@@ -891,6 +891,141 @@ async fn queue_uses_its_builder_line(pool: PgPool) {
     assert_eq!(main_rows, 0, "main line should be untouched");
 }
 
+/// Per-queue default timeout: handlers that don't return within the duration
+/// are aborted and the job gets retried (then failed at max_attempts).
+#[sqlx::test(migrations = "./migrations")]
+async fn per_queue_timeout_fires_and_retries(pool: PgPool) {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct HangingTask {
+        n: u64,
+    }
+    impl Job for HangingTask {
+        const KIND: &'static str = "hanging";
+        fn queue(&self) -> &'static str {
+            "slow_lane"
+        }
+        fn max_attempts(&self) -> i32 {
+            2
+        }
+    }
+
+    let invocations = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct HangingWorker {
+        count: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Worker<HangingTask> for HangingWorker {
+        async fn perform(&self, _: HangingTask, _: JobContext) -> JobResult {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            // Sleep way past the queue timeout — worker should be aborted.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        }
+    }
+
+    let queue = Queue::builder(pool.clone())
+        .register::<HangingTask, _>(HangingWorker {
+            count: invocations.clone(),
+        })
+        .subscribe_to(["slow_lane"])
+        .config(fast_config())
+        .build();
+
+    // 150ms timeout on the queue.
+    queue
+        .set_queue_timeout("slow_lane", Some(Duration::from_millis(150)))
+        .await
+        .unwrap();
+
+    queue.enqueue(&HangingTask { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+
+    // max_attempts=2 + retry_base=20ms (fast_config). Timeline:
+    //   attempt 1 → start, timeout at ~150ms → retry queued at ~170ms
+    //   attempt 2 → start ~170ms, timeout at ~320ms → mark failed (at cap)
+    // Total: ~400ms. Give it 2s of headroom.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let failed: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs WHERE state = 'failed'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if failed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("job should be marked failed after hitting max_attempts of timeouts");
+    queue.shutdown().await.unwrap();
+
+    assert!(
+        invocations.load(Ordering::SeqCst) >= 2,
+        "handler should have been invoked 2× (attempt 1 timeout + retry)"
+    );
+
+    // The error log should mention the timeout.
+    let errors: serde_json::Value =
+        sqlx::query_scalar("SELECT errors FROM eddyq_jobs WHERE state = 'failed' LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let errors_str = errors.to_string();
+    assert!(
+        errors_str.contains("timed out"),
+        "error log should mention timeout, got {errors_str}"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn no_timeout_lets_long_jobs_run(pool: PgPool) {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SlowTask {
+        n: u64,
+    }
+    impl Job for SlowTask {
+        const KIND: &'static str = "slow";
+    }
+
+    let done = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct SlowWorker(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Worker<SlowTask> for SlowWorker {
+        async fn perform(&self, _: SlowTask, _: JobContext) -> JobResult {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    // No timeout configured on the queue → 200ms sleep runs to completion.
+    let queue = Queue::builder(pool.clone())
+        .register::<SlowTask, _>(SlowWorker(done.clone()))
+        .config(fast_config())
+        .build();
+
+    queue.enqueue(&SlowTask { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if done.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("slow job should complete without a timeout configured");
+    queue.shutdown().await.unwrap();
+}
+
 /// The "10 ECS tasks" test: simulate multiple worker processes (each its own
 /// Queue + pool) all subscribed to "integrations", set a cross-process cap of
 /// 3, enqueue a burst of jobs. Proves peak concurrency across ALL processes
@@ -950,12 +1085,19 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
     .await
     .unwrap();
 
-    // Spin up FIVE independent "processes" (each with worker_concurrency=8).
-    // Per-process cap would permit 5 × 8 = 40 concurrent. The cross-process
-    // cap should keep peak ≤ 3.
-    let mut processes = Vec::new();
+    // Spin up FIVE independent "processes" — each with its own PgPool to
+    // simulate separate ECS tasks. Per-process cap would permit 5 × 4 = 20
+    // concurrent; the cross-process cap should keep peak ≤ 3.
+    let connect_opts = pool.connect_options();
+    let mut process_pools: Vec<sqlx::PgPool> = Vec::new();
+    let mut processes: Vec<Queue> = Vec::new();
     for _ in 0..5 {
-        let q = Queue::builder(pool.clone())
+        let p = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with((*connect_opts).clone())
+            .await
+            .unwrap();
+        let q = Queue::builder(p.clone())
             .register::<IntegTask, _>(SharedWorker {
                 current: current.clone(),
                 max_observed: max_observed.clone(),
@@ -963,10 +1105,12 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
             })
             .subscribe_to(["integrations"])
             .config(QueueConfig {
-                worker_concurrency: 8,
+                worker_concurrency: 4,
+                poll_only: true, // simulate transaction-pooled PgBouncer mode
                 ..fast_config()
             })
             .build();
+        process_pools.push(p);
         processes.push(q);
     }
 
@@ -980,7 +1124,7 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
         q.start().unwrap();
     }
 
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             if completed.load(Ordering::SeqCst) >= 50 {
                 break;
@@ -988,8 +1132,29 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("all 50 should complete");
+    .await;
+
+    if outcome.is_err() {
+        let states: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT state, COUNT(*) FROM eddyq_jobs GROUP BY state ORDER BY state",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let qstate: Vec<(String, i32, i32, bool)> = sqlx::query_as(
+            "SELECT name, running_count, max_concurrency, paused FROM eddyq_queues",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        panic!(
+            "timed out: completed={} states={:?} queue={:?} atomic_current={}",
+            completed.load(Ordering::SeqCst),
+            states,
+            qstate,
+            current.load(Ordering::SeqCst)
+        );
+    }
 
     for q in &processes {
         q.shutdown().await.unwrap();

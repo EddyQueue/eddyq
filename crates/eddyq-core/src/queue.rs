@@ -391,6 +391,24 @@ impl Queue {
         crate::named_queue::list(&self.pool).await
     }
 
+    /// Set a default per-job timeout for jobs in this queue. Handlers that
+    /// don't return within the duration are aborted and the job is marked
+    /// failed (with retry if under `max_attempts`). Pass `None` to clear.
+    ///
+    /// **Default is no timeout** — matches River's `Worker.Timeout=0`
+    /// convention. Opt in per queue.
+    ///
+    /// Limitation inherited from tokio: only I/O-yielding handlers can be
+    /// cancelled. A handler doing tight CPU work without `.await` won't be
+    /// interrupted by the timeout.
+    pub async fn set_queue_timeout(
+        &self,
+        name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
+        crate::named_queue::set_timeout(&self.pool, name, timeout).await
+    }
+
     pub fn start(&self) -> Result<()> {
         let mut state = self.state.lock().expect("queue state lock poisoned");
         if matches!(*state, QueueState::Running { .. }) {

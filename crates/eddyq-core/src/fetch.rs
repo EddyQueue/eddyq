@@ -15,6 +15,9 @@ pub struct ClaimedJob {
     pub group_key: Option<String>,
     pub queue: String,
     pub worker_id: Uuid,
+    /// Resolved per-job timeout: the queue's `default_timeout_ms` at claim
+    /// time, or `None` if no timeout is configured for this queue.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Claim up to `batch_size` pending jobs, respecting per-group concurrency
@@ -50,14 +53,16 @@ pub async fn claim_batch(
 
     let mut tx = pool.begin().await?;
 
-    // Phase 0 — lock + read cross-process queue caps. For any subscribed
-    // queue with a row in eddyq_queues, compute available slots; for queues
-    // without a row, treat as unlimited (i32::MAX).
+    // Phase 0 — lock + read cross-process queue caps + default timeouts. For
+    // any subscribed queue with a row in eddyq_queues, compute available
+    // slots and pick up its default_timeout_ms. Queues without a row are
+    // unlimited (i32::MAX) with no timeout.
     let mut queue_budget: HashMap<String, i32> = HashMap::new();
+    let mut queue_timeout: HashMap<String, Option<std::time::Duration>> = HashMap::new();
     {
-        let rows: Vec<(String, i32, i32, bool)> = sqlx::query_as(
+        let rows: Vec<(String, i32, i32, bool, Option<i32>)> = sqlx::query_as(
             r#"
-            SELECT name, running_count, max_concurrency, paused
+            SELECT name, running_count, max_concurrency, paused, default_timeout_ms
               FROM eddyq_queues
              WHERE name = ANY($1)
           ORDER BY name
@@ -67,9 +72,17 @@ pub async fn claim_batch(
         .bind(queues)
         .fetch_all(&mut *tx)
         .await?;
-        for (name, running, max, paused) in rows {
+        for (name, running, max, paused, timeout_ms) in rows {
             let slots = if paused { 0 } else { (max - running).max(0) };
-            queue_budget.insert(name, slots);
+            queue_budget.insert(name.clone(), slots);
+            if let Some(ms) = timeout_ms {
+                if ms > 0 {
+                    queue_timeout.insert(
+                        name,
+                        Some(std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0))),
+                    );
+                }
+            }
         }
     }
     let budget_for = |qname: &str, tbl: &HashMap<String, i32>| -> i32 {
@@ -280,8 +293,9 @@ pub async fn claim_batch(
     }
 
     // Step 4: UPDATE accepted jobs to 'running'; upsert group + queue counters.
+    type ClaimedRow = (JobId, String, serde_json::Value, i32, i32, Option<String>, String);
     let accepted_ids: Vec<JobId> = accepted.iter().map(|(id, _, _)| *id).collect();
-    let claimed: Vec<(JobId, String, serde_json::Value, i32, i32, Option<String>, String)> =
+    let claimed: Vec<ClaimedRow> =
         sqlx::query_as(
             r#"
             UPDATE eddyq_jobs AS j
@@ -364,15 +378,19 @@ pub async fn claim_batch(
     Ok(claimed
         .into_iter()
         .map(
-            |(id, kind, payload, attempt, max_attempts, group_key, queue)| ClaimedJob {
-                id,
-                kind,
-                payload,
-                attempt,
-                max_attempts,
-                group_key,
-                queue,
-                worker_id,
+            |(id, kind, payload, attempt, max_attempts, group_key, queue)| {
+                let timeout = queue_timeout.get(&queue).and_then(|o| *o);
+                ClaimedJob {
+                    id,
+                    kind,
+                    payload,
+                    attempt,
+                    max_attempts,
+                    group_key,
+                    queue,
+                    worker_id,
+                    timeout,
+                }
             },
         )
         .collect())

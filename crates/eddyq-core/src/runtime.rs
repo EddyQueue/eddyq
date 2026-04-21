@@ -241,8 +241,23 @@ async fn worker_loop(
             }
         });
 
-        let fut = std::panic::AssertUnwindSafe(handler(job.payload.clone(), ctx.clone()));
-        let result = futures_util::FutureExt::catch_unwind(fut).await;
+        let inner = handler(job.payload.clone(), ctx.clone());
+        let caught_fut =
+            futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(inner));
+
+        // If the queue has a configured default timeout, wrap the handler in
+        // `tokio::time::timeout`. On timeout, synthesize a JobResult::Err so
+        // the downstream retry/fail plumbing treats it like any other failure.
+        let result = match job.timeout {
+            Some(t) => match tokio::time::timeout(t, caught_fut).await {
+                Ok(caught) => caught,
+                Err(_elapsed) => Ok(Err(anyhow::anyhow!(format!(
+                    "job timed out after {:?}",
+                    t
+                )))),
+            },
+            None => caught_fut.await,
+        };
 
         hb_stop.cancel();
         let _ = heartbeat_task.await;

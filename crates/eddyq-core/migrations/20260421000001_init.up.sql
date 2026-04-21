@@ -65,12 +65,14 @@ CREATE INDEX eddyq_jobs_tags ON eddyq_jobs USING GIN (tags);
 -- Tracks running_count for each named queue so a cap of 10 on "integrations"
 -- applies across all worker replicas, not per-process.
 CREATE TABLE eddyq_queues (
-    name            TEXT        PRIMARY KEY,
-    running_count   INTEGER     NOT NULL DEFAULT 0 CHECK (running_count >= 0),
-    max_concurrency INTEGER     NOT NULL DEFAULT 2147483647 CHECK (max_concurrency >= 0),
-    paused          BOOLEAN     NOT NULL DEFAULT FALSE,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    name               TEXT        PRIMARY KEY,
+    running_count      INTEGER     NOT NULL DEFAULT 0 CHECK (running_count >= 0),
+    max_concurrency    INTEGER     NOT NULL DEFAULT 2147483647 CHECK (max_concurrency >= 0),
+    paused             BOOLEAN     NOT NULL DEFAULT FALSE,
+    -- Default per-job timeout in ms. NULL = no timeout (River-compatible default).
+    default_timeout_ms INTEGER CHECK (default_timeout_ms IS NULL OR default_timeout_ms > 0),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- ─── Groups ────────────────────────────────────────────────────────────────
