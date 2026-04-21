@@ -1,19 +1,208 @@
-name: Release (manual)
+name: Release
 
-# Skeleton only. Real release pipeline lands in Phase 6; this file exists so
-# reviewers can see the intended shape without it firing accidentally.
+# Triggered by pushing a tag `vX.Y.Z` (canonical) or manually for dry-runs.
+#
+# Flow:
+#   1. build: matrix across all 7 NAPI targets, each produces `eddyq.<target>.node`
+#      and uploads it as an artifact
+#   2. publish: downloads every artifact, moves them into per-target npm/ subdirs,
+#      then publishes `@eddyq/queue` (triggers per-platform package publishes via
+#      `napi prepublish`) followed by `@eddyq/nestjs`
+#
+# Requires secret: NPM_TOKEN (an npm token with publish rights to @eddyq).
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       dry-run:
-        description: "Dry run (no publish)"
+        description: "Dry run (build artifacts, skip publish)"
         type: boolean
         default: true
 
+env:
+  DEBUG: "napi:*"
+  APP_NAME: eddyq
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+  CARGO_INCREMENTAL: "0"
+
+permissions:
+  contents: write
+  id-token: write
+
 jobs:
-  noop:
-    name: "Placeholder — release pipeline TBD in Phase 6"
-    runs-on: ubuntu-latest
+  build:
+    name: build ${{ matrix.settings.target }}
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: macos-14
+            target: aarch64-apple-darwin
+            build: pnpm -C packages/queue build -- --target aarch64-apple-darwin
+
+          - host: macos-13
+            target: x86_64-apple-darwin
+            build: pnpm -C packages/queue build -- --target x86_64-apple-darwin
+
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            build: pnpm -C packages/queue build -- --target x86_64-pc-windows-msvc
+
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
+            build: pnpm -C packages/queue build -- --target x86_64-unknown-linux-gnu --use-napi-cross
+
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust-cross:lts-debian-aarch64
+            build: pnpm -C packages/queue build -- --target aarch64-unknown-linux-gnu --use-napi-cross
+
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
+            build: pnpm -C packages/queue build -- --target x86_64-unknown-linux-musl
+
+          - host: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust-cross:lts-alpine-aarch64
+            build: pnpm -C packages/queue build -- --target aarch64-unknown-linux-musl
+
     steps:
-      - run: echo "Release automation lives in release.toml (cargo-release) and .changeset/config.json (npm). Real CD pipeline is a Phase 6 deliverable."
+      - uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        if: ${{ !matrix.settings.docker }}
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Setup Rust toolchain
+        if: ${{ !matrix.settings.docker }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-${{ matrix.settings.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.settings.target }}-
+
+      - name: Install dependencies (host)
+        if: ${{ !matrix.settings.docker }}
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Build (docker)
+        if: ${{ matrix.settings.docker }}
+        uses: addnab/docker-run-action@v3
+        with:
+          image: ${{ matrix.settings.docker }}
+          options: |
+            --user 0:0
+            -v ${{ github.workspace }}:/build
+            -w /build
+          run: |
+            corepack enable
+            pnpm install --frozen-lockfile=false
+            ${{ matrix.settings.build }}
+
+      - name: Build (host)
+        if: ${{ !matrix.settings.docker }}
+        run: ${{ matrix.settings.build }}
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.settings.target }}
+          path: packages/queue/${{ env.APP_NAME }}.*.node
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: publish to npm
+    needs: [build]
+    runs-on: ubuntu-latest
+    # Only run publish on a real tag push. workflow_dispatch builds artifacts
+    # for smoke-testing but never publishes unless `dry-run: false` is set.
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.dry-run == 'false')
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org/"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: packages/queue/artifacts
+
+      - name: Create per-target npm dirs
+        run: pnpm -C packages/queue create-npm-dirs
+
+      - name: Move binaries into npm/<target>/
+        run: pnpm -C packages/queue artifacts
+
+      - name: List artifacts for sanity
+        run: ls -R packages/queue/npm
+
+      - name: Build @eddyq/nestjs
+        run: pnpm -C packages/nestjs build
+
+      - name: Publish @eddyq/queue (+ per-platform packages)
+        # `prepublishOnly` hook runs `napi prepublish -t npm` which publishes
+        # every `packages/queue/npm/<target>/` package before npm publishes the
+        # main package. Requires NPM_TOKEN in the environment.
+        run: |
+          cd packages/queue
+          npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @eddyq/nestjs
+        # `pnpm publish` rewrites `workspace:*` in peerDependencies to the
+        # actual version being published, which `npm publish` would leave as-is.
+        run: |
+          pnpm -C packages/nestjs publish --access public --no-git-checks --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          draft: false
