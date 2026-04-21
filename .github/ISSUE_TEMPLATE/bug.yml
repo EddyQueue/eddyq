@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a bug in eddyq
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report! eddyq is pre-alpha, so expect bugs — but a clear reproducer makes them fixable fast.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect to happen, and what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: |
+        Minimal code or steps to reproduce. A runnable snippet is best.
+      render: rust
+    validations:
+      required: true
+
+  - type: input
+    id: eddyq-version
+    attributes:
+      label: eddyq version
+      placeholder: "0.0.1"
+    validations:
+      required: true
+
+  - type: input
+    id: postgres-version
+    attributes:
+      label: Postgres version
+      placeholder: "17.2"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pooler
+    attributes:
+      label: Connection pooler
+      options:
+        - "None (direct connection)"
+        - "PgBouncer (session mode)"
+        - "PgBouncer (transaction mode)"
+        - "Supabase pooler"
+        - "RDS Proxy"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: "macOS 15 arm64, Linux x86_64, etc."
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Run with `RUST_LOG=eddyq=debug` if possible.
+      render: shell

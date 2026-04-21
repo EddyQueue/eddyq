@@ -1,0 +1,19 @@
+name: Release (manual)
+
+# Skeleton only. Real release pipeline lands in Phase 6; this file exists so
+# reviewers can see the intended shape without it firing accidentally.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Dry run (no publish)"
+        type: boolean
+        default: true
+
+jobs:
+  noop:
+    name: "Placeholder — release pipeline TBD in Phase 6"
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Release automation lives in release.toml (cargo-release) and .changeset/config.json (npm). Real CD pipeline is a Phase 6 deliverable."

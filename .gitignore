@@ -1,0 +1,37 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+dist/
+build/
+.turbo/
+
+# NAPI-RS prebuilds
+*.node
+crates/eddyq-napi/index.js
+crates/eddyq-napi/index.d.ts
+crates/eddyq-napi/npm/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Bench artifacts
+/benches/results/
+bench-report.md
+
+# sqlx offline cache (we use compile-time verification)
+.sqlx/

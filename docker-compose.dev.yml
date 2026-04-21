@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: eddyq-dev-postgres
+    environment:
+      POSTGRES_USER: eddyq
+      POSTGRES_PASSWORD: eddyq
+      POSTGRES_DB: eddyq_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - eddyq-dev-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eddyq -d eddyq_dev"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.23.1
+    container_name: eddyq-dev-pgbouncer
+    profiles: ["pgbouncer"]
+    environment:
+      DATABASE_URL: "postgres://eddyq:eddyq@postgres:5432/eddyq_dev"
+      POOL_MODE: transaction
+      MAX_PREPARED_STATEMENTS: "100"
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  eddyq-dev-pgdata:

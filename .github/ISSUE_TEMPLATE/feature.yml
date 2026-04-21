@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a feature for eddyq
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: we're **aggressively scoping v1.0**. Many "obvious" features are deliberately deferred to v1.x or later (see [v1.0 non-goals](../../docs/decisions/)).
+        Still, good ideas are welcome — the right feature at the right phase is how the project stays shippable.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Start with the user problem, not the solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, existing features, other designs.
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Which phase do you think this belongs in?
+      options:
+        - "Phase 1 (core queue) — needed for MVP"
+        - "Phase 2 (groups, rate limits, transactional enqueue)"
+        - "Phase 3 (Node bindings)"
+        - "Phase 4 (observability, dashboard)"
+        - "Phase 5 (hardening)"
+        - "v1.x (after launch)"
+        - "Not sure"
+    validations:
+      required: true

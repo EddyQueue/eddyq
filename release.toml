@@ -1,0 +1,31 @@
+# cargo-release configuration for the eddyq workspace.
+# https://github.com/crate-ci/cargo-release
+
+# Do not publish eddyq-napi to crates.io — it ships via the @eddyq/queue npm package.
+# (The `publish = false` in its Cargo.toml enforces this; we also skip tagging.)
+
+# Publishing order: eddyq-core → eddyq-client → eddyq-cli. cargo-release respects
+# dependency graph within the workspace by default.
+
+# Use a single version across the workspace (enforced by workspace.package.version).
+shared-version = true
+
+# Tag format: v0.1.0 rather than eddyq-core-v0.1.0 (we release the workspace as one unit).
+tag-name = "v{{version}}"
+tag-message = "eddyq {{version}}"
+
+# Don't push automatically — require a manual `cargo release publish --execute` after review.
+push = false
+publish = false
+
+# Commit message shown when cargo-release bumps the workspace version.
+pre-release-commit-message = "chore(release): eddyq {{version}}"
+
+# Sign commits and tags if the user has gpg configured; cargo-release respects git config.
+sign-tag = false
+sign-commit = false
+
+# Replace version strings in these files during release (besides the Cargo.tomls).
+pre-release-replacements = [
+  { file = "README.md", search = "eddyq [0-9]+\\.[0-9]+\\.[0-9]+", replace = "eddyq {{version}}", min = 0 },
+]

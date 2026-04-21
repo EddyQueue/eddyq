@@ -1,0 +1,30 @@
+{
+  "name": "@eddyq/queue",
+  "version": "0.0.1",
+  "description": "Node.js client for eddyq — a Rust + Postgres job queue",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eddyqueue/eddyq.git",
+    "directory": "packages/queue"
+  },
+  "homepage": "https://github.com/eddyqueue/eddyq",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "echo \"no tests yet\" && exit 0",
+    "lint": "echo \"no lint yet\" && exit 0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

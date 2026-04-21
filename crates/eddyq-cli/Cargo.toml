@@ -1,0 +1,31 @@
+[package]
+name = "eddyq-cli"
+description = "Command-line interface for eddyq"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["queue", "postgres", "cli"]
+categories = ["command-line-utilities", "database"]
+
+[[bin]]
+name = "eddyq"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+eddyq-core = { path = "../eddyq-core", version = "0.0.1" }
+eddyq-client = { path = "../eddyq-client", version = "0.0.1" }
+tokio = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

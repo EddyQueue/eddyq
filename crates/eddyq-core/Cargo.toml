@@ -1,0 +1,46 @@
+[package]
+name = "eddyq-core"
+description = "Core queue engine for eddyq — a Rust + Postgres job queue"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["queue", "postgres", "background-jobs", "worker", "async"]
+categories = ["asynchronous", "database"]
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+rand = { workspace = true }
+futures-util = "0.3"
+cron = "0.15"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tracing-subscriber = { workspace = true }
+tracing-test = "0.2"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[example]]
+name = "hello"
+path = "examples/hello.rs"
