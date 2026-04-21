@@ -8,6 +8,7 @@ pub mod error;
 pub mod fetch;
 pub mod group;
 pub mod job;
+pub mod migrate;
 pub mod queue;
 pub mod retry;
 mod runtime;

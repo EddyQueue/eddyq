@@ -728,6 +728,179 @@ async fn paused_group_blocks_execution(pool: PgPool) {
     queue.shutdown().await.unwrap();
 }
 
+// ---------------------------------------------------------------------------
+// Migration runner tests (no `migrations = ...` on sqlx::test — we want a
+// truly empty DB so the runner does the work)
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrations = false)]
+async fn migrate_up_applies_all_known_migrations(pool: PgPool) {
+    let report = eddyq_core::migrate::up(&pool, "main").await.unwrap();
+
+    // We ship 4 migrations at time of writing; the assertion is >= so that
+    // adding new migrations doesn't retroactively break this test.
+    assert!(
+        report.applied.len() >= 4,
+        "expected at least 4 migrations applied, got {}",
+        report.applied.len()
+    );
+
+    // All expected tables exist.
+    for tbl in &["eddyq_jobs", "eddyq_schedules", "eddyq_groups", "_eddyq_migrations"] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+        )
+        .bind(*tbl)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(exists, "table {tbl} should exist after migrate up");
+    }
+
+    // We do NOT create `_sqlx_migrations` — that's the whole point of using
+    // our own tracking table: no collision with user's sqlx tooling.
+    let sqlx_table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = '_sqlx_migrations')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!sqlx_table_exists, "eddyq must not touch _sqlx_migrations");
+}
+
+#[sqlx::test(migrations = false)]
+async fn migrate_up_is_idempotent(pool: PgPool) {
+    let first = eddyq_core::migrate::up(&pool, "main").await.unwrap();
+    let second = eddyq_core::migrate::up(&pool, "main").await.unwrap();
+    assert!(!first.applied.is_empty());
+    assert!(
+        second.applied.is_empty(),
+        "second up should apply nothing: {:?}",
+        second.applied
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn migrate_down_rolls_back_all(pool: PgPool) {
+    eddyq_core::migrate::up(&pool, "main").await.unwrap();
+    let report = eddyq_core::migrate::down(&pool, "main", usize::MAX).await.unwrap();
+    assert!(report.rolled_back.len() >= 4);
+
+    // All our tables are gone (except _eddyq_migrations, which we keep
+    // around as an empty tracking table — that matches River's behavior).
+    for tbl in &["eddyq_jobs", "eddyq_schedules", "eddyq_groups"] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+        )
+        .bind(*tbl)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(!exists, "table {tbl} should be gone after migrate down");
+    }
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations").fetch_one(&pool).await.unwrap();
+    assert_eq!(remaining, 0, "tracking table should be empty after full rollback");
+}
+
+#[sqlx::test(migrations = false)]
+async fn migrate_status_reports_pending_and_applied(pool: PgPool) {
+    // Before any migration: all pending.
+    let before = eddyq_core::migrate::status(&pool, "main").await.unwrap();
+    assert!(before.iter().all(|s| s.applied_at.is_none()));
+
+    // Apply everything: all applied.
+    eddyq_core::migrate::up(&pool, "main").await.unwrap();
+    let after = eddyq_core::migrate::status(&pool, "main").await.unwrap();
+    assert!(after.iter().all(|s| s.applied_at.is_some()));
+
+    // Roll back one: last is pending again.
+    eddyq_core::migrate::down(&pool, "main", 1).await.unwrap();
+    let partial = eddyq_core::migrate::status(&pool, "main").await.unwrap();
+    assert!(
+        partial.last().unwrap().applied_at.is_none(),
+        "most recent migration should be pending after down --max-steps 1"
+    );
+    assert!(
+        partial[0].applied_at.is_some(),
+        "earlier migrations still applied"
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn lines_track_independently(pool: PgPool) {
+    // Apply all migrations on "main".
+    eddyq_core::migrate::up(&pool, "main").await.unwrap();
+
+    // "canary" line should report everything as pending, even though the
+    // schema is already up (shared tables across lines).
+    let canary_status = eddyq_core::migrate::status(&pool, "canary").await.unwrap();
+    assert!(
+        canary_status.iter().all(|s| s.applied_at.is_none()),
+        "canary should see all migrations as pending — it has its own tracking"
+    );
+
+    let main_status = eddyq_core::migrate::status(&pool, "main").await.unwrap();
+    assert!(
+        main_status.iter().all(|s| s.applied_at.is_some()),
+        "main should see everything as applied"
+    );
+
+    // Both lines exist in the registry.
+    let lines = eddyq_core::migrate::list_lines(&pool).await.unwrap();
+    assert_eq!(lines, vec!["main".to_string()]);
+
+    // Rolling back canary is a no-op — nothing was applied on that line.
+    let rb = eddyq_core::migrate::down(&pool, "canary", usize::MAX)
+        .await
+        .unwrap();
+    assert!(rb.rolled_back.is_empty());
+
+    // Rolling back main doesn't affect canary's tracking (which is already empty).
+    eddyq_core::migrate::down(&pool, "main", 1).await.unwrap();
+    let canary_after = eddyq_core::migrate::status(&pool, "canary").await.unwrap();
+    assert!(canary_after.iter().all(|s| s.applied_at.is_none()));
+}
+
+#[sqlx::test(migrations = false)]
+async fn queue_uses_its_builder_line(pool: PgPool) {
+    let queue = Queue::builder(pool.clone()).line("canary").build();
+    assert_eq!(queue.line(), "canary");
+
+    // Migrate via the queue — should tag with line="canary" in the tracking
+    // table even though we're in a fresh DB (which is fine — no main yet).
+    queue.migrate().await.unwrap();
+
+    let canary_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations WHERE line = 'canary'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(canary_rows >= 4, "expected 4+ canary rows, got {canary_rows}");
+
+    let main_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations WHERE line = 'main'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(main_rows, 0, "main line should be untouched");
+}
+
+#[test]
+fn get_sql_returns_up_and_down() {
+    use eddyq_core::migrate::{Direction, MIGRATIONS, get_sql};
+
+    let first = MIGRATIONS[0];
+    let up = get_sql(first.version, Direction::Up).expect("up should exist");
+    let down = get_sql(first.version, Direction::Down).expect("down should exist");
+    assert!(up.contains("CREATE TABLE eddyq_jobs"));
+    assert!(down.contains("DROP TABLE"));
+    assert_ne!(up, down);
+
+    assert!(get_sql(999_999_999, Direction::Up).is_none());
+}
+
 /// The BullMQ-killer: enqueuing inside the user's transaction. If the user's
 /// work rolls back, the job must NOT appear — even though it was "inserted"
 /// earlier in the transaction.

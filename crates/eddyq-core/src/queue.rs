@@ -51,6 +51,7 @@ pub struct QueueBuilder {
     pool: PgPool,
     registry: WorkerRegistry,
     config: QueueConfig,
+    line: String,
 }
 
 impl QueueBuilder {
@@ -59,7 +60,17 @@ impl QueueBuilder {
             pool,
             registry: WorkerRegistry::new(),
             config: QueueConfig::default(),
+            line: crate::migrate::DEFAULT_LINE.to_owned(),
         }
+    }
+
+    /// Name the migration line this queue uses. Default is `"main"`. Use
+    /// distinct lines when you want multiple logical eddyq instances to track
+    /// their migration histories separately. Lines do not isolate tables —
+    /// for that, use separate Postgres schemas or databases.
+    pub fn line(mut self, name: impl Into<String>) -> Self {
+        self.line = name.into();
+        self
     }
 
     pub fn register<J, W>(mut self, worker: W) -> Self
@@ -111,6 +122,7 @@ impl QueueBuilder {
             pool: self.pool,
             registry: Arc::new(self.registry),
             config: self.config,
+            line: self.line,
             state: std::sync::Mutex::new(QueueState::Idle),
         }
     }
@@ -128,6 +140,7 @@ pub struct Queue {
     pool: PgPool,
     registry: Arc<WorkerRegistry>,
     config: QueueConfig,
+    line: String,
     state: std::sync::Mutex<QueueState>,
 }
 
@@ -140,9 +153,24 @@ impl Queue {
         &self.pool
     }
 
-    pub async fn migrate(&self) -> Result<()> {
-        sqlx::migrate!("./migrations").run(&self.pool).await?;
-        Ok(())
+    /// The migration line this queue was built for (default: `"main"`).
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// Apply all pending schema migrations for this queue's line. Uses the
+    /// `_eddyq_migrations` tracking table (intentionally separate from your
+    /// app's migration tool so there are no collisions).
+    pub async fn migrate(&self) -> Result<crate::migrate::MigrateReport> {
+        crate::migrate::up(&self.pool, &self.line).await
+    }
+
+    pub async fn migrate_down(&self, max_steps: usize) -> Result<crate::migrate::MigrateReport> {
+        crate::migrate::down(&self.pool, &self.line, max_steps).await
+    }
+
+    pub async fn migration_status(&self) -> Result<Vec<crate::migrate::MigrationStatus>> {
+        crate::migrate::status(&self.pool, &self.line).await
     }
 
     pub async fn enqueue<J: Job>(&self, job: &J) -> Result<EnqueueResult> {
