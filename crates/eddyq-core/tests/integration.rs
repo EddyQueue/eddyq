@@ -2385,3 +2385,227 @@ async fn sweeper_decrements_group_counter(pool: PgPool) {
         .unwrap();
     assert_eq!(count, 0, "sweeper should have decremented group counter");
 }
+
+// ─── SQL enqueue functions (cross-language transactional enqueue) ──────────
+
+/// Call `eddyq_enqueue(...)` from raw SQL and assert the row matches what the
+/// Rust path produces for the same inputs. This is the parity test that keeps
+/// the two implementations honest.
+#[sqlx::test(migrations = "./migrations")]
+async fn sql_enqueue_function_parity(pool: PgPool) {
+    use serde_json::json;
+
+    // Pin scheduled_at so the two rows are comparable. The only fields that
+    // should differ are `id` (serial), `created_at`, and `updated_at`.
+    let scheduled_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let payload = json!({"to": "a@x.com", "n": 7});
+
+    // Rust path.
+    let mut req = eddyq_core::enqueue::DynEnqueue::new("send.email", payload.clone());
+    req.priority = 5;
+    req.max_attempts = 4;
+    req.queue = "urgent".to_owned();
+    req.scheduled_at = Some(scheduled_at);
+    req.unique_key = Some("rust-parity-1".into());
+    req.group_key = Some("acme".into());
+    req.tags = vec!["urgent".into(), "billing".into()];
+    req.metadata = json!({"source": "rust"});
+    let res = eddyq_core::enqueue::enqueue_dyn(&pool, req).await.unwrap();
+    let rust_id = match res {
+        eddyq_core::EnqueueResult::Inserted(id) => id,
+        _ => panic!("rust enqueue should have inserted"),
+    };
+
+    // SQL path — same inputs except unique_key (else it would dedupe).
+    let sql_id: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT eddyq_enqueue(
+            $1, $2::jsonb, $3, $4::smallint, $5::int, $6::timestamptz,
+            $7, $8, $9::text[], $10::jsonb
+        )
+        "#,
+    )
+    .bind("send.email")
+    .bind(&payload)
+    .bind("urgent")
+    .bind(5_i16)
+    .bind(4_i32)
+    .bind(scheduled_at)
+    .bind("sql-parity-1")
+    .bind("acme")
+    .bind(vec!["urgent".to_string(), "billing".to_string()])
+    .bind(json!({"source": "rust"})) // same metadata on purpose, for row compare
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let sql_id = sql_id.expect("sql enqueue should have returned an id");
+
+    // Compare every column that's supposed to match between the two.
+    let row: (
+        String, serde_json::Value, String, i16, i32, chrono::DateTime<chrono::Utc>,
+        Option<String>, Vec<String>, serde_json::Value, String,
+    ) = sqlx::query_as(
+        r#"
+        SELECT kind, payload, state::text, priority, max_attempts, scheduled_at,
+               group_key, tags, metadata, queue
+          FROM eddyq_jobs
+         WHERE id = ANY($1)
+      ORDER BY id
+        "#,
+    )
+    .bind([rust_id, sql_id])
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .next()
+    .unwrap();
+
+    // Fetch both rows in one query for a side-by-side compare.
+    let rows: Vec<(
+        String, serde_json::Value, String, i16, i32, chrono::DateTime<chrono::Utc>,
+        Option<String>, Vec<String>, serde_json::Value, String,
+    )> = sqlx::query_as(
+        r#"
+        SELECT kind, payload, state::text, priority, max_attempts, scheduled_at,
+               group_key, tags, metadata, queue
+          FROM eddyq_jobs
+         WHERE id = ANY($1)
+      ORDER BY id
+        "#,
+    )
+    .bind([rust_id, sql_id])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "both rows must exist");
+    let (a, b) = (&rows[0], &rows[1]);
+    assert_eq!(a.0, b.0, "kind must match");
+    assert_eq!(a.1, b.1, "payload must match");
+    assert_eq!(a.2, b.2, "state must match");
+    assert_eq!(a.3, b.3, "priority must match");
+    assert_eq!(a.4, b.4, "max_attempts must match");
+    assert_eq!(a.5, b.5, "scheduled_at must match");
+    assert_eq!(a.6, b.6, "group_key must match");
+    assert_eq!(a.7, b.7, "tags must match");
+    assert_eq!(a.8, b.8, "metadata must match");
+    assert_eq!(a.9, b.9, "queue must match");
+
+    // unused binding kept just to silence clippy about `row` variable above.
+    let _ = row;
+}
+
+/// Calling eddyq_enqueue inside a Postgres transaction that rolls back must
+/// produce no job row — same semantics as the Rust enqueue_in_tx path. This
+/// is the defining feature of a Postgres-backed queue vs Redis.
+#[sqlx::test(migrations = "./migrations")]
+async fn sql_enqueue_rolls_back_with_user_tx(pool: PgPool) {
+    use serde_json::json;
+
+    // Create a fake domain table to simulate the user's own write.
+    sqlx::query("CREATE TABLE tx_widgets (id BIGSERIAL PRIMARY KEY, label TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Inside a tx: insert a widget + enqueue a follow-up job, then roll back.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("INSERT INTO tx_widgets (label) VALUES ('rollback-me')")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let id: Option<i64> = sqlx::query_scalar("SELECT eddyq_enqueue($1, $2::jsonb)")
+        .bind("sql.tx.test")
+        .bind(json!({"rolled": false}))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert!(id.is_some(), "enqueue inside tx should return an id pre-rollback");
+    tx.rollback().await.unwrap();
+
+    // Both the widget and the job must be gone.
+    let widgets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tx_widgets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(widgets, 0, "widget must be rolled back");
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs WHERE kind = 'sql.tx.test'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0, "job must be rolled back alongside the domain write");
+}
+
+/// unique_key collisions via the SQL function return NULL rather than raising.
+#[sqlx::test(migrations = "./migrations")]
+async fn sql_enqueue_unique_key_conflict_returns_null(pool: PgPool) {
+    let first: Option<i64> = sqlx::query_scalar(
+        "SELECT eddyq_enqueue('k', '{}'::jsonb, 'default', 0::smallint, 3, NOW(), 'same-key')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(first.is_some());
+
+    let second: Option<i64> = sqlx::query_scalar(
+        "SELECT eddyq_enqueue('k', '{}'::jsonb, 'default', 0::smallint, 3, NOW(), 'same-key')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(second.is_none(), "conflict should return NULL, not raise");
+}
+
+/// SQL bulk enqueue round-trips a mixed batch and reports aggregate counts.
+#[sqlx::test(migrations = "./migrations")]
+async fn sql_enqueue_many_bulk(pool: PgPool) {
+    use serde_json::json;
+
+    let stamp = chrono::Utc::now().timestamp_millis();
+    let items = json!([
+        { "kind": "sql.bulk.a", "payload": {"n": 1}, "unique_key": format!("sql-bulk-a-{stamp}") },
+        { "kind": "sql.bulk.b", "payload": {"n": 2}, "unique_key": format!("sql-bulk-b-{stamp}") },
+        { "kind": "sql.bulk.a", "payload": {"n": 3}, "unique_key": format!("sql-bulk-a-{stamp}") }, // dupe
+    ]);
+
+    let result: serde_json::Value = sqlx::query_scalar("SELECT eddyq_enqueue_many($1::jsonb)")
+        .bind(&items)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(result["inserted"], 2);
+    assert_eq!(result["skipped"], 1);
+}
+
+/// Group rule materialization works through the SQL path (via the internal
+/// helper). A job with a group_key matching a pattern rule should lazily
+/// create the eddyq_groups row with the rule's cap.
+#[sqlx::test(migrations = "./migrations")]
+async fn sql_enqueue_materializes_group_rule(pool: PgPool) {
+    use serde_json::json;
+
+    // Install a pattern rule capping "shopify:*" to 5 concurrent jobs.
+    sqlx::query(
+        "INSERT INTO eddyq_group_rules (pattern, max_concurrency, priority) VALUES ('shopify:*', 5, 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Enqueue via SQL with a matching group_key.
+    let _: Option<i64> = sqlx::query_scalar(
+        "SELECT eddyq_enqueue('sync', $1::jsonb, 'default', 0::smallint, 3, NOW(), NULL, 'shopify:42')",
+    )
+    .bind(json!({"shop": 42}))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let cap: i32 = sqlx::query_scalar(
+        "SELECT max_concurrency FROM eddyq_groups WHERE key = 'shopify:42'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cap, 5, "pattern rule 'shopify:*' should have materialized the row");
+}

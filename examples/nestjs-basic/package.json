@@ -12,6 +12,7 @@
     "dev": "tsc -p tsconfig.json --watch"
   },
   "dependencies": {
+    "@eddyq/board": "workspace:*",
     "@eddyq/nestjs": "workspace:*",
     "@eddyq/queue": "workspace:*",
     "@nestjs/common": "^11.0.0",

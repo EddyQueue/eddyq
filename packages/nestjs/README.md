@@ -205,9 +205,77 @@ minute-interval cron, you get one catch-up enqueue, not sixty.
 
 ## Transactional enqueue
 
-Not yet surfaced in the NestJS module — the underlying core supports it
-(`enqueue_in_tx`) but the Node binding doesn't expose a transactional entry
-point. Track progress in the roadmap.
+The main reason to use a Postgres-backed queue over Redis: your domain write
+and your job enqueue commit atomically. If the commit fails, no invoice *and*
+no follow-up job. If the job is queued, the invoice definitely exists.
+
+eddyq exposes this via a **SQL function** (`eddyq_enqueue`) that runs inside
+your own DB client's transaction — Prisma, Drizzle, Knex, pg, whatever you
+already use:
+
+```ts
+// Prisma
+await prisma.$transaction(async (tx) => {
+  const invoice = await tx.invoice.create({ data });
+  await tx.$executeRaw`
+    SELECT eddyq_enqueue(
+      'send.receipt',
+      ${JSON.stringify({ invoiceId: invoice.id })}::jsonb
+    )
+  `;
+});
+
+// Drizzle
+await db.transaction(async (tx) => {
+  const [invoice] = await tx.insert(invoices).values(data).returning();
+  await tx.execute(sql`
+    SELECT eddyq_enqueue(
+      'send.receipt',
+      ${JSON.stringify({ invoiceId: invoice.id })}::jsonb
+    )
+  `);
+});
+
+// pg
+await client.query("BEGIN");
+const { rows } = await client.query("INSERT INTO invoices (...) RETURNING id", [...]);
+await client.query(
+  `SELECT eddyq_enqueue('send.receipt', $1::jsonb)`,
+  [JSON.stringify({ invoiceId: rows[0].id })],
+);
+await client.query("COMMIT");
+```
+
+The full signature:
+
+```sql
+eddyq_enqueue(
+  p_kind          text,
+  p_payload       jsonb,
+  p_queue         text        DEFAULT 'default',
+  p_priority      smallint    DEFAULT 0,
+  p_max_attempts  integer     DEFAULT 3,
+  p_scheduled_at  timestamptz DEFAULT now(),
+  p_unique_key    text        DEFAULT null,
+  p_group_key     text        DEFAULT null,
+  p_tags          text[]      DEFAULT '{}',
+  p_metadata      jsonb       DEFAULT '{}'
+) RETURNS bigint  -- the new job id, or NULL on unique_key conflict
+```
+
+And a bulk variant `eddyq_enqueue_many(jsonb)` taking a JSONB array of job
+objects, returning `{ inserted: N, skipped: N }`.
+
+The SQL path mirrors the Rust path exactly — same INSERT, same pattern-rule
+materialization for `group_key`, same `pg_notify`. An integration test in
+`eddyq-core` enqueues the same job via both paths and asserts identical rows,
+so they can't drift.
+
+**When to use which:**
+- `this.queue.enqueue(...)` via `@InjectEddyq` — simple fire-and-forget, no
+  outer transaction. The 90% case.
+- `SELECT eddyq_enqueue(...)` inside your ORM's transaction — when the job
+  must be atomic with a domain write.
 
 ## Migrations
 

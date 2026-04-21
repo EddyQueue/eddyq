@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 
+import { EddyqBoardModule } from "@eddyq/board";
 import { EddyqModule } from "@eddyq/nestjs";
 
 import { EmailModule } from "./email/email.module.js";
@@ -19,6 +20,10 @@ const DEFAULT_DATABASE_URL =
     EddyqModule.forRoot({
       databaseUrl: process.env.EDDYQ_DATABASE_URL ?? DEFAULT_DATABASE_URL,
       autoStart: false,
+    }),
+    EddyqBoardModule.forRoot({
+      mountPath: '/board',
+      auth: { password: process.env.BOARD_PASSWORD ?? 'admin' },
     }),
     EmailModule,
     ReportsModule,

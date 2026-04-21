@@ -129,3 +129,160 @@ CREATE TABLE eddyq_schedules (
 );
 
 CREATE INDEX eddyq_schedules_due ON eddyq_schedules (next_run_at) WHERE enabled;
+
+-- ─── SQL enqueue functions ─────────────────────────────────────────────────
+-- Expose the enqueue path to non-Rust callers so Node/Python/Ruby can
+-- participate in transactional enqueue through their own DB client. The
+-- Rust path in `eddyq_core::enqueue::enqueue_dyn` does three things:
+--   1. INSERT into eddyq_jobs with ON CONFLICT DO NOTHING
+--   2. If inserted AND group_key IS NOT NULL: materialize an eddyq_groups row
+--      from the best-matching eddyq_group_rules pattern
+--   3. If inserted AND scheduled_at <= NOW(): pg_notify('eddyq_job', '')
+-- These functions mirror that logic exactly.
+--
+-- Example (Prisma / Drizzle / pg inside an app transaction):
+--   BEGIN;
+--     INSERT INTO invoices (...) VALUES (...);
+--     SELECT eddyq_enqueue('send.receipt', '{"invoiceId":42}'::jsonb);
+--   COMMIT;
+
+
+
+-- Internal helper: mirrors Rust's group::materialize_from_rule.
+CREATE OR REPLACE FUNCTION eddyq_materialize_group_from_rule(p_key TEXT)
+RETURNS VOID AS $$
+BEGIN
+    INSERT INTO eddyq_groups (
+        key, max_concurrency, paused, rate_count, rate_period_ms, tokens, tokens_refilled_at
+    )
+    SELECT
+        p_key,
+        COALESCE(r.max_concurrency, 2147483647),
+        FALSE,
+        r.rate_count,
+        r.rate_period_ms,
+        COALESCE(r.rate_count::double precision, 0),
+        CASE WHEN r.rate_count IS NOT NULL THEN NOW() END
+      FROM eddyq_group_rules r
+     WHERE p_key LIKE REPLACE(REPLACE(r.pattern, '*', '%'), '?', '_')
+  ORDER BY r.priority DESC, LENGTH(r.pattern) DESC
+     LIMIT 1
+    ON CONFLICT (key) DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Single-job enqueue. Returns the new job id, or NULL on unique_key conflict.
+CREATE OR REPLACE FUNCTION eddyq_enqueue(
+    p_kind          TEXT,
+    p_payload       JSONB,
+    p_queue         TEXT        DEFAULT 'default',
+    p_priority      SMALLINT    DEFAULT 0,
+    p_max_attempts  INTEGER     DEFAULT 3,
+    p_scheduled_at  TIMESTAMPTZ DEFAULT NOW(),
+    p_unique_key    TEXT        DEFAULT NULL,
+    p_group_key     TEXT        DEFAULT NULL,
+    p_tags          TEXT[]      DEFAULT ARRAY[]::text[],
+    p_metadata      JSONB       DEFAULT '{}'::jsonb
+) RETURNS BIGINT AS $$
+DECLARE
+    v_id      BIGINT;
+    v_due_now BOOLEAN := p_scheduled_at <= NOW();
+BEGIN
+    INSERT INTO eddyq_jobs (
+        kind, payload, state, priority, max_attempts, scheduled_at,
+        unique_key, group_key, tags, metadata, queue
+    )
+    VALUES (
+        p_kind, p_payload, 'pending', p_priority, p_max_attempts, p_scheduled_at,
+        p_unique_key, p_group_key, p_tags, p_metadata, p_queue
+    )
+    ON CONFLICT DO NOTHING
+    RETURNING id INTO v_id;
+
+    IF v_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    IF p_group_key IS NOT NULL THEN
+        PERFORM eddyq_materialize_group_from_rule(p_group_key);
+    END IF;
+
+    IF v_due_now THEN
+        PERFORM pg_notify('eddyq_job', '');
+    END IF;
+
+    RETURN v_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Bulk enqueue. Input is a JSONB array of job objects. Returns
+-- { inserted: N, skipped: N } aggregate counts.
+CREATE OR REPLACE FUNCTION eddyq_enqueue_many(p_items JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    v_inserted INTEGER := 0;
+    v_skipped  INTEGER := 0;
+    v_row_id   BIGINT;
+    v_item     JSONB;
+    v_any_due  BOOLEAN := FALSE;
+    v_groups   TEXT[] := ARRAY[]::text[];
+    v_gk       TEXT;
+BEGIN
+    IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' THEN
+        RAISE EXCEPTION 'eddyq_enqueue_many: p_items must be a JSONB array';
+    END IF;
+
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items) LOOP
+        INSERT INTO eddyq_jobs (
+            kind, payload, state, priority, max_attempts, scheduled_at,
+            unique_key, group_key, tags, metadata, queue
+        )
+        VALUES (
+            v_item ->> 'kind',
+            v_item -> 'payload',
+            'pending',
+            COALESCE((v_item ->> 'priority')::smallint, 0),
+            COALESCE((v_item ->> 'max_attempts')::integer, (v_item ->> 'maxAttempts')::integer, 3),
+            COALESCE((v_item ->> 'scheduled_at')::timestamptz, (v_item ->> 'scheduledAt')::timestamptz, NOW()),
+            v_item ->> 'unique_key',
+            v_item ->> 'group_key',
+            COALESCE(
+                ARRAY(SELECT jsonb_array_elements_text(v_item -> 'tags')),
+                ARRAY[]::text[]
+            ),
+            COALESCE(v_item -> 'metadata', '{}'::jsonb),
+            COALESCE(v_item ->> 'queue', 'default')
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING id INTO v_row_id;
+
+        IF v_row_id IS NOT NULL THEN
+            v_inserted := v_inserted + 1;
+            IF COALESCE((v_item ->> 'scheduled_at')::timestamptz, NOW()) <= NOW() THEN
+                v_any_due := TRUE;
+            END IF;
+            v_gk := v_item ->> 'group_key';
+            IF v_gk IS NOT NULL AND NOT (v_gk = ANY(v_groups)) THEN
+                v_groups := array_append(v_groups, v_gk);
+            END IF;
+        ELSE
+            v_skipped := v_skipped + 1;
+        END IF;
+    END LOOP;
+
+    FOREACH v_gk IN ARRAY v_groups LOOP
+        PERFORM eddyq_materialize_group_from_rule(v_gk);
+    END LOOP;
+
+    IF v_any_due AND v_inserted > 0 THEN
+        PERFORM pg_notify('eddyq_job', '');
+    END IF;
+
+    RETURN jsonb_build_object('inserted', v_inserted, 'skipped', v_skipped);
+END;
+$$ LANGUAGE plpgsql;
+
+COMMENT ON FUNCTION eddyq_enqueue(TEXT, JSONB, TEXT, SMALLINT, INTEGER, TIMESTAMPTZ, TEXT, TEXT, TEXT[], JSONB) IS
+  'Transactional enqueue for non-Rust callers. Call from inside your own BEGIN/COMMIT to atomically tie a job to a domain write. Returns the new job id, or NULL on unique_key conflict.';
+COMMENT ON FUNCTION eddyq_enqueue_many(JSONB) IS
+  'Bulk transactional enqueue. Accepts a JSONB array of job objects. Returns { inserted, skipped }.';

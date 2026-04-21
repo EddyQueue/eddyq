@@ -1,3 +1,6 @@
+DROP FUNCTION IF EXISTS eddyq_enqueue_many(JSONB);
+DROP FUNCTION IF EXISTS eddyq_enqueue(TEXT, JSONB, TEXT, SMALLINT, INTEGER, TIMESTAMPTZ, TEXT, TEXT, TEXT[], JSONB);
+DROP FUNCTION IF EXISTS eddyq_materialize_group_from_rule(TEXT);
 DROP TABLE IF EXISTS eddyq_schedules;
 DROP TABLE IF EXISTS eddyq_group_rules;
 DROP TABLE IF EXISTS eddyq_groups;

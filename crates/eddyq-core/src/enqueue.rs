@@ -115,6 +115,9 @@ pub struct BulkEnqueueResult {
 /// than calling `enqueue()` N times. Pattern rules still materialize per group
 /// (one ensure-from-rule call per distinct group key in the batch).
 ///
+/// **Atomicity:** INSERT + group-rule materialization + the workers NOTIFY all
+/// commit (or roll back) together in one transaction.
+///
 /// Returns the aggregate count: inserted + skipped (due to unique-key
 /// conflicts). For per-row results, use `enqueue` in a loop.
 pub async fn enqueue_many<J: Job>(
@@ -124,19 +127,9 @@ pub async fn enqueue_many<J: Job>(
     if jobs.is_empty() {
         return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
     }
-    let mut conn = pool.acquire().await?;
-    let (result, any_due_now, distinct_groups) = insert_many(&mut conn, jobs).await?;
-
-    for g in &distinct_groups {
-        crate::group::materialize_from_rule(&mut conn, g).await?;
-    }
-
-    if any_due_now && result.inserted > 0 {
-        let _ = sqlx::query("SELECT pg_notify('eddyq_job', '')")
-            .execute(&mut *conn)
-            .await;
-    }
-
+    let mut tx = pool.begin().await?;
+    let result = enqueue_many_in_tx(&mut tx, jobs).await?;
+    tx.commit().await?;
     Ok(result)
 }
 
@@ -178,10 +171,13 @@ async fn insert_many<J: Job>(
     let mut scheduled_ats: Vec<DateTime<Utc>> = Vec::with_capacity(jobs.len());
     let mut unique_keys: Vec<Option<String>> = Vec::with_capacity(jobs.len());
     let mut group_keys: Vec<Option<String>> = Vec::with_capacity(jobs.len());
+    // Per-row text[] tags can't be passed as a Postgres multidim array
+    // (those require rectangular shape). Serialize each row's tags as a JSON
+    // array and convert back to text[] in SQL via `jsonb_array_elements_text`.
+    let mut tags: Vec<serde_json::Value> = Vec::with_capacity(jobs.len());
     let mut metadatas: Vec<serde_json::Value> = Vec::with_capacity(jobs.len());
     let mut queues: Vec<String> = Vec::with_capacity(jobs.len());
 
-    let mut any_due_now = false;
     for job in jobs {
         payloads.push(serde_json::to_value(job)?);
         priorities.push(job.priority());
@@ -189,18 +185,20 @@ async fn insert_many<J: Job>(
         scheduled_ats.push(now);
         unique_keys.push(job.unique_key());
         group_keys.push(job.group_key());
+        tags.push(serde_json::Value::Array(
+            job.tags().into_iter().map(serde_json::Value::String).collect(),
+        ));
         metadatas.push(
             job.metadata()
                 .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         );
         queues.push(job.queue().to_owned());
-        any_due_now = true;
     }
 
     let rows_inserted: (i64,) = sqlx::query_as(
         r#"
         WITH inserted AS (
-            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
             SELECT $1,
                    t.payload,
                    'pending',
@@ -209,12 +207,13 @@ async fn insert_many<J: Job>(
                    t.scheduled_at,
                    t.unique_key,
                    t.group_key,
+                   COALESCE(ARRAY(SELECT jsonb_array_elements_text(t.tags)), ARRAY[]::text[]),
                    t.metadata,
                    t.queue
               FROM UNNEST(
                   $2::jsonb[], $3::smallint[], $4::int[],
-                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::text[]
-              ) AS t(payload, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[]
+              ) AS t(payload, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
             ON CONFLICT DO NOTHING
          RETURNING id
         )
@@ -228,6 +227,7 @@ async fn insert_many<J: Job>(
     .bind(&scheduled_ats)
     .bind(&unique_keys)
     .bind(&group_keys)
+    .bind(&tags)
     .bind(&metadatas)
     .bind(&queues)
     .fetch_one(&mut *conn)
@@ -244,7 +244,7 @@ async fn insert_many<J: Job>(
 
     Ok((
         BulkEnqueueResult { inserted, skipped },
-        any_due_now,
+        true,
         distinct_groups,
     ))
 }
@@ -456,10 +456,10 @@ async fn insert_many_dyn(
 
 /// Dynamic-kind bulk enqueue. Mixed kinds in one batch are supported — unlike
 /// the typed `enqueue_many`, which constrains the batch to a single `J::KIND`.
+/// Per-item `tags` are passed through.
 ///
-/// Per-item `tags` are passed through. The typed `enqueue_many` path doesn't
-/// yet support tags; if you need tagged jobs from Rust, use `enqueue_dyn`
-/// with `DynEnqueue::new` or call this function.
+/// **Atomicity:** INSERT + group-rule materialization + the workers NOTIFY all
+/// commit (or roll back) together in one transaction.
 pub async fn enqueue_many_dyn(
     pool: &PgPool,
     reqs: Vec<DynEnqueue>,
@@ -467,19 +467,9 @@ pub async fn enqueue_many_dyn(
     if reqs.is_empty() {
         return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
     }
-    let mut conn = pool.acquire().await?;
-    let (result, any_due_now, distinct_groups) = insert_many_dyn(&mut conn, reqs).await?;
-
-    for g in &distinct_groups {
-        crate::group::materialize_from_rule(&mut conn, g).await?;
-    }
-
-    if any_due_now && result.inserted > 0 {
-        let _ = sqlx::query("SELECT pg_notify('eddyq_job', '')")
-            .execute(&mut *conn)
-            .await;
-    }
-
+    let mut tx = pool.begin().await?;
+    let result = enqueue_many_dyn_in_tx(&mut tx, reqs).await?;
+    tx.commit().await?;
     Ok(result)
 }
 
