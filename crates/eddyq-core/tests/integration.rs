@@ -1440,7 +1440,7 @@ async fn cleanup_deletes_old_finalized_jobs(pool: PgPool) {
     // Seed 5 finalized jobs at various ages + states + one young job.
     sqlx::query(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, completed_at)
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
         VALUES
             ('old_ok',  '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 hours'),
             ('new_ok',  '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '30 seconds'),
@@ -1480,7 +1480,7 @@ async fn cleanup_respects_none_retention(pool: PgPool) {
     // An ancient completed job; with None retention it must not be deleted.
     sqlx::query(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, completed_at)
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
         VALUES ('ancient', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '365 days')
         "#,
     )
@@ -1511,10 +1511,10 @@ async fn cleanup_respects_none_retention(pool: PgPool) {
 async fn cleanup_does_not_touch_pending_or_running(pool: PgPool) {
     use eddyq_core::fetch::{Retention, cleanup};
 
-    // Pending + running jobs, whose completed_at is NULL.
+    // Pending + running jobs, whose finalized_at is NULL.
     sqlx::query(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, completed_at)
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
         VALUES
             ('pending_job', '{}'::jsonb, 'pending', 0, 3, NULL),
             ('running_job', '{}'::jsonb, 'running', 1, 3, NULL)

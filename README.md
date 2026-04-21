@@ -10,21 +10,16 @@
 - **Transactional enqueue.** Enqueue a job in the same transaction as your business write. No more "the job ran before the row committed" bugs.
 - **First-class Node bindings.** `pnpm add @eddyq/queue` and ship from NestJS, Next.js, or any Node app.
 - **River-grade Postgres semantics.** Hybrid LISTEN/NOTIFY + polling wakeup with jitter and debouncing. PgBouncer-aware deployment modes.
-- **Group concurrency** (Phase 2). Limit concurrent jobs per tenant, per provider, per anything.
+- **Group concurrency.** Limit concurrent jobs per tenant, per provider, per anything.
 
-## Project status
+## Migrations are a deploy step
 
-eddyq is in **Phase 0** of its [v1.0 roadmap](docs/decisions/). The current focus is foundations: workspace, CI, ADRs, and a benchmark harness — *before* writing any queue logic, so design choices are bench-verified.
-
-| Phase | Status |
-|-------|--------|
-| 0 — Foundations & benchmarks | 🟡 in progress |
-| 1 — Core queue | ⏳ |
-| 2 — Differentiators (groups, rate limits, transactional enqueue) | ⏳ |
-| 3 — NAPI-RS Node bindings | ⏳ |
-| 4 — Observability + dashboard | ⏳ |
-| 5 — Production hardening | ⏳ |
-| 6 — v1.0 launch | ⏳ |
+eddyq owns its own schema and ships migrations, but **they do not run
+automatically at app boot**. Apply them via `eddyq migrate run` or a Node
+one-shot script **before** starting workers. `eddyq.start()` refuses to boot
+against a stale schema and tells you how to fix it. See
+[ADR 011](docs/decisions/011-migrations-deploy-step.md) and
+[`@eddyq/queue` README](packages/queue/README.md#migrations--deploy-step-not-auto-apply).
 
 ## Workspace layout
 
@@ -37,7 +32,7 @@ crates/
 packages/
   queue/           # @eddyq/queue — TS wrapper
   nestjs/          # @eddyq/nestjs — NestJS module + decorators
-  dashboard/       # web UI (Phase 4)
+  dashboard/       # web UI
 docs/decisions/    # ADRs
 benches/           # benchmark harness vs sqlxmq, graphile-worker, BullMQ
 ```
@@ -53,4 +48,4 @@ at your option.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues, PRs, and design discussions all welcome — but note this project is still in Phase 0 and the architecture is largely locked via [ADRs](docs/decisions/).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues, PRs, and design discussions all welcome — but note the architecture is largely locked via [ADRs](docs/decisions/).

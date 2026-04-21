@@ -1,5 +1,240 @@
 # @eddyq/nestjs
 
-NestJS module + decorators for [eddyq](https://github.com/eddyqueue/eddyq).
+NestJS module for [eddyq](https://github.com/eddyqueue/eddyq) — a Rust + Postgres
+job queue with native Node bindings.
 
-**Pre-alpha.** Real bindings land in Phase 3 of the v1.0 roadmap.
+```
+pnpm add @eddyq/queue @eddyq/nestjs
+```
+
+> npm has a long-standing bug with `optionalDependencies` + lockfiles that
+> breaks packages shipping prebuilt binaries. **Use pnpm or yarn.**
+
+## Quick start
+
+```ts
+// app.module.ts
+import { Module } from "@nestjs/common";
+import { EddyqModule } from "@eddyq/nestjs";
+import { EmailProcessor } from "./email.processor";
+
+@Module({
+  imports: [
+    EddyqModule.forRoot({
+      databaseUrl: process.env.DATABASE_URL!,
+      workerConcurrency: 20,
+      subscribeTo: ["default", "urgent"],
+    }),
+  ],
+  providers: [EmailProcessor],
+})
+export class AppModule {}
+```
+
+```ts
+// email.processor.ts
+import { Processor, JobHandler, type JobCall } from "@eddyq/nestjs";
+
+@Processor()
+export class EmailProcessor {
+  @JobHandler("send.email")
+  async send({ payload, id, attempt }: JobCall) {
+    // throw to retry with exponential backoff.
+    // throw new CancelError(...) to fail permanently.
+    // throw new RetryError(..., { delayMs }) to retry at a specific delay.
+    await sendgrid.send(payload);
+  }
+}
+```
+
+```ts
+// some.controller.ts — enqueueing from a request handler
+import { Controller, Post, Body } from "@nestjs/common";
+import { InjectEddyq, type Eddyq } from "@eddyq/nestjs";
+
+@Controller("notify")
+export class NotifyController {
+  constructor(@InjectEddyq() private readonly queue: Eddyq) {}
+
+  @Post()
+  async fanout(@Body() body: { to: string; subject: string }) {
+    const r = await this.queue.enqueue("send.email", body, {
+      uniqueKey: `${body.to}:${Date.now()}`,
+      priority: 5,
+    });
+    return { jobId: r.id };
+  }
+}
+```
+
+That's the whole surface. Start Nest normally (`nest start`) — on
+`onApplicationBootstrap` the module scans every provider for `@Processor()` +
+`@JobHandler(kind)`, registers each as a worker, and starts the runtime.
+On shutdown it drains in-flight jobs (default 30s grace) and closes the pool.
+
+## Module configuration
+
+### `forRoot(options)`
+
+```ts
+EddyqModule.forRoot({
+  databaseUrl: "postgres://…",
+
+  // Forwarded to `Eddyq.connect` — pool sizing + migration line.
+  connectOptions: { maxConnections: 20, line: "main" },
+
+  // Worker runtime (ignored if you have no @JobHandler providers).
+  workerConcurrency: 20,            // default 10
+  subscribeTo: ["default"],         // default ["default"]
+  gracefulShutdownMs: 30_000,       // default 30_000
+
+  // Lifecycle knobs.
+  autoStart: true,                  // default true — false = register handlers only
+  skipMigrationCheck: false,        // default false — match core's deploy-step guard
+  runMigrations: false,             // default false — migrations are a deploy step
+});
+```
+
+### `forRootAsync(options)` — for DI-sourced config
+
+```ts
+EddyqModule.forRootAsync({
+  imports: [ConfigModule],
+  inject: [ConfigService],
+  useFactory: (cfg: ConfigService) => ({
+    databaseUrl: cfg.getOrThrow("DATABASE_URL"),
+    workerConcurrency: cfg.get<number>("QUEUE_CONCURRENCY") ?? 10,
+  }),
+});
+```
+
+## Error handling
+
+Handlers can throw three things:
+
+| Throw                                     | Effect                                                   |
+| ----------------------------------------- | -------------------------------------------------------- |
+| Any `Error`                               | Job retries with exponential backoff until `maxAttempts` |
+| `new CancelError(msg)`                    | Mark failed permanently — no more retries                |
+| `new RetryError(msg, { delayMs: 60_000 })` | Retry at a specific delay (e.g. honor `Retry-After`)     |
+
+```ts
+import { CancelError, RetryError } from "@eddyq/nestjs";
+
+@JobHandler("webhook.call")
+async call({ payload }: JobCall) {
+  const r = await fetch(payload.url, { method: "POST" });
+  if (r.status === 429) {
+    const after = Number(r.headers.get("retry-after")) * 1000;
+    throw new RetryError("rate limited", { delayMs: after });
+  }
+  if (r.status === 400) throw new CancelError("bad request — no retry");
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+}
+```
+
+### Cooperative cancellation
+
+On `app.close()` eddyq broadcasts `.abort()` to every in-flight handler.
+Destructure `signal` off the `JobCall` and pass it to anything that accepts
+an `AbortSignal`:
+
+```ts
+@JobHandler("download")
+async download({ payload, signal }: JobCall) {
+  const r = await fetch(payload.url, { signal });
+  return await r.json();
+}
+```
+
+## Admin, stats, and schedules
+
+The raw `Eddyq` client is exported globally — inject it anywhere:
+
+```ts
+import { InjectEddyq, type Eddyq } from "@eddyq/nestjs";
+
+@Injectable()
+export class QueueAdmin {
+  constructor(@InjectEddyq() private readonly q: Eddyq) {}
+
+  async pauseIntegrations() {
+    await this.q.pauseQueue("integrations");
+  }
+
+  async dashboard() {
+    const [stats, queues, groups] = await Promise.all([
+      this.q.getStats(),
+      this.q.listNamedQueues(),
+      this.q.listGroups(),
+    ]);
+    return { stats, queues, groups };
+  }
+}
+```
+
+See `@eddyq/queue` for the full method list: `enqueue`, `cancel`, `getStats`,
+`listJobs`, `setGroupConcurrency`, `setGroupRate`, `setQueueConcurrency`,
+`setQueueTimeout`, `addSchedule`, `removeSchedule`, and more.
+
+## Cron schedules
+
+```ts
+@Injectable()
+export class ReportSchedules implements OnApplicationBootstrap {
+  constructor(@InjectEddyq() private readonly q: Eddyq) {}
+
+  async onApplicationBootstrap() {
+    // Cron dialect: 6 fields — `sec min hour dom month dow`.
+    await this.q.addSchedule(
+      "daily-report",
+      "0 0 8 * * *",       // every day at 08:00:00 UTC
+      "report.generate",
+      { scope: "daily" },
+      { priority: 5 },
+    );
+  }
+}
+```
+
+`addSchedule` is an idempotent upsert keyed on `name`, so re-registering on
+every boot is the intended pattern. The scheduler runs with single-leader
+election (Postgres advisory lock) so N replicas never double-fire a tick, and
+uses skip-missed semantics — if the cluster was down for an hour against a
+minute-interval cron, you get one catch-up enqueue, not sixty.
+
+## Transactional enqueue
+
+Not yet surfaced in the NestJS module — the underlying core supports it
+(`enqueue_in_tx`) but the Node binding doesn't expose a transactional entry
+point. Track progress in the roadmap.
+
+## Migrations
+
+Migrations are a **deploy-step concern**, not a runtime one. The default
+`start()` path refuses to boot if any registered migration is unapplied — this
+matches River's model and prevents rolling deploys from running workers
+against a stale schema.
+
+Three ways to apply migrations, in order of recommendation:
+
+1. **A one-shot deploy job** (e.g. Kubernetes `Job`, ECS one-off task) that
+   calls `Eddyq.connect(url).then((q) => q.migrate())` before workers roll.
+2. The `eddyq` CLI: `eddyq migrate run --database-url $DATABASE_URL`.
+3. **`runMigrations: true`** in `forRoot` — applies on bootstrap. Only use
+   this for local dev or tests; it serializes every replica's boot behind
+   schema migration.
+
+Set `skipMigrationCheck: true` if you manage migrations out-of-band and want
+to silence the boot-time guard.
+
+## Requirements
+
+- Node ≥ 20
+- PostgreSQL ≥ 14
+- `@nestjs/common` and `@nestjs/core` ^10 or ^11 (peer deps)
+- `@eddyq/queue` same minor version (peer dep)
+
+## License
+
+MIT OR Apache-2.0

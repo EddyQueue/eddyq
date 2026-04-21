@@ -14,11 +14,12 @@ pub mod queue;
 pub mod retry;
 mod runtime;
 pub mod schedule;
+pub mod stats;
 pub mod worker;
 
 pub use async_trait::async_trait;
-pub use enqueue::{EnqueueOptions, EnqueueResult};
-pub use error::{Error, JobResult, Result};
+pub use enqueue::{BulkEnqueueResult, DynEnqueue, EnqueueOptions, EnqueueResult};
+pub use error::{Directive, Error, HandlerFailure, JobResult, Result};
 pub use job::{Job, JobContext, JobId, JobState};
 pub use queue::{Queue, QueueBuilder, QueueConfig};
 pub use worker::{Worker, WorkerRegistry};

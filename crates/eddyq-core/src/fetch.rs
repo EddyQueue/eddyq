@@ -43,13 +43,13 @@ pub async fn claim_batch(
     pool: &PgPool,
     worker_id: Uuid,
     batch_size: usize,
-    kinds: &[&str],
+    kinds: &[String],
     queues: &[String],
 ) -> Result<Vec<ClaimedJob>> {
     if batch_size == 0 || kinds.is_empty() || queues.is_empty() {
         return Ok(vec![]);
     }
-    let kinds_vec: Vec<String> = kinds.iter().map(|s| (*s).to_owned()).collect();
+    let kinds_vec: Vec<String> = kinds.to_vec();
 
     let mut tx = pool.begin().await?;
 
@@ -408,12 +408,14 @@ fn _assert_tx_type(_: &mut Transaction<'_, Postgres>) {}
 pub async fn cancel(pool: &PgPool, id: JobId) -> Result<bool> {
     // If the job had a group_key, decrement the counter — but only if it was
     // in a state where it had been counted (it wasn't: pending jobs don't
-    // contribute to running_count). So we just transition state + completed_at.
+    // contribute to running_count). So we just transition state + finalized_at.
+    // NB: `finalized_at` is our unified name for "entered a terminal state" —
+    // it's set on completed, failed (no-more-retries), and cancelled jobs.
     let res = sqlx::query(
         r#"
         UPDATE eddyq_jobs
            SET state        = 'cancelled',
-               completed_at = NOW()
+               finalized_at = NOW()
          WHERE id = $1
            AND state = 'pending'
         "#,
@@ -446,13 +448,13 @@ pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u
     ] {
         let Some(secs) = maybe_secs else { continue };
         let secs = i64::try_from(secs).unwrap_or(i64::MAX);
-        // Uses eddyq_jobs_finalized (completed_at DESC) partial index.
+        // Uses eddyq_jobs_finalized (finalized_at DESC) partial index.
         let res = sqlx::query(
             r#"
             DELETE FROM eddyq_jobs
              WHERE state = $1
-               AND completed_at IS NOT NULL
-               AND completed_at < NOW() - make_interval(secs => $2)
+               AND finalized_at IS NOT NULL
+               AND finalized_at < NOW() - make_interval(secs => $2)
             "#,
         )
         .bind(state)
@@ -465,7 +467,12 @@ pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u
     Ok((completed, failed, cancelled))
 }
 
-pub async fn mark_completed(pool: &PgPool, id: JobId, worker_id: Uuid) -> Result<()> {
+pub async fn mark_completed(
+    pool: &PgPool,
+    id: JobId,
+    worker_id: Uuid,
+    result: Option<serde_json::Value>,
+) -> Result<()> {
     // Gate on (state='running' AND worker_id = our uuid) so a worker whose
     // heartbeat was swept can't clobber the job state after another worker
     // picked it up. Decrements both the group counter (if any) AND the queue
@@ -477,7 +484,8 @@ pub async fn mark_completed(pool: &PgPool, id: JobId, worker_id: Uuid) -> Result
            SET state        = 'completed',
                heartbeat_at = NULL,
                worker_id    = NULL,
-               completed_at = NOW()
+               finalized_at = NOW(),
+               result       = $3
          WHERE id = $1
            AND state = 'running'
            AND worker_id = $2
@@ -486,6 +494,7 @@ pub async fn mark_completed(pool: &PgPool, id: JobId, worker_id: Uuid) -> Result
     )
     .bind(id)
     .bind(worker_id)
+    .bind(result)
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((group_key, queue)) = row {
@@ -546,7 +555,7 @@ pub async fn sweep_stale(
                    heartbeat_at = NULL,
                    worker_id    = NULL,
                    errors       = errors || $2::jsonb,
-                   completed_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
+                   finalized_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
              WHERE state = 'running'
                AND heartbeat_at < NOW() - make_interval(secs => $1)
          RETURNING group_key, queue
@@ -597,13 +606,9 @@ pub async fn mark_failed(
     pool: &PgPool,
     id: JobId,
     worker_id: Uuid,
-    error: &str,
+    error_entry: serde_json::Value,
     retry_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    let error_entry = serde_json::json!({
-        "at": chrono::Utc::now(),
-        "message": error,
-    });
 
     let mut tx = pool.begin().await?;
 
@@ -636,7 +641,7 @@ pub async fn mark_failed(
                    heartbeat_at = NULL,
                    worker_id    = NULL,
                    errors       = errors || $2::jsonb,
-                   completed_at = NOW()
+                   finalized_at = NOW()
              WHERE id = $1
                AND state = 'running'
                AND worker_id = $3

@@ -1,0 +1,11 @@
+{
+  "entryPoints": ["src/index.ts"],
+  "tsconfig": "tsconfig.json",
+  "out": "docs",
+  "name": "@eddyq/nestjs",
+  "readme": "README.md",
+  "includeVersion": true,
+  "navigationLinks": {
+    "GitHub": "https://github.com/eddyqueue/eddyq"
+  }
+}

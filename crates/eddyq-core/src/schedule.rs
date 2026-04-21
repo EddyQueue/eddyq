@@ -31,14 +31,37 @@ pub async fn upsert_schedule<J: Job>(
     cron_expr: &str,
     job: &J,
 ) -> Result<()> {
+    let payload = serde_json::to_value(job)?;
+    upsert_schedule_raw(
+        pool,
+        name,
+        cron_expr,
+        J::KIND,
+        payload,
+        job.priority(),
+        job.max_attempts(),
+    )
+    .await
+}
+
+/// JSON-payload variant of `upsert_schedule` — used by language bindings and
+/// dynamic callers that don't have a typed `Job` at hand. Validates the cron
+/// expression and computes the first `next_run_at` before inserting.
+pub async fn upsert_schedule_raw(
+    pool: &PgPool,
+    name: &str,
+    cron_expr: &str,
+    kind: &str,
+    payload: serde_json::Value,
+    priority: i16,
+    max_attempts: i32,
+) -> Result<()> {
     let schedule = CronSchedule::from_str(cron_expr)
         .map_err(|e| crate::error::Error::Cron(e.to_string()))?;
     let next = schedule
         .upcoming(Utc)
         .next()
         .ok_or_else(|| crate::error::Error::Cron("cron never fires".into()))?;
-
-    let payload = serde_json::to_value(job)?;
 
     sqlx::query(
         r#"
@@ -56,12 +79,12 @@ pub async fn upsert_schedule<J: Job>(
         "#,
     )
     .bind(name)
-    .bind(J::KIND)
+    .bind(kind)
     .bind(payload)
     .bind(cron_expr)
     .bind(next)
-    .bind(job.priority())
-    .bind(job.max_attempts())
+    .bind(priority)
+    .bind(max_attempts)
     .execute(pool)
     .await?;
 

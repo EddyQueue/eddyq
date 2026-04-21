@@ -5,10 +5,10 @@
   "license": "(MIT OR Apache-2.0)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/eddyqueue/eddyq.git",
+    "url": "git+https://github.com/remstone7/eddyq.git",
     "directory": "packages/nestjs"
   },
-  "homepage": "https://github.com/eddyqueue/eddyq",
+  "homepage": "https://github.com/remstone7/eddyq",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
@@ -19,12 +19,19 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "echo \"no tests yet\" && exit 0",
-    "lint": "echo \"no lint yet\" && exit 0"
+    "lint": "echo \"no lint yet\" && exit 0",
+    "docs": "typedoc"
   },
   "peerDependencies": {
     "@eddyq/queue": "workspace:*",
     "@nestjs/common": "^10 || ^11",
     "@nestjs/core": "^10 || ^11"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "reflect-metadata": "^0.2.0",
+    "rxjs": "^7.8.0",
+    "typedoc": "^0.28.0"
   },
   "engines": {
     "node": ">=20"

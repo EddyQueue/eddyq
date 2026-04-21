@@ -1,0 +1,10 @@
+{
+  "entryPoints": ["index.d.ts"],
+  "out": "docs",
+  "name": "@eddyq/queue",
+  "readme": "README.md",
+  "includeVersion": true,
+  "navigationLinks": {
+    "GitHub": "https://github.com/eddyqueue/eddyq"
+  }
+}

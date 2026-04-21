@@ -12,7 +12,7 @@ eddyq is in pre-alpha. Once v1.0 ships, the latest minor release will receive se
 
 **Please do not report vulnerabilities via public GitHub issues.**
 
-Instead, email the maintainers at `security@eddyq.dev` (replace once domain is secured) with:
+Instead, email the maintainers at `security@eddyq.dev` with:
 
 - A description of the vulnerability
 - Steps to reproduce

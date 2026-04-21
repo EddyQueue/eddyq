@@ -11,11 +11,14 @@ dist/
 build/
 .turbo/
 
+# Generated docs
+packages/queue/docs/
+
 # NAPI-RS prebuilds
 *.node
-crates/eddyq-napi/index.js
-crates/eddyq-napi/index.d.ts
-crates/eddyq-napi/npm/
+packages/queue/index.js
+packages/queue/index.d.ts
+packages/queue/npm/
 
 # IDE / editor
 .idea/

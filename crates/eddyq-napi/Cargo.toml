@@ -21,11 +21,13 @@ workspace = true
 
 [dependencies]
 eddyq-client = { path = "../eddyq-client", version = "0.0.1" }
-napi = { version = "3", default-features = false, features = ["napi4", "tokio_rt", "serde-json"] }
+napi = { version = "3", default-features = false, features = ["napi4", "tokio_rt", "serde-json", "chrono_date"] }
 napi-derive = "3"
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
 
 [build-dependencies]
 napi-build = "2"

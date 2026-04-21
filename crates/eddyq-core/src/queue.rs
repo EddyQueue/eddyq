@@ -114,6 +114,19 @@ impl QueueBuilder {
         self
     }
 
+    /// Register a handler keyed by string `kind` (no `Job` trait required).
+    /// Used by language bindings where the handler is a foreign function.
+    pub fn register_dyn<F, Fut>(mut self, kind: impl Into<String>, f: F) -> Self
+    where
+        F: Fn(serde_json::Value, crate::job::JobContext) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::error::JobResult<serde_json::Value>>
+            + Send
+            + 'static,
+    {
+        self.registry.register_dyn(kind, f);
+        self
+    }
+
     pub fn config(mut self, config: QueueConfig) -> Self {
         self.config = config;
         self
@@ -389,6 +402,23 @@ impl Queue {
 
     pub async fn list_named_queues(&self) -> Result<Vec<crate::named_queue::NamedQueue>> {
         crate::named_queue::list(&self.pool).await
+    }
+
+    // --- Stats / read-only queries ----------------------------------------
+
+    /// One-shot snapshot of job counts grouped by (queue, state). Single SQL
+    /// round trip — suitable as the landing query for a dashboard.
+    pub async fn get_stats(&self) -> Result<crate::stats::JobStats> {
+        crate::stats::get_stats(&self.pool).await
+    }
+
+    /// Paginated job listing with optional filters. Ordered newest-first.
+    pub async fn list_jobs(
+        &self,
+        filter: crate::stats::ListJobsFilter,
+        pagination: crate::stats::Pagination,
+    ) -> Result<crate::stats::JobList> {
+        crate::stats::list_jobs(&self.pool, filter, pagination).await
     }
 
     /// Set a default per-job timeout for jobs in this queue. Handlers that

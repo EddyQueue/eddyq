@@ -249,6 +249,118 @@ async fn insert_many<J: Job>(
     ))
 }
 
+/// Dynamic-kind enqueue request. Used by bindings (Node, CLI, future SDKs)
+/// that don't have a compile-time `Job` trait implementation. All fields are
+/// explicit — the caller provides the defaults a `Job` impl would normally
+/// supply.
+#[derive(Debug, Clone)]
+pub struct DynEnqueue {
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub max_attempts: i32,
+    pub priority: i16,
+    pub queue: String,
+    pub scheduled_at: Option<DateTime<Utc>>,
+    pub unique_key: Option<String>,
+    pub group_key: Option<String>,
+    pub tags: Vec<String>,
+    pub metadata: serde_json::Value,
+}
+
+impl DynEnqueue {
+    /// Build a request with the same defaults the `Job` trait provides:
+    /// `max_attempts=3`, `priority=0`, `queue="default"`, empty tags/metadata.
+    pub fn new(kind: impl Into<String>, payload: serde_json::Value) -> Self {
+        Self {
+            kind: kind.into(),
+            payload,
+            max_attempts: 3,
+            priority: 0,
+            queue: crate::job::DEFAULT_QUEUE.to_owned(),
+            scheduled_at: None,
+            unique_key: None,
+            group_key: None,
+            tags: Vec::new(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+}
+
+async fn insert_dyn(
+    conn: &mut PgConnection,
+    req: DynEnqueue,
+) -> Result<(EnqueueResult, bool)> {
+    let scheduled_at = req.scheduled_at.unwrap_or_else(Utc::now);
+    let due_now = scheduled_at <= Utc::now();
+
+    let row: Option<(JobId,)> = sqlx::query_as(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
+        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(&req.kind)
+    .bind(&req.payload)
+    .bind(req.priority)
+    .bind(req.max_attempts)
+    .bind(scheduled_at)
+    .bind(&req.unique_key)
+    .bind(&req.group_key)
+    .bind(&req.tags)
+    .bind(&req.metadata)
+    .bind(&req.queue)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    let result = match row {
+        Some((id,)) => EnqueueResult::Inserted(id),
+        None => EnqueueResult::Skipped,
+    };
+
+    if matches!(result, EnqueueResult::Inserted(_)) {
+        if let Some(key) = &req.group_key {
+            crate::group::materialize_from_rule(conn, key).await?;
+        }
+    }
+
+    Ok((result, due_now))
+}
+
+/// Pool-based dynamic enqueue. Mirrors `enqueue` but drops the generic `Job`
+/// bound so callers like the Node bindings can pass `kind` and `payload` directly.
+pub async fn enqueue_dyn(pool: &PgPool, req: DynEnqueue) -> Result<EnqueueResult> {
+    let mut conn = pool.acquire().await?;
+    let (result, due_now) = insert_dyn(&mut conn, req).await?;
+
+    if matches!(result, EnqueueResult::Inserted(_)) && due_now {
+        let _ = sqlx::query("SELECT pg_notify('eddyq_job', '')")
+            .execute(&mut *conn)
+            .await;
+    }
+
+    Ok(result)
+}
+
+/// Transactional dynamic enqueue — atomic with the caller's transaction.
+pub async fn enqueue_dyn_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    req: DynEnqueue,
+) -> Result<EnqueueResult> {
+    let conn: &mut PgConnection = tx;
+    let (result, due_now) = insert_dyn(conn, req).await?;
+
+    if matches!(result, EnqueueResult::Inserted(_)) && due_now {
+        let conn: &mut PgConnection = tx;
+        sqlx::query("SELECT pg_notify('eddyq_job', '')")
+            .execute(conn)
+            .await?;
+    }
+
+    Ok(result)
+}
+
 /// Enqueue a job *inside the caller's transaction*. The row — and the NOTIFY —
 /// are visible only if the user commits. Rolling back the transaction discards
 /// both. This is the defining correctness guarantee of eddyq vs Redis-backed

@@ -14,12 +14,13 @@ CREATE TABLE eddyq_jobs (
     heartbeat_at  TIMESTAMPTZ,
     worker_id     UUID,
     errors        JSONB       NOT NULL DEFAULT '[]'::JSONB,
+    result        JSONB,
     unique_key    TEXT,
     group_key     TEXT,
     tags          TEXT[]      NOT NULL DEFAULT '{}',
     metadata      JSONB       NOT NULL DEFAULT '{}'::JSONB,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at  TIMESTAMPTZ,
+    finalized_at  TIMESTAMPTZ,
     CONSTRAINT eddyq_jobs_state_check
         CHECK (state IN ('pending', 'running', 'completed', 'failed', 'scheduled', 'cancelled'))
 );
@@ -55,8 +56,8 @@ CREATE INDEX eddyq_jobs_kind ON eddyq_jobs (kind);
 
 -- Serves: recent completions / failures, archival queries.
 CREATE INDEX eddyq_jobs_finalized
-    ON eddyq_jobs (completed_at DESC)
-    WHERE state IN ('completed', 'failed');
+    ON eddyq_jobs (finalized_at DESC)
+    WHERE state IN ('completed', 'failed', 'cancelled');
 
 -- Serves: filter by tag in dashboards ("show me all jobs tagged 'urgent'").
 CREATE INDEX eddyq_jobs_tags ON eddyq_jobs USING GIN (tags);

@@ -1,6 +1,6 @@
 [package]
 name = "eddyq-benches"
-description = "Benchmark harness for eddyq (not published)"
+description = "Criterion benchmarks for eddyq (not published)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,16 +12,13 @@ publish = false
 workspace = true
 
 [dependencies]
+eddyq-core = { path = "../crates/eddyq-core" }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-async-trait = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
-clap = { version = "4.5", features = ["derive"] }
+uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
@@ -30,6 +27,6 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 name = "enqueue"
 harness = false
 
-[[bin]]
-name = "eddyq-bench"
-path = "src/bin/main.rs"
+[[bench]]
+name = "claim"
+harness = false

@@ -209,8 +209,14 @@ async fn worker_loop(
             Ok(h) => h,
             Err(err) => {
                 warn!(id = job.id, kind = %job.kind, ?err, "no handler for job kind");
+                let entry = crate::error::HandlerFailure {
+                    message: err.to_string(),
+                    name: Some("UnknownKind".into()),
+                    ..Default::default()
+                }
+                .as_error_entry();
                 if let Err(db_err) =
-                    mark_failed(&pool, job.id, job.worker_id, &err.to_string(), None).await
+                    mark_failed(&pool, job.id, job.worker_id, entry, None).await
                 {
                     error!(?db_err, "failed to mark unknown-kind job as failed");
                 }
@@ -263,16 +269,38 @@ async fn worker_loop(
         let _ = heartbeat_task.await;
 
         match result {
-            Ok(Ok(())) => {
-                if let Err(err) = mark_completed(&pool, job.id, job.worker_id).await {
+            Ok(Ok(value)) => {
+                let stored = match value {
+                    serde_json::Value::Null => None,
+                    other => Some(other),
+                };
+                if let Err(err) = mark_completed(&pool, job.id, job.worker_id, stored).await {
                     error!(id = job.id, ?err, "failed to mark job completed");
                 }
             }
             Ok(Err(err)) => {
-                let retry_at = retry_schedule(job.attempt, job.max_attempts, &config);
-                warn!(id = job.id, attempt = job.attempt, max = job.max_attempts, retry_at = ?retry_at, error = %err, "job failed");
+                // If the handler attached a HandlerFailure (via downcast), honor
+                // its directive. Otherwise build a minimal failure from the
+                // anyhow display.
+                let failure = err
+                    .downcast_ref::<crate::error::HandlerFailure>()
+                    .cloned()
+                    .unwrap_or_else(|| crate::error::HandlerFailure::from_message(err.to_string()));
+                let retry_at = match failure.directive {
+                    Some(crate::error::Directive::Cancel) => None,
+                    Some(crate::error::Directive::Retry { delay_ms }) => Some(
+                        chrono::Utc::now()
+                            + chrono::Duration::milliseconds(delay_ms as i64),
+                    ),
+                    None => retry_schedule(job.attempt, job.max_attempts, &config),
+                };
+                warn!(
+                    id = job.id, attempt = job.attempt, max = job.max_attempts,
+                    retry_at = ?retry_at, directive = ?failure.directive,
+                    error = %failure, "job failed"
+                );
                 if let Err(db_err) =
-                    mark_failed(&pool, job.id, job.worker_id, &err.to_string(), retry_at).await
+                    mark_failed(&pool, job.id, job.worker_id, failure.as_error_entry(), retry_at).await
                 {
                     error!(id = job.id, ?db_err, "failed to record job failure");
                 }
@@ -281,8 +309,14 @@ async fn worker_loop(
                 let msg = panic_message(&panic);
                 let retry_at = retry_schedule(job.attempt, job.max_attempts, &config);
                 error!(id = job.id, attempt = job.attempt, retry_at = ?retry_at, msg = %msg, "job panicked");
+                let entry = crate::error::HandlerFailure {
+                    message: msg,
+                    name: Some("Panic".into()),
+                    ..Default::default()
+                }
+                .as_error_entry();
                 if let Err(db_err) =
-                    mark_failed(&pool, job.id, job.worker_id, &msg, retry_at).await
+                    mark_failed(&pool, job.id, job.worker_id, entry, retry_at).await
                 {
                     error!(id = job.id, ?db_err, "failed to record panic");
                 }

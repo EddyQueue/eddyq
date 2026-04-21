@@ -71,6 +71,9 @@ pub struct MigrateReport {
 }
 
 /// All registered migrations, newest last.
+///
+/// **Policy:** append-only from v0.1.0 onward. Never edit an applied
+/// migration's SQL — add a new one. Pre-v0.1.0 we're still collapsing.
 pub const MIGRATIONS: &[Migration] = &[Migration {
     version: 20_260_421_000_001,
     name: "init",
@@ -137,17 +140,63 @@ async fn list_applied(pool: &PgPool, line: &str) -> Result<Vec<AppliedRow>> {
     Ok(rows)
 }
 
+/// Advisory-lock key used to serialize concurrent `migrate()` calls on the
+/// same Postgres cluster. The key is derived once at compile time from a hash
+/// of the literal `"eddyq::migrate"` — hashed with a stable seed so different
+/// eddyq versions never collide with each other.
+///
+/// The key includes the line so `--line main` and `--line canary` can migrate
+/// in parallel without blocking each other.
+fn advisory_key(line: &str) -> i64 {
+    // FNV-1a 64-bit over "eddyq::migrate::<line>". Stable across runs; no heap.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in b"eddyq::migrate::" {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    for byte in line.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash as i64
+}
+
 /// Apply all pending up-migrations for `line`. Idempotent — already-applied
-/// versions are skipped. Each migration runs in its own transaction so a
-/// partial-failure leaves the DB at the last-successful version, not mid-step.
+/// versions are skipped. Safe under concurrent callers: a Postgres advisory
+/// lock keyed on `(line)` serializes competing migrations across replicas, so
+/// N apps booting simultaneously won't race on DDL. Each migration runs in
+/// its own transaction, so a partial failure leaves the DB at the last
+/// successful version, not mid-step.
 pub async fn up(pool: &PgPool, line: &str) -> Result<MigrateReport> {
-    let applied: std::collections::HashSet<i64> = list_applied(pool, line)
-        .await?
-        .into_iter()
-        .map(|r| r.version)
-        .collect();
+    // Dedicated connection so we can hold the advisory lock for the whole run
+    // without worrying about connection pooling swapping it out from under us.
+    // `pg_advisory_lock` (session-scoped) releases on disconnect — if our
+    // process crashes mid-migration, the lock is freed automatically by
+    // Postgres when the session ends.
+    let mut conn = pool.acquire().await?;
+    let key = advisory_key(line);
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(&mut *conn)
+        .await?;
+
+    // Re-read applied versions *after* acquiring the lock, so we see any
+    // migrations another racer just finished.
+    ensure_tracking_table_pool(pool).await?;
+    let applied_rows: Vec<AppliedRow> = sqlx::query_as(
+        "SELECT version, name, applied_at
+           FROM _eddyq_migrations
+          WHERE line = $1
+       ORDER BY version",
+    )
+    .bind(line)
+    .fetch_all(&mut *conn)
+    .await?;
+    let applied: std::collections::HashSet<i64> =
+        applied_rows.into_iter().map(|r| r.version).collect();
 
     let mut report = MigrateReport::default();
+    let mut migration_err: Option<crate::error::Error> = None;
     for m in MIGRATIONS {
         if applied.contains(&m.version) {
             continue;
@@ -156,17 +205,37 @@ pub async fn up(pool: &PgPool, line: &str) -> Result<MigrateReport> {
         ensure_tracking_table(&mut tx).await?;
         // raw_sql because migration files contain multiple statements
         // (CREATE TABLE + indexes), which sqlx's prepared-statement path rejects.
-        sqlx::raw_sql(m.up_sql).execute(&mut *tx).await?;
-        sqlx::query(
+        if let Err(e) = sqlx::raw_sql(m.up_sql).execute(&mut *tx).await {
+            migration_err = Some(e.into());
+            break;
+        }
+        if let Err(e) = sqlx::query(
             "INSERT INTO _eddyq_migrations (line, version, name) VALUES ($1, $2, $3)",
         )
         .bind(line)
         .bind(m.version)
         .bind(m.name)
         .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
+        .await
+        {
+            migration_err = Some(e.into());
+            break;
+        }
+        if let Err(e) = tx.commit().await {
+            migration_err = Some(e.into());
+            break;
+        }
         report.applied.push((m.version, m.name));
+    }
+
+    // Always release the advisory lock, even on error.
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut *conn)
+        .await;
+
+    if let Some(err) = migration_err {
+        return Err(err);
     }
     Ok(report)
 }

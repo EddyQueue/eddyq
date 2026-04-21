@@ -1,6 +1,6 @@
 # Contributing to eddyq
 
-Thanks for your interest in eddyq! This project is in **Phase 0** of its v1.0 roadmap. Architecture is largely locked via [ADRs](docs/decisions/) — please read them before opening design-shaped PRs.
+Thanks for your interest in eddyq! Architecture is largely locked via [ADRs](docs/decisions/) — please read them before opening design-shaped PRs.
 
 ## Prerequisites
 
@@ -41,7 +41,3 @@ just bench           # runs benchmark harness, emits bench-report.md
 ## Security
 
 See [SECURITY.md](SECURITY.md) for vulnerability disclosure.
-
-## Code of conduct
-
-See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
