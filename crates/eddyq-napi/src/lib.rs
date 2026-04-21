@@ -107,6 +107,36 @@ pub struct EnqueueOutcome {
     pub id: Option<i64>,
 }
 
+/// One item in an `enqueueMany` batch. Mixed `kind` is supported across items.
+#[napi(object)]
+pub struct EnqueueManyItem {
+    /// Job kind — matches `@JobHandler(kind)` on the worker side.
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub max_attempts: Option<i32>,
+    pub priority: Option<i16>,
+    pub queue: Option<String>,
+    /// Run no earlier than this time (epoch milliseconds). Default now.
+    /// Mutually exclusive with `delayMs`.
+    pub scheduled_at_ms: Option<i64>,
+    /// Delay this job by N milliseconds relative to batch-submit time.
+    /// Mutually exclusive with `scheduledAtMs`.
+    pub delay_ms: Option<i64>,
+    pub unique_key: Option<String>,
+    pub group_key: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Aggregate result of `enqueueMany`. Per-job ids are not returned — use
+/// single `enqueue` calls when you need them.
+#[napi(object)]
+pub struct BulkEnqueueOutcome {
+    /// Rows newly inserted.
+    pub inserted: i64,
+    /// Rows skipped due to `unique_key` conflicts.
+    pub skipped: i64,
+}
+
 /// A pending or applied migration.
 #[napi(object)]
 pub struct MigrationStatus {
@@ -379,6 +409,24 @@ impl Queue {
     ) -> Result<EnqueueOutcome> {
         let client = self.client.clone();
         run(move || do_enqueue(client, kind, payload, options)).await
+    }
+
+    /// Enqueue a batch of jobs in a single round-trip. Uses a Postgres
+    /// `UNNEST`-based INSERT, so 1000 jobs cost roughly one statement instead
+    /// of one per job. Mixed `kind` within a batch is supported.
+    ///
+    /// Returns aggregate counts (`inserted`, `skipped`); per-job ids are not
+    /// surfaced — use `enqueue()` in a loop if you need them.
+    ///
+    /// Note: per-item `tags` are not yet supported in the bulk path and will
+    /// be ignored. Use `enqueue()` for tagged jobs.
+    #[napi]
+    pub async fn enqueue_many(
+        &self,
+        items: Vec<EnqueueManyItem>,
+    ) -> Result<BulkEnqueueOutcome> {
+        let client = self.client.clone();
+        run(move || do_enqueue_many(client, items)).await
     }
 
     /// Cancel a pending job. Returns `true` if cancelled, `false` if the job
@@ -934,6 +982,51 @@ async fn do_enqueue(
     Ok(match result {
         eddyq_client::EnqueueResult::Inserted(id) => EnqueueOutcome { inserted: true, id: Some(id) },
         eddyq_client::EnqueueResult::Skipped => EnqueueOutcome { inserted: false, id: None },
+    })
+}
+
+async fn do_enqueue_many(
+    client: Client,
+    items: Vec<EnqueueManyItem>,
+) -> Result<BulkEnqueueOutcome> {
+    let mut reqs: Vec<DynEnqueue> = Vec::with_capacity(items.len());
+    for item in items {
+        if item.scheduled_at_ms.is_some() && item.delay_ms.is_some() {
+            return Err(napi::Error::from_reason(
+                "enqueueMany: each item must set either scheduledAtMs or delayMs, not both",
+            ));
+        }
+        let mut req = DynEnqueue::new(item.kind, item.payload);
+        if let Some(n) = item.max_attempts {
+            req.max_attempts = n;
+        }
+        if let Some(p) = item.priority {
+            req.priority = p;
+        }
+        if let Some(q) = item.queue {
+            req.queue = q;
+        }
+        if let Some(ms) = item.scheduled_at_ms {
+            req.scheduled_at = Some(ms_to_utc(ms));
+        }
+        if let Some(ms) = item.delay_ms {
+            req.scheduled_at = Some(Utc::now() + chrono::Duration::milliseconds(ms));
+        }
+        if let Some(k) = item.unique_key {
+            req.unique_key = Some(k);
+        }
+        if let Some(g) = item.group_key {
+            req.group_key = Some(g);
+        }
+        if let Some(m) = item.metadata {
+            req.metadata = m;
+        }
+        reqs.push(req);
+    }
+    let result = client.enqueue_many(reqs).await.map_err(err)?;
+    Ok(BulkEnqueueOutcome {
+        inserted: result.inserted as i64,
+        skipped: result.skipped as i64,
     })
 }
 

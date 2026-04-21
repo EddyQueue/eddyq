@@ -9,6 +9,10 @@ This repo publishes two npm packages as a single unit:
 
 Both go out atomically from a single tag-triggered GitHub Actions run.
 
+**Versions are driven by the tag** (`v0.1.0` → `0.1.0` on npm). You never
+bump `package.json` — the workflow rewrites it during the publish step. The
+value in `package.json` on main is a placeholder.
+
 ## One-time setup
 
 1. **Claim the npm scope.** Either an org (`npm org create eddyq`) or publish
@@ -17,44 +21,37 @@ Both go out atomically from a single tag-triggered GitHub Actions run.
    `@eddyq` scope. Prefer a "Granular Access Token" scoped to `@eddyq/*`.
 3. **Add `NPM_TOKEN` to GitHub repo secrets.**
    `Settings → Secrets and variables → Actions → New repository secret`.
-4. **Enable provenance** by making sure the repo is on a `pnpm`/Node version
-   new enough to emit it (the workflow uses Node 22 + `--provenance`).
-   Provenance also requires the workflow to run with
-   `permissions: { id-token: write }` — already set in `release.yml`.
 
 ## Cutting a release
 
-1. **Bump versions.** The workspace versions should match across both
-   packages (they're published as a pair).
-   ```bash
-   # from the repo root
-   pnpm -C packages/queue  version 0.1.0 --no-git-tag-version
-   pnpm -C packages/nestjs version 0.1.0 --no-git-tag-version
-   ```
-2. **Commit + tag.**
-   ```bash
-   git add packages/queue/package.json packages/nestjs/package.json
-   git commit -m "chore(release): 0.1.0"
-   git tag v0.1.0
-   git push origin main --tags
-   ```
-3. **Watch the workflow** at `https://github.com/<you>/eddyq/actions`.
-   - `build` matrix runs across 7 targets (~15 min total)
-   - `publish` downloads every `.node` artifact, runs
-     `napi prepublish -t npm` (publishes the 7 per-platform packages),
-     then `npm publish` the main `@eddyq/queue`, then
-     `pnpm publish` for `@eddyq/nestjs`
-   - A GitHub release is drafted automatically with generated notes
+Everything happens in the GitHub UI.
+
+1. **Releases tab → Draft a new release.**
+2. Click **"Choose a tag"**, type `v0.1.0`, pick **"Create new tag: v0.1.0 on publish"**.
+3. Target: `main` (or whatever branch the release reflects).
+4. **Write the release notes** — this is the body you want displayed on the
+   Releases page and GitHub will surface it in the repo sidebar. The workflow
+   does not touch it.
+5. Hit **Publish release**.
+
+That's it. Publishing the release pushes the tag, which triggers the
+workflow. From there:
+
+- `build` matrix runs across 7 targets (~15 min total)
+- `publish` derives the version from the tag, rewrites both `package.json`
+  versions, downloads every `.node` artifact into per-target `npm/` subdirs,
+  and publishes `@eddyq/queue` (+ 7 per-platform packages) and `@eddyq/nestjs`
+  to npm
 
 ## Testing a release without publishing
 
-`workflow_dispatch` with `dry-run: true` (the default) runs the full build
-matrix and uploads artifacts but skips the publish job. Useful for verifying
-cross-compile works after changing dependencies or targets.
+Actions tab → Release → "Run workflow" → leave `dry-run` as `true`.
+Runs the full 7-target build and uploads artifacts but skips the publish
+job. Useful after changing dependencies or adding a target.
 
-```
-Actions → Release → Run workflow → dry-run: true
-```
+Setting `dry-run: false` on a `workflow_dispatch` runs the full publish, but
+only against whatever tag is on the chosen branch's tip — if no tag is
+there, it fails fast.
 
 ## Verifying after publish
 

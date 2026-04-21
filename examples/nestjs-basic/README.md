@@ -72,6 +72,17 @@ The API listens on `http://localhost:3000`. The worker has no listener.
 curl -X POST http://localhost:3000/email/send \
   -H 'content-type: application/json' \
   -d '{"to":"rem@example.com","subject":"hello"}'
+
+# Bulk enqueue — one Postgres round-trip for the whole batch. Useful for
+# fan-out patterns (sending 500 emails after a signup import, etc.).
+curl -X POST http://localhost:3000/email/send-bulk \
+  -H 'content-type: application/json' \
+  -d '{"messages":[
+        {"to":"a@example.com","subject":"#1"},
+        {"to":"b@example.com","subject":"#2"},
+        {"to":"c@example.com","subject":"#3"}
+      ]}'
+# → { "inserted": 3, "skipped": 0 }
 ```
 
 Watch the worker terminal — you'll see:

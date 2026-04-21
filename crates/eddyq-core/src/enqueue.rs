@@ -361,6 +361,144 @@ pub async fn enqueue_dyn_in_tx(
     Ok(result)
 }
 
+async fn insert_many_dyn(
+    conn: &mut PgConnection,
+    reqs: Vec<DynEnqueue>,
+) -> Result<(BulkEnqueueResult, bool, Vec<String>)> {
+    let now = Utc::now();
+    let n = reqs.len();
+    let mut kinds: Vec<String> = Vec::with_capacity(n);
+    let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(n);
+    let mut priorities: Vec<i16> = Vec::with_capacity(n);
+    let mut max_attempts: Vec<i32> = Vec::with_capacity(n);
+    let mut scheduled_ats: Vec<DateTime<Utc>> = Vec::with_capacity(n);
+    let mut unique_keys: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut group_keys: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut metadatas: Vec<serde_json::Value> = Vec::with_capacity(n);
+    let mut queues: Vec<String> = Vec::with_capacity(n);
+
+    let mut any_due_now = false;
+    for req in reqs {
+        let scheduled_at = req.scheduled_at.unwrap_or(now);
+        if scheduled_at <= now {
+            any_due_now = true;
+        }
+        kinds.push(req.kind);
+        payloads.push(req.payload);
+        priorities.push(req.priority);
+        max_attempts.push(req.max_attempts);
+        scheduled_ats.push(scheduled_at);
+        unique_keys.push(req.unique_key);
+        group_keys.push(req.group_key);
+        metadatas.push(req.metadata);
+        queues.push(req.queue);
+    }
+
+    let rows_inserted: (i64,) = sqlx::query_as(
+        r#"
+        WITH inserted AS (
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+            SELECT t.kind,
+                   t.payload,
+                   'pending',
+                   t.priority,
+                   t.max_attempts,
+                   t.scheduled_at,
+                   t.unique_key,
+                   t.group_key,
+                   t.metadata,
+                   t.queue
+              FROM UNNEST(
+                  $1::text[], $2::jsonb[], $3::smallint[], $4::int[],
+                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::text[]
+              ) AS t(kind, payload, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+            ON CONFLICT DO NOTHING
+         RETURNING id
+        )
+        SELECT COUNT(*)::bigint FROM inserted
+        "#,
+    )
+    .bind(&kinds)
+    .bind(&payloads)
+    .bind(&priorities)
+    .bind(&max_attempts)
+    .bind(&scheduled_ats)
+    .bind(&unique_keys)
+    .bind(&group_keys)
+    .bind(&metadatas)
+    .bind(&queues)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let inserted = u64::try_from(rows_inserted.0).unwrap_or(0);
+    let total = n as u64;
+    let skipped = total.saturating_sub(inserted);
+
+    let mut distinct_groups: Vec<String> = group_keys.into_iter().flatten().collect();
+    distinct_groups.sort();
+    distinct_groups.dedup();
+
+    Ok((
+        BulkEnqueueResult { inserted, skipped },
+        any_due_now,
+        distinct_groups,
+    ))
+}
+
+/// Dynamic-kind bulk enqueue. Mixed kinds in one batch are supported — unlike
+/// the typed `enqueue_many`, which constrains the batch to a single `J::KIND`.
+///
+/// Note: `tags` are ignored in the bulk path (matching the typed bulk).
+/// Use the single-job `enqueue_dyn` if you need tagged jobs.
+pub async fn enqueue_many_dyn(
+    pool: &PgPool,
+    reqs: Vec<DynEnqueue>,
+) -> Result<BulkEnqueueResult> {
+    if reqs.is_empty() {
+        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+    }
+    let mut conn = pool.acquire().await?;
+    let (result, any_due_now, distinct_groups) = insert_many_dyn(&mut conn, reqs).await?;
+
+    for g in &distinct_groups {
+        crate::group::materialize_from_rule(&mut conn, g).await?;
+    }
+
+    if any_due_now && result.inserted > 0 {
+        let _ = sqlx::query("SELECT pg_notify('eddyq_job', '')")
+            .execute(&mut *conn)
+            .await;
+    }
+
+    Ok(result)
+}
+
+/// Transactional dynamic bulk enqueue — atomic with the caller's transaction.
+pub async fn enqueue_many_dyn_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    reqs: Vec<DynEnqueue>,
+) -> Result<BulkEnqueueResult> {
+    if reqs.is_empty() {
+        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+    }
+    let conn: &mut PgConnection = tx;
+    let (result, any_due_now, distinct_groups) = insert_many_dyn(conn, reqs).await?;
+
+    for g in &distinct_groups {
+        let conn: &mut PgConnection = tx;
+        crate::group::materialize_from_rule(conn, g).await?;
+    }
+
+    if any_due_now && result.inserted > 0 {
+        let conn: &mut PgConnection = tx;
+        sqlx::query("SELECT pg_notify('eddyq_job', '')")
+            .execute(conn)
+            .await?;
+    }
+
+    Ok(result)
+}
+
 /// Enqueue a job *inside the caller's transaction*. The row — and the NOTIFY —
 /// are visible only if the user commits. Rolling back the transaction discards
 /// both. This is the defining correctness guarantee of eddyq vs Redis-backed

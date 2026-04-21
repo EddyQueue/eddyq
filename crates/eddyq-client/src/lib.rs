@@ -104,6 +104,12 @@ impl Client {
         eddyq_core::enqueue::enqueue_dyn(&self.pool, req).await
     }
 
+    /// Bulk enqueue — a single UNNEST INSERT, dramatically faster than calling
+    /// `enqueue` N times. Supports mixed `kind` across the batch.
+    pub async fn enqueue_many(&self, reqs: Vec<DynEnqueue>) -> Result<BulkEnqueueResult> {
+        eddyq_core::enqueue::enqueue_many_dyn(&self.pool, reqs).await
+    }
+
     pub async fn enqueue_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
