@@ -267,6 +267,41 @@ impl Queue {
         crate::group::clear_rate(&self.pool, key).await
     }
 
+    // --- Pattern-based group rules -----------------------------------------
+
+    /// Register a default-values rule for a group-key glob pattern. Any group
+    /// whose key matches this pattern will be auto-configured with these
+    /// defaults on its first `enqueue()`, unless you've already explicitly
+    /// called `set_group_concurrency` / `set_group_rate` for that specific key.
+    ///
+    /// Patterns use `*` (any chars) and `?` (one char).
+    ///
+    /// ```ignore
+    /// // Every Shopify integration auto-caps at 2 concurrent workers:
+    /// queue.set_group_rule("shopify:*", GroupRule::concurrency(2)).await?;
+    ///
+    /// // OpenAI calls per tenant: 2000 requests/min, cap 20 in flight:
+    /// queue.set_group_rule(
+    ///     "tenant:*:openai",
+    ///     GroupRule::both(20, 2000, Duration::from_secs(60)),
+    /// ).await?;
+    /// ```
+    pub async fn set_group_rule(
+        &self,
+        pattern: &str,
+        rule: crate::group::GroupRule,
+    ) -> Result<()> {
+        crate::group::set_rule(&self.pool, pattern, rule).await
+    }
+
+    pub async fn remove_group_rule(&self, pattern: &str) -> Result<bool> {
+        crate::group::remove_rule(&self.pool, pattern).await
+    }
+
+    pub async fn list_group_rules(&self) -> Result<Vec<crate::group::StoredRule>> {
+        crate::group::list_rules(&self.pool).await
+    }
+
     pub fn start(&self) -> Result<()> {
         let mut state = self.state.lock().expect("queue state lock poisoned");
         if matches!(*state, QueueState::Running { .. }) {

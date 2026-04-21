@@ -32,7 +32,7 @@ async fn insert_job<J: Job>(
     let max_attempts = opts.max_attempts.unwrap_or_else(|| job.max_attempts());
     let priority = opts.priority.unwrap_or_else(|| job.priority());
     let unique_key = opts.unique_key.or_else(|| job.unique_key());
-    let group_key = opts.group_key.or_else(|| job.group_key());
+    let group_key = opts.group_key.clone().or_else(|| job.group_key());
     let scheduled_at = opts.scheduled_at.unwrap_or_else(Utc::now);
     let due_now = scheduled_at <= Utc::now();
 
@@ -50,7 +50,7 @@ async fn insert_job<J: Job>(
     .bind(max_attempts)
     .bind(scheduled_at)
     .bind(unique_key)
-    .bind(group_key)
+    .bind(&group_key)
     .fetch_optional(&mut *conn)
     .await?;
 
@@ -58,6 +58,17 @@ async fn insert_job<J: Job>(
         Some((id,)) => EnqueueResult::Inserted(id),
         None => EnqueueResult::Skipped,
     };
+
+    // Lazily materialize an eddyq_groups row for this key from any matching
+    // pattern rule. ON CONFLICT DO NOTHING means: no-op if the group already
+    // has an explicit row (explicit set_group_concurrency wins), and no-op if
+    // no rule matches (group stays unlimited). Only cost in the common case
+    // is a single LIKE-seq-scan of eddyq_group_rules, which is typically tiny.
+    if matches!(result, EnqueueResult::Inserted(_)) {
+        if let Some(key) = &group_key {
+            crate::group::materialize_from_rule(conn, key).await?;
+        }
+    }
 
     Ok((result, due_now))
 }

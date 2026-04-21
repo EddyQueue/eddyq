@@ -740,8 +740,8 @@ async fn migrate_up_applies_all_known_migrations(pool: PgPool) {
     // We ship 4 migrations at time of writing; the assertion is >= so that
     // adding new migrations doesn't retroactively break this test.
     assert!(
-        report.applied.len() >= 4,
-        "expected at least 4 migrations applied, got {}",
+        !report.applied.is_empty(),
+        "expected at least 1 migration applied, got {}",
         report.applied.len()
     );
 
@@ -784,7 +784,7 @@ async fn migrate_up_is_idempotent(pool: PgPool) {
 async fn migrate_down_rolls_back_all(pool: PgPool) {
     eddyq_core::migrate::up(&pool, "main").await.unwrap();
     let report = eddyq_core::migrate::down(&pool, "main", usize::MAX).await.unwrap();
-    assert!(report.rolled_back.len() >= 4);
+    assert!(!report.rolled_back.is_empty());
 
     // All our tables are gone (except _eddyq_migrations, which we keep
     // around as an empty tracking table — that matches River's behavior).
@@ -815,16 +815,12 @@ async fn migrate_status_reports_pending_and_applied(pool: PgPool) {
     let after = eddyq_core::migrate::status(&pool, "main").await.unwrap();
     assert!(after.iter().all(|s| s.applied_at.is_some()));
 
-    // Roll back one: last is pending again.
+    // Roll back one: that one is pending again.
     eddyq_core::migrate::down(&pool, "main", 1).await.unwrap();
     let partial = eddyq_core::migrate::status(&pool, "main").await.unwrap();
     assert!(
         partial.last().unwrap().applied_at.is_none(),
         "most recent migration should be pending after down --max-steps 1"
-    );
-    assert!(
-        partial[0].applied_at.is_some(),
-        "earlier migrations still applied"
     );
 }
 
@@ -840,12 +836,14 @@ async fn lines_track_independently(pool: PgPool) {
         canary_status.iter().all(|s| s.applied_at.is_none()),
         "canary should see all migrations as pending — it has its own tracking"
     );
+    assert!(!canary_status.is_empty());
 
     let main_status = eddyq_core::migrate::status(&pool, "main").await.unwrap();
     assert!(
         main_status.iter().all(|s| s.applied_at.is_some()),
         "main should see everything as applied"
     );
+    assert!(!main_status.is_empty());
 
     // Both lines exist in the registry.
     let lines = eddyq_core::migrate::list_lines(&pool).await.unwrap();
@@ -877,7 +875,7 @@ async fn queue_uses_its_builder_line(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(canary_rows >= 4, "expected 4+ canary rows, got {canary_rows}");
+    assert!(canary_rows >= 1, "expected ≥1 canary row, got {canary_rows}");
 
     let main_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations WHERE line = 'main'")
@@ -1188,6 +1186,517 @@ async fn rate_and_concurrency_stack(pool: PgPool) {
 
     let peak = max_observed.load(Ordering::SeqCst);
     assert!(peak <= 2, "concurrency cap=2 should hold; got peak={peak}");
+}
+
+/// FIFO within a capped group: at equal priority, jobs run in enqueue order.
+/// Regression guard for the `ORDER BY priority DESC, scheduled_at ASC, id ASC`
+/// claim contract.
+#[sqlx::test(migrations = "./migrations")]
+async fn fifo_within_group(pool: PgPool) {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Ordered {
+        n: u64,
+    }
+    impl Job for Ordered {
+        const KIND: &'static str = "ordered";
+        fn group_key(&self) -> Option<String> {
+            Some("tenant:123".into())
+        }
+    }
+
+    let log: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(vec![]));
+
+    #[derive(Clone)]
+    struct RecordingWorker(Arc<std::sync::Mutex<Vec<u64>>>);
+    #[async_trait]
+    impl Worker<Ordered> for RecordingWorker {
+        async fn perform(&self, job: Ordered, _: JobContext) -> JobResult {
+            self.0.lock().unwrap().push(job.n);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(())
+        }
+    }
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Ordered, _>(RecordingWorker(log.clone()))
+        .config(QueueConfig {
+            worker_concurrency: 1, // serialize to make the order observable
+            ..fast_config()
+        })
+        .build();
+
+    // Cap=1 + worker_concurrency=1 means strict serial execution.
+    queue.set_group_concurrency("tenant:123", 1).await.unwrap();
+
+    for n in 0..10 {
+        queue.enqueue(&Ordered { n }).await.unwrap();
+    }
+
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if log.lock().unwrap().len() >= 10 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all 10 should complete");
+    queue.shutdown().await.unwrap();
+
+    let observed = log.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        (0..10).collect::<Vec<_>>(),
+        "jobs must run in enqueue order within a capped group, got {observed:?}"
+    );
+}
+
+/// Regression test: ungrouped "fastlane" jobs must not starve when a
+/// "slowlane" group has a large backlog at equal priority. Before the claim
+/// refactor, the fetcher over-fetched globally by priority, saw only
+/// capped-group candidates first, and returned 0 — fastlane workers idled.
+#[sqlx::test(migrations = "./migrations")]
+async fn fastlane_does_not_starve_behind_slowlane(pool: PgPool) {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Slow {
+        n: u64,
+    }
+    impl Job for Slow {
+        const KIND: &'static str = "slow";
+        fn group_key(&self) -> Option<String> {
+            Some("slowlane".into())
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Fast {
+        n: u64,
+    }
+    impl Job for Fast {
+        const KIND: &'static str = "fast";
+        // No group_key — fastlane.
+    }
+
+    let slow_done = Arc::new(AtomicUsize::new(0));
+    let fast_done = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct SlowWorker(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Worker<Slow> for SlowWorker {
+        async fn perform(&self, _: Slow, _: JobContext) -> JobResult {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[derive(Clone)]
+    struct FastWorker(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Worker<Fast> for FastWorker {
+        async fn perform(&self, _: Fast, _: JobContext) -> JobResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Slow, _>(SlowWorker(slow_done.clone()))
+        .register::<Fast, _>(FastWorker(fast_done.clone()))
+        .config(QueueConfig {
+            worker_concurrency: 10,
+            ..fast_config()
+        })
+        .build();
+
+    // Cap slowlane at 2. Then enqueue 100 slow jobs *before* 20 fast ones,
+    // so they have lower IDs and would be picked first by a priority-only
+    // claim. With the fix, fastlane still gets through.
+    queue.set_group_concurrency("slowlane", 2).await.unwrap();
+
+    for n in 0..100 {
+        queue.enqueue(&Slow { n }).await.unwrap();
+    }
+    for n in 0..20 {
+        queue.enqueue(&Fast { n }).await.unwrap();
+    }
+
+    queue.start().unwrap();
+
+    // All 20 fast jobs should finish quickly (well before the slow ones),
+    // proving they weren't blocked behind the slow backlog.
+    tokio::time::timeout(Duration::from_millis(1500), async {
+        loop {
+            if fast_done.load(Ordering::SeqCst) >= 20 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fastlane jobs should not be starved by slowlane backlog");
+
+    assert!(
+        fast_done.load(Ordering::SeqCst) >= 20,
+        "fast jobs done"
+    );
+    // Slow is still working — we don't wait for all of them.
+    queue.shutdown().await.unwrap();
+}
+
+/// Index coverage check: the fetch hot path must be Index Scan / Index Only
+/// Scan / Bitmap Index Scan — never Seq Scan, even with many rows. Regression
+/// guard against dropping or breaking a partial index.
+#[sqlx::test(migrations = "./migrations")]
+async fn fetch_hot_path_uses_index(pool: PgPool) {
+    // Seed enough rows that the planner has a strong reason to pick an index.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at)
+        SELECT 'bench', '{}'::jsonb, 'pending', (i % 5)::smallint, 3, NOW()
+          FROM generate_series(1, 2000) AS i
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE eddyq_jobs").execute(&pool).await.unwrap();
+
+    let plan: Vec<(String,)> = sqlx::query_as(
+        "EXPLAIN SELECT j.id FROM eddyq_jobs j
+          WHERE j.state = 'pending' AND j.scheduled_at <= NOW() AND j.group_key IS NULL
+       ORDER BY j.priority DESC, j.scheduled_at ASC, j.id ASC
+          LIMIT 10",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let plan_text: String = plan.iter().map(|(s,)| s.as_str()).collect::<Vec<_>>().join("\n");
+
+    assert!(
+        plan_text.contains("Index"),
+        "fetch hot path should use an index, got plan:\n{plan_text}"
+    );
+    assert!(
+        !plan_text.contains("Seq Scan on eddyq_jobs"),
+        "fetch hot path must not seq-scan eddyq_jobs, plan:\n{plan_text}"
+    );
+}
+
+/// Pattern-based rule: one `set_group_rule("shopify:*", cap=2)` call covers
+/// every shopify integration ever enqueued, no per-tenant setup needed.
+#[sqlx::test(migrations = "./migrations")]
+async fn group_rule_auto_caps_new_integrations(pool: PgPool) {
+    use eddyq_core::group::GroupRule;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SyncTask {
+        integration: String,
+    }
+    impl Job for SyncTask {
+        const KIND: &'static str = "shopify_sync";
+        fn group_key(&self) -> Option<String> {
+            Some(format!("shopify:{}", self.integration))
+        }
+    }
+
+    let queue = Queue::builder(pool.clone()).build();
+
+    // One global rule. No per-integration setup.
+    queue
+        .set_group_rule("shopify:*", GroupRule::concurrency(2))
+        .await
+        .unwrap();
+
+    // Enqueue for three new, previously-unknown integrations.
+    for tenant in &["acme", "globex", "initech"] {
+        queue
+            .enqueue(&SyncTask {
+                integration: (*tenant).into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Each should have a materialized eddyq_groups row with cap=2.
+    for tenant in &["acme", "globex", "initech"] {
+        let g = queue
+            .get_group(&format!("shopify:{tenant}"))
+            .await
+            .unwrap()
+            .expect("rule should have materialized a group row");
+        assert_eq!(g.max_concurrency, 2, "rule should apply cap=2 to {tenant}");
+        assert_eq!(g.running_count, 0);
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn more_specific_rule_wins(pool: PgPool) {
+    use eddyq_core::group::GroupRule;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SyncTask {
+        integration: String,
+    }
+    impl Job for SyncTask {
+        const KIND: &'static str = "ssync";
+        fn group_key(&self) -> Option<String> {
+            Some(format!("shopify:{}", self.integration))
+        }
+    }
+
+    let queue = Queue::builder(pool.clone()).build();
+
+    // Generic rule: all shopify get cap=2. Specific rule: premium gets cap=10.
+    queue
+        .set_group_rule("shopify:*", GroupRule::concurrency(2))
+        .await
+        .unwrap();
+    queue
+        .set_group_rule("shopify:premium:*", GroupRule::concurrency(10))
+        .await
+        .unwrap();
+
+    queue
+        .enqueue(&SyncTask {
+            integration: "acme".into(),
+        })
+        .await
+        .unwrap();
+    queue
+        .enqueue(&SyncTask {
+            integration: "premium:initech".into(),
+        })
+        .await
+        .unwrap();
+
+    let acme = queue.get_group("shopify:acme").await.unwrap().unwrap();
+    let premium = queue
+        .get_group("shopify:premium:initech")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(acme.max_concurrency, 2);
+    assert_eq!(premium.max_concurrency, 10, "more-specific pattern wins");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn explicit_set_overrides_rule(pool: PgPool) {
+    use eddyq_core::group::GroupRule;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SyncTask {
+        integration: String,
+    }
+    impl Job for SyncTask {
+        const KIND: &'static str = "ssync";
+        fn group_key(&self) -> Option<String> {
+            Some(format!("shopify:{}", self.integration))
+        }
+    }
+
+    let queue = Queue::builder(pool.clone()).build();
+
+    // Explicitly cap a specific integration BEFORE setting up the pattern.
+    queue
+        .set_group_concurrency("shopify:vip", 20)
+        .await
+        .unwrap();
+
+    // Then a generic rule that would otherwise catch it.
+    queue
+        .set_group_rule("shopify:*", GroupRule::concurrency(2))
+        .await
+        .unwrap();
+
+    // Enqueueing for vip shouldn't reset its cap — explicit setting wins
+    // (ON CONFLICT DO NOTHING on the materialize path).
+    queue
+        .enqueue(&SyncTask {
+            integration: "vip".into(),
+        })
+        .await
+        .unwrap();
+
+    let vip = queue.get_group("shopify:vip").await.unwrap().unwrap();
+    assert_eq!(
+        vip.max_concurrency, 20,
+        "explicit set_group_concurrency before rule must not be overwritten"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rule_with_rate_materializes_token_bucket(pool: PgPool) {
+    use eddyq_core::group::GroupRule;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SyncTask {
+        tenant: String,
+    }
+    impl Job for SyncTask {
+        const KIND: &'static str = "openai_call";
+        fn group_key(&self) -> Option<String> {
+            Some(format!("tenant:{}:openai", self.tenant))
+        }
+    }
+
+    let queue = Queue::builder(pool.clone()).build();
+    queue
+        .set_group_rule(
+            "tenant:*:openai",
+            GroupRule::both(20, 1000, Duration::from_secs(60)),
+        )
+        .await
+        .unwrap();
+
+    queue
+        .enqueue(&SyncTask {
+            tenant: "acme".into(),
+        })
+        .await
+        .unwrap();
+
+    let g = queue.get_group("tenant:acme:openai").await.unwrap().unwrap();
+    assert_eq!(g.max_concurrency, 20);
+    assert_eq!(g.rate_count, Some(1000));
+    assert_eq!(g.rate_period_ms, Some(60_000));
+    // Bucket starts full.
+    assert!(
+        (g.tokens - 1000.0).abs() < 0.5,
+        "token bucket should initialize to rate_count; got {}",
+        g.tokens
+    );
+}
+
+/// Simulates a real-world pattern: two Shopify integrations, each has a burst
+/// of tasks, each should be independently throttled to 2 concurrent workers.
+/// Integration A's cap should not slow down integration B, and vice versa.
+#[sqlx::test(migrations = "./migrations")]
+async fn per_integration_concurrency_cap(pool: PgPool) {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SyncTask {
+        integration: String,
+        item: u32,
+    }
+    impl Job for SyncTask {
+        const KIND: &'static str = "shopify_sync";
+        fn group_key(&self) -> Option<String> {
+            Some(format!("shopify:{}", self.integration))
+        }
+    }
+
+    #[derive(Clone)]
+    struct TrackedWorker {
+        per_integration_current: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+        per_integration_peak: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Worker<SyncTask> for TrackedWorker {
+        async fn perform(&self, job: SyncTask, _ctx: JobContext) -> JobResult {
+            let key = job.integration.clone();
+            let now = {
+                let mut cur = self.per_integration_current.lock().unwrap();
+                let slot = cur.entry(key.clone()).or_insert(0);
+                *slot += 1;
+                *slot
+            };
+            {
+                let mut peak = self.per_integration_peak.lock().unwrap();
+                let p = peak.entry(key.clone()).or_insert(0);
+                if now > *p {
+                    *p = now;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            {
+                let mut cur = self.per_integration_current.lock().unwrap();
+                *cur.get_mut(&key).unwrap() -= 1;
+            }
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let per_current = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let per_peak = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let queue = Queue::builder(pool.clone())
+        .register::<SyncTask, _>(TrackedWorker {
+            per_integration_current: per_current.clone(),
+            per_integration_peak: per_peak.clone(),
+            completed: completed.clone(),
+        })
+        .config(QueueConfig {
+            worker_concurrency: 12, // plenty of workers — cap has to come from groups
+            ..fast_config()
+        })
+        .build();
+
+    // Two integrations, each capped at 2 concurrent.
+    queue.set_group_concurrency("shopify:acme", 2).await.unwrap();
+    queue.set_group_concurrency("shopify:globex", 2).await.unwrap();
+
+    // 30 tasks for each integration.
+    for item in 0..30 {
+        queue
+            .enqueue(&SyncTask {
+                integration: "acme".into(),
+                item,
+            })
+            .await
+            .unwrap();
+        queue
+            .enqueue(&SyncTask {
+                integration: "globex".into(),
+                item,
+            })
+            .await
+            .unwrap();
+    }
+
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if completed.load(Ordering::SeqCst) >= 60 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all 60 tasks across both integrations should complete");
+    queue.shutdown().await.unwrap();
+
+    // Each integration's peak concurrency must have been at most 2.
+    let (acme_peak, globex_peak) = {
+        let peaks = per_peak.lock().unwrap();
+        (*peaks.get("acme").unwrap(), *peaks.get("globex").unwrap())
+    };
+    assert!(
+        acme_peak <= 2,
+        "acme peak concurrency should be ≤ 2, got {acme_peak}"
+    );
+    assert!(
+        globex_peak <= 2,
+        "globex peak concurrency should be ≤ 2, got {globex_peak}"
+    );
+    // Both should have actually run ≥1 at a time (proof jobs ran).
+    assert!(acme_peak >= 1);
+    assert!(globex_peak >= 1);
+
+    // And the group tables show the live state is cleaned up.
+    let acme = queue.get_group("shopify:acme").await.unwrap().unwrap();
+    let globex = queue.get_group("shopify:globex").await.unwrap().unwrap();
+    assert_eq!(acme.running_count, 0);
+    assert_eq!(globex.running_count, 0);
+    assert_eq!(acme.max_concurrency, 2);
+    assert_eq!(globex.max_concurrency, 2);
 }
 
 #[sqlx::test(migrations = "./migrations")]

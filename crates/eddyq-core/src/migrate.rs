@@ -71,32 +71,12 @@ pub struct MigrateReport {
 }
 
 /// All registered migrations, newest last.
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 20_260_421_000_001,
-        name: "init",
-        up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
-        down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
-    },
-    Migration {
-        version: 20_260_421_000_002,
-        name: "schedules",
-        up_sql: include_str!("../migrations/20260421000002_schedules.up.sql"),
-        down_sql: include_str!("../migrations/20260421000002_schedules.down.sql"),
-    },
-    Migration {
-        version: 20_260_421_000_003,
-        name: "groups",
-        up_sql: include_str!("../migrations/20260421000003_groups.up.sql"),
-        down_sql: include_str!("../migrations/20260421000003_groups.down.sql"),
-    },
-    Migration {
-        version: 20_260_421_000_004,
-        name: "group_rate",
-        up_sql: include_str!("../migrations/20260421000004_group_rate.up.sql"),
-        down_sql: include_str!("../migrations/20260421000004_group_rate.down.sql"),
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 20_260_421_000_001,
+    name: "init",
+    up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
+    down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
+}];
 
 /// Fresh-install DDL for the tracking table: composite PK `(line, version)`
 /// so each line has an independent applied-version history.

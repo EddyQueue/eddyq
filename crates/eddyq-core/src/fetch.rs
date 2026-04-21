@@ -16,19 +16,25 @@ pub struct ClaimedJob {
     pub worker_id: Uuid,
 }
 
-/// Claim up to `batch_size` pending jobs, respecting per-group concurrency caps.
+/// Claim up to `batch_size` pending jobs, respecting per-group concurrency
+/// caps and per-group token-bucket rate limits.
 ///
-/// Two-phase:
-///   1. Lock up to `batch_size * 4` candidate job rows with FOR UPDATE SKIP LOCKED.
-///   2. Lock the relevant `eddyq_groups` rows (plain FOR UPDATE — serializes
-///      same-group claims between concurrent fetchers). Accept candidates in
-///      priority order until each group's `max_concurrency - running_count`
-///      budget is exhausted.
-///   3. UPDATE the accepted jobs to 'running' and upsert group counters.
+/// Split into independent lanes so capped "slowlane" groups can't starve
+/// "fastlane" (ungrouped) work when the slowlane has a large backlog at equal
+/// priority:
 ///
-/// All three steps share one transaction, so another concurrent fetcher that
-/// tries to touch the same groups will block on the eddyq_groups FOR UPDATE
-/// until we commit — then see our updated running_count.
+///   1. Lock ungrouped candidates up to the full `batch_size` (fastlane).
+///   2. Find groups with pending work; lock their rows (serializes same-group
+///      claims between concurrent fetchers); compute per-group slots =
+///      min(concurrency remaining, floor(refilled tokens)).
+///   3. For each group with slots > 0, lock up to `slots` candidates from
+///      that group specifically.
+///   4. UPDATE the accepted jobs to 'running', bump running_count + token
+///      balances on their groups.
+///
+/// All phases share one transaction: another concurrent fetcher that tries to
+/// touch the same groups blocks on the `eddyq_groups` FOR UPDATE until we
+/// commit, then sees the updated counters.
 pub async fn claim_batch(
     pool: &PgPool,
     worker_id: Uuid,
@@ -37,39 +43,53 @@ pub async fn claim_batch(
     if batch_size == 0 {
         return Ok(vec![]);
     }
-    let over_fetch = i64::try_from(batch_size.saturating_mul(4)).unwrap_or(i64::MAX);
+    let batch_size_i64 = i64::try_from(batch_size).unwrap_or(i64::MAX);
 
     let mut tx = pool.begin().await?;
 
-    // Step 1: candidate job rows (locked, but not yet updated).
-    let candidates: Vec<(JobId, Option<String>)> = sqlx::query_as(
+    // Phase 1 — ungrouped candidates (the fastlane). Uses the
+    // eddyq_jobs_fetch_ungrouped partial index.
+    let ungrouped: Vec<(JobId,)> = sqlx::query_as(
         r#"
-        SELECT j.id, j.group_key
+        SELECT j.id
           FROM eddyq_jobs j
          WHERE j.state = 'pending'
            AND j.scheduled_at <= NOW()
+           AND j.group_key IS NULL
       ORDER BY j.priority DESC, j.scheduled_at ASC, j.id ASC
          LIMIT $1
          FOR UPDATE OF j SKIP LOCKED
         "#,
     )
-    .bind(over_fetch)
+    .bind(batch_size_i64)
     .fetch_all(&mut *tx)
     .await?;
 
-    if candidates.is_empty() {
-        tx.rollback().await?;
-        return Ok(vec![]);
-    }
+    let mut accepted: Vec<(JobId, Option<String>)> =
+        ungrouped.into_iter().map(|(id,)| (id, None)).collect();
 
-    // Step 2: lock + read caps for every group that shows up.
-    let group_keys: Vec<String> = {
-        let mut keys: Vec<String> =
-            candidates.iter().filter_map(|(_, g)| g.clone()).collect();
-        keys.sort();
-        keys.dedup();
-        keys
+    let remaining = batch_size.saturating_sub(accepted.len());
+
+    // Phase 2 — find which groups have pending work right now, lock their
+    // rows, read their caps/tokens.
+    let active_group_keys: Vec<String> = if remaining == 0 {
+        vec![]
+    } else {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT j.group_key
+              FROM eddyq_jobs j
+             WHERE j.state = 'pending'
+               AND j.scheduled_at <= NOW()
+               AND j.group_key IS NOT NULL
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        rows.into_iter().map(|(k,)| k).collect()
     };
+
+    let group_keys = active_group_keys;
 
     // For each group row we lock, track:
     //   - the slot budget (min of concurrency-slots and floor(refilled tokens))
@@ -141,30 +161,43 @@ pub async fn claim_batch(
         }
     }
 
-    // Step 3: decide which candidates to claim — priority order preserved,
-    // each group's slot budget depleted as we go.
-    let mut accepted: Vec<(JobId, Option<String>)> = Vec::with_capacity(batch_size);
-    for (id, group) in candidates {
+    // Phase 3 — for each group with slots > 0, fetch up to `slots`
+    // candidates from that specific group. Uses eddyq_jobs_group partial
+    // index. Stops early if we hit batch_size total.
+    for (key, state) in group_slots.iter_mut() {
         if accepted.len() >= batch_size {
             break;
         }
-        match &group {
-            None => accepted.push((id, None)),
-            Some(g) => {
-                // Groups with no configured row are implicitly unlimited; treat
-                // as if they have a large slot budget so we still track
-                // running_count when we bump.
-                let state = group_slots.entry(g.clone()).or_insert(GroupState {
-                    slots: i32::MAX,
-                    refilled_tokens: 0.0,
-                    rate_limited: false,
-                });
-                if state.slots > 0 {
-                    state.slots -= 1;
-                    accepted.push((id, Some(g.clone())));
-                }
-            }
+        if state.slots <= 0 {
+            continue;
         }
+        let take_n = i64::from(state.slots).min(
+            i64::try_from(batch_size - accepted.len()).unwrap_or(i64::MAX),
+        );
+        if take_n <= 0 {
+            continue;
+        }
+        let rows: Vec<(JobId,)> = sqlx::query_as(
+            r#"
+            SELECT j.id
+              FROM eddyq_jobs j
+             WHERE j.state = 'pending'
+               AND j.scheduled_at <= NOW()
+               AND j.group_key = $1
+          ORDER BY j.priority DESC, j.scheduled_at ASC, j.id ASC
+             LIMIT $2
+             FOR UPDATE OF j SKIP LOCKED
+            "#,
+        )
+        .bind(key)
+        .bind(take_n)
+        .fetch_all(&mut *tx)
+        .await?;
+        let got = rows.len();
+        for (id,) in rows {
+            accepted.push((id, Some(key.clone())));
+        }
+        state.slots -= i32::try_from(got).unwrap_or(0);
     }
 
     if accepted.is_empty() {
