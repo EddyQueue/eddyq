@@ -85,5 +85,53 @@ try {
   console.log("combined scheduledAtMs + delayMs rejected:", e.message.split("\n")[0]);
 }
 
+// Tags round-trip in bulk path and are queryable via listJobs.
+const tagStamp = Date.now();
+const tagResult = await q.enqueueMany([
+  {
+    kind: "bulk.demo.tagged",
+    payload: { n: 1 },
+    uniqueKey: `tag-${tagStamp}-a`,
+    tags: ["urgent", "billing"],
+  },
+  {
+    kind: "bulk.demo.tagged",
+    payload: { n: 2 },
+    uniqueKey: `tag-${tagStamp}-b`,
+    tags: ["urgent"],
+  },
+  {
+    kind: "bulk.demo.tagged",
+    payload: { n: 3 },
+    uniqueKey: `tag-${tagStamp}-c`,
+    // No tags — defaults to empty array.
+  },
+]);
+console.log(
+  `enqueueMany(3 tagged) → inserted=${tagResult.inserted} skipped=${tagResult.skipped}`,
+);
+const billing = await q.listJobs({ kind: "bulk.demo.tagged", tags: ["billing"] }, { limit: 10 });
+const urgent = await q.listJobs({ kind: "bulk.demo.tagged", tags: ["urgent"] }, { limit: 10 });
+console.log(`listJobs tags=[billing]: ${billing.rows.length}`);
+console.log(`listJobs tags=[urgent]:  ${urgent.rows.length}`);
+if (billing.rows.length < 1 || urgent.rows.length < 2) {
+  console.error("FAIL: tag filter did not return expected rows");
+  process.exit(1);
+}
+
+// Batch-size cap should reject at 5001 items.
+try {
+  const oversize = Array.from({ length: 5001 }, (_, i) => ({
+    kind: "bulk.demo.oversize",
+    payload: { i },
+    uniqueKey: `oversize-${tagStamp}-${i}`,
+  }));
+  await q.enqueueMany(oversize);
+  console.error("FAIL: 5001-item batch should have been rejected");
+  process.exit(1);
+} catch (e) {
+  console.log("5001-item batch rejected:", e.message.split("\n")[0]);
+}
+
 await q.close();
 console.log("OK");

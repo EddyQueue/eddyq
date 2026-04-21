@@ -374,6 +374,10 @@ async fn insert_many_dyn(
     let mut scheduled_ats: Vec<DateTime<Utc>> = Vec::with_capacity(n);
     let mut unique_keys: Vec<Option<String>> = Vec::with_capacity(n);
     let mut group_keys: Vec<Option<String>> = Vec::with_capacity(n);
+    // Per-row `text[]` tags can't be passed as a Postgres multidim array
+    // (those require rectangular shape). Serialize each row's tags as a JSON
+    // array and convert back to `text[]` in SQL via `jsonb_array_elements_text`.
+    let mut tags: Vec<serde_json::Value> = Vec::with_capacity(n);
     let mut metadatas: Vec<serde_json::Value> = Vec::with_capacity(n);
     let mut queues: Vec<String> = Vec::with_capacity(n);
 
@@ -390,6 +394,9 @@ async fn insert_many_dyn(
         scheduled_ats.push(scheduled_at);
         unique_keys.push(req.unique_key);
         group_keys.push(req.group_key);
+        tags.push(serde_json::Value::Array(
+            req.tags.into_iter().map(serde_json::Value::String).collect(),
+        ));
         metadatas.push(req.metadata);
         queues.push(req.queue);
     }
@@ -397,7 +404,7 @@ async fn insert_many_dyn(
     let rows_inserted: (i64,) = sqlx::query_as(
         r#"
         WITH inserted AS (
-            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
             SELECT t.kind,
                    t.payload,
                    'pending',
@@ -406,12 +413,13 @@ async fn insert_many_dyn(
                    t.scheduled_at,
                    t.unique_key,
                    t.group_key,
+                   COALESCE(ARRAY(SELECT jsonb_array_elements_text(t.tags)), ARRAY[]::text[]),
                    t.metadata,
                    t.queue
               FROM UNNEST(
                   $1::text[], $2::jsonb[], $3::smallint[], $4::int[],
-                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::text[]
-              ) AS t(kind, payload, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[]
+              ) AS t(kind, payload, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
             ON CONFLICT DO NOTHING
          RETURNING id
         )
@@ -425,6 +433,7 @@ async fn insert_many_dyn(
     .bind(&scheduled_ats)
     .bind(&unique_keys)
     .bind(&group_keys)
+    .bind(&tags)
     .bind(&metadatas)
     .bind(&queues)
     .fetch_one(&mut *conn)
@@ -448,8 +457,9 @@ async fn insert_many_dyn(
 /// Dynamic-kind bulk enqueue. Mixed kinds in one batch are supported — unlike
 /// the typed `enqueue_many`, which constrains the batch to a single `J::KIND`.
 ///
-/// Note: `tags` are ignored in the bulk path (matching the typed bulk).
-/// Use the single-job `enqueue_dyn` if you need tagged jobs.
+/// Per-item `tags` are passed through. The typed `enqueue_many` path doesn't
+/// yet support tags; if you need tagged jobs from Rust, use `enqueue_dyn`
+/// with `DynEnqueue::new` or call this function.
 pub async fn enqueue_many_dyn(
     pool: &PgPool,
     reqs: Vec<DynEnqueue>,

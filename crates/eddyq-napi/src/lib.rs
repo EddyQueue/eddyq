@@ -124,6 +124,8 @@ pub struct EnqueueManyItem {
     pub delay_ms: Option<i64>,
     pub unique_key: Option<String>,
     pub group_key: Option<String>,
+    /// Admin-visible tags (stored on the job row, queryable via `listJobs`).
+    pub tags: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -416,10 +418,12 @@ impl Queue {
     /// of one per job. Mixed `kind` within a batch is supported.
     ///
     /// Returns aggregate counts (`inserted`, `skipped`); per-job ids are not
-    /// surfaced — use `enqueue()` in a loop if you need them.
+    /// surfaced — use a stable `uniqueKey` per item if you need to correlate
+    /// results back to your own domain objects, or fall back to `enqueue()`
+    /// when you need the auto-generated id.
     ///
-    /// Note: per-item `tags` are not yet supported in the bulk path and will
-    /// be ignored. Use `enqueue()` for tagged jobs.
+    /// Batch size is capped at 5,000 items per call — split larger workloads
+    /// client-side.
     #[napi]
     pub async fn enqueue_many(
         &self,
@@ -985,10 +989,22 @@ async fn do_enqueue(
     })
 }
 
+/// Cap on items per `enqueueMany` call. Each item binds ~10 Postgres
+/// parameters and the protocol limit is 65,535 — plus giant batches hold
+/// a pool connection for a long time. Split larger workloads client-side.
+const ENQUEUE_MANY_MAX: usize = 5_000;
+
 async fn do_enqueue_many(
     client: Client,
     items: Vec<EnqueueManyItem>,
 ) -> Result<BulkEnqueueOutcome> {
+    if items.len() > ENQUEUE_MANY_MAX {
+        return Err(napi::Error::from_reason(format!(
+            "enqueueMany: batch of {} exceeds max of {}; split client-side",
+            items.len(),
+            ENQUEUE_MANY_MAX,
+        )));
+    }
     let mut reqs: Vec<DynEnqueue> = Vec::with_capacity(items.len());
     for item in items {
         if item.scheduled_at_ms.is_some() && item.delay_ms.is_some() {
@@ -1017,6 +1033,9 @@ async fn do_enqueue_many(
         }
         if let Some(g) = item.group_key {
             req.group_key = Some(g);
+        }
+        if let Some(t) = item.tags {
+            req.tags = t;
         }
         if let Some(m) = item.metadata {
             req.metadata = m;
