@@ -13,6 +13,9 @@ pub struct EnqueueOptions {
     pub priority: Option<i16>,
     pub unique_key: Option<String>,
     pub group_key: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub metadata: Option<serde_json::Value>,
+    pub queue: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +36,19 @@ async fn insert_job<J: Job>(
     let priority = opts.priority.unwrap_or_else(|| job.priority());
     let unique_key = opts.unique_key.or_else(|| job.unique_key());
     let group_key = opts.group_key.clone().or_else(|| job.group_key());
+    let tags = opts.tags.unwrap_or_else(|| job.tags());
+    let metadata = opts
+        .metadata
+        .or_else(|| job.metadata())
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let queue = opts.queue.unwrap_or_else(|| job.queue().to_owned());
     let scheduled_at = opts.scheduled_at.unwrap_or_else(Utc::now);
     let due_now = scheduled_at <= Utc::now();
 
     let row: Option<(JobId,)> = sqlx::query_as(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key)
-        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7)
+        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
+        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT DO NOTHING
         RETURNING id
         "#,
@@ -51,6 +60,9 @@ async fn insert_job<J: Job>(
     .bind(scheduled_at)
     .bind(unique_key)
     .bind(&group_key)
+    .bind(&tags)
+    .bind(&metadata)
+    .bind(&queue)
     .fetch_optional(&mut *conn)
     .await?;
 
@@ -90,6 +102,151 @@ pub async fn enqueue<J: Job>(
     }
 
     Ok(result)
+}
+
+/// Aggregate result of a bulk enqueue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkEnqueueResult {
+    pub inserted: u64,
+    pub skipped: u64,
+}
+
+/// Enqueue many jobs of the same kind in a single INSERT — dramatically faster
+/// than calling `enqueue()` N times. Pattern rules still materialize per group
+/// (one ensure-from-rule call per distinct group key in the batch).
+///
+/// Returns the aggregate count: inserted + skipped (due to unique-key
+/// conflicts). For per-row results, use `enqueue` in a loop.
+pub async fn enqueue_many<J: Job>(
+    pool: &PgPool,
+    jobs: &[J],
+) -> Result<BulkEnqueueResult> {
+    if jobs.is_empty() {
+        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+    }
+    let mut conn = pool.acquire().await?;
+    let (result, any_due_now, distinct_groups) = insert_many(&mut conn, jobs).await?;
+
+    for g in &distinct_groups {
+        crate::group::materialize_from_rule(&mut conn, g).await?;
+    }
+
+    if any_due_now && result.inserted > 0 {
+        let _ = sqlx::query("SELECT pg_notify('eddyq_job', '')")
+            .execute(&mut *conn)
+            .await;
+    }
+
+    Ok(result)
+}
+
+/// Transactional bulk enqueue — all inserts (and the follow-up NOTIFY) only
+/// land if the caller's transaction commits.
+pub async fn enqueue_many_in_tx<J: Job>(
+    tx: &mut Transaction<'_, Postgres>,
+    jobs: &[J],
+) -> Result<BulkEnqueueResult> {
+    if jobs.is_empty() {
+        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+    }
+    let conn: &mut PgConnection = tx;
+    let (result, any_due_now, distinct_groups) = insert_many(conn, jobs).await?;
+
+    for g in &distinct_groups {
+        let conn: &mut PgConnection = tx;
+        crate::group::materialize_from_rule(conn, g).await?;
+    }
+
+    if any_due_now && result.inserted > 0 {
+        let conn: &mut PgConnection = tx;
+        sqlx::query("SELECT pg_notify('eddyq_job', '')")
+            .execute(conn)
+            .await?;
+    }
+
+    Ok(result)
+}
+
+async fn insert_many<J: Job>(
+    conn: &mut PgConnection,
+    jobs: &[J],
+) -> Result<(BulkEnqueueResult, bool, Vec<String>)> {
+    let now = Utc::now();
+    let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(jobs.len());
+    let mut priorities: Vec<i16> = Vec::with_capacity(jobs.len());
+    let mut max_attempts: Vec<i32> = Vec::with_capacity(jobs.len());
+    let mut scheduled_ats: Vec<DateTime<Utc>> = Vec::with_capacity(jobs.len());
+    let mut unique_keys: Vec<Option<String>> = Vec::with_capacity(jobs.len());
+    let mut group_keys: Vec<Option<String>> = Vec::with_capacity(jobs.len());
+    let mut metadatas: Vec<serde_json::Value> = Vec::with_capacity(jobs.len());
+    let mut queues: Vec<String> = Vec::with_capacity(jobs.len());
+
+    let mut any_due_now = false;
+    for job in jobs {
+        payloads.push(serde_json::to_value(job)?);
+        priorities.push(job.priority());
+        max_attempts.push(job.max_attempts());
+        scheduled_ats.push(now);
+        unique_keys.push(job.unique_key());
+        group_keys.push(job.group_key());
+        metadatas.push(
+            job.metadata()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+        );
+        queues.push(job.queue().to_owned());
+        any_due_now = true;
+    }
+
+    let rows_inserted: (i64,) = sqlx::query_as(
+        r#"
+        WITH inserted AS (
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+            SELECT $1,
+                   t.payload,
+                   'pending',
+                   t.priority,
+                   t.max_attempts,
+                   t.scheduled_at,
+                   t.unique_key,
+                   t.group_key,
+                   t.metadata,
+                   t.queue
+              FROM UNNEST(
+                  $2::jsonb[], $3::smallint[], $4::int[],
+                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::text[]
+              ) AS t(payload, priority, max_attempts, scheduled_at, unique_key, group_key, metadata, queue)
+            ON CONFLICT DO NOTHING
+         RETURNING id
+        )
+        SELECT COUNT(*)::bigint FROM inserted
+        "#,
+    )
+    .bind(J::KIND)
+    .bind(&payloads)
+    .bind(&priorities)
+    .bind(&max_attempts)
+    .bind(&scheduled_ats)
+    .bind(&unique_keys)
+    .bind(&group_keys)
+    .bind(&metadatas)
+    .bind(&queues)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let inserted = u64::try_from(rows_inserted.0).unwrap_or(0);
+    let total = jobs.len() as u64;
+    let skipped = total.saturating_sub(inserted);
+
+    let mut distinct_groups: Vec<String> =
+        group_keys.into_iter().flatten().collect();
+    distinct_groups.sort();
+    distinct_groups.dedup();
+
+    Ok((
+        BulkEnqueueResult { inserted, skipped },
+        any_due_now,
+        distinct_groups,
+    ))
 }
 
 /// Enqueue a job *inside the caller's transaction*. The row — and the NOTIFY —

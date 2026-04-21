@@ -3,6 +3,7 @@
 -- ─── Jobs ──────────────────────────────────────────────────────────────────
 CREATE TABLE eddyq_jobs (
     id            BIGSERIAL   PRIMARY KEY,
+    queue         TEXT        NOT NULL DEFAULT 'default',
     kind          TEXT        NOT NULL,
     payload       JSONB       NOT NULL,
     state         TEXT        NOT NULL,
@@ -15,21 +16,23 @@ CREATE TABLE eddyq_jobs (
     errors        JSONB       NOT NULL DEFAULT '[]'::JSONB,
     unique_key    TEXT,
     group_key     TEXT,
+    tags          TEXT[]      NOT NULL DEFAULT '{}',
+    metadata      JSONB       NOT NULL DEFAULT '{}'::JSONB,
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at  TIMESTAMPTZ,
     CONSTRAINT eddyq_jobs_state_check
         CHECK (state IN ('pending', 'running', 'completed', 'failed', 'scheduled', 'cancelled'))
 );
 
--- Serves: fetch claim path (all pending, ordered).
+-- Serves: fetch claim path (all pending, ordered). Queue is the leading column
+-- so workers subscribed to a subset of queues can index-scan efficiently.
 CREATE INDEX eddyq_jobs_fetch
-    ON eddyq_jobs (priority DESC, scheduled_at ASC, id ASC)
+    ON eddyq_jobs (queue, priority DESC, scheduled_at ASC, id ASC)
     WHERE state = 'pending';
 
--- Serves: fastlane claim (ungrouped pending). Distinct from eddyq_jobs_fetch
--- so the fastlane doesn't walk past grouped rows row-by-row.
+-- Serves: fastlane claim (ungrouped pending).
 CREATE INDEX eddyq_jobs_fetch_ungrouped
-    ON eddyq_jobs (priority DESC, scheduled_at ASC, id ASC)
+    ON eddyq_jobs (queue, priority DESC, scheduled_at ASC, id ASC)
     WHERE state = 'pending' AND group_key IS NULL;
 
 -- Serves: per-group claim path.
@@ -54,6 +57,21 @@ CREATE INDEX eddyq_jobs_kind ON eddyq_jobs (kind);
 CREATE INDEX eddyq_jobs_finalized
     ON eddyq_jobs (completed_at DESC)
     WHERE state IN ('completed', 'failed');
+
+-- Serves: filter by tag in dashboards ("show me all jobs tagged 'urgent'").
+CREATE INDEX eddyq_jobs_tags ON eddyq_jobs USING GIN (tags);
+
+-- ─── Named queues (cross-process concurrency tracking) ────────────────────
+-- Tracks running_count for each named queue so a cap of 10 on "integrations"
+-- applies across all worker replicas, not per-process.
+CREATE TABLE eddyq_queues (
+    name            TEXT        PRIMARY KEY,
+    running_count   INTEGER     NOT NULL DEFAULT 0 CHECK (running_count >= 0),
+    max_concurrency INTEGER     NOT NULL DEFAULT 2147483647 CHECK (max_concurrency >= 0),
+    paused          BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
 -- ─── Groups ────────────────────────────────────────────────────────────────
 CREATE TABLE eddyq_groups (

@@ -27,6 +27,11 @@ impl JobState {
     }
 }
 
+/// Default queue name. Matches the convention used by River, BullMQ, and
+/// Sidekiq — jobs with no explicit queue go here, workers subscribe here by
+/// default.
+pub const DEFAULT_QUEUE: &str = "default";
+
 pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     const KIND: &'static str;
 
@@ -42,11 +47,34 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
         None
     }
 
+    /// Which named queue this job should be enqueued on. Workers subscribe to
+    /// queues via `QueueBuilder::subscribe_to`. Default is `"default"`.
+    ///
+    /// Use named queues for *routing pools* — separate worker processes for
+    /// urgent vs default vs heavy workloads. Use `group_key` for concurrency
+    /// limiting. The two are orthogonal.
+    fn queue(&self) -> &'static str {
+        DEFAULT_QUEUE
+    }
+
     /// Group this job belongs to for concurrency / rate-limit purposes. Jobs
     /// sharing a `group_key` are subject to the per-group `max_concurrency` limit
     /// (set via `Queue::set_group_concurrency`). Returning `None` means the job
     /// is not group-limited.
     fn group_key(&self) -> Option<String> {
+        None
+    }
+
+    /// Tags attached to this job for filtering in dashboards / admin queries.
+    /// Stored in a GIN-indexed TEXT[] column; query with `tags @> '{urgent}'`.
+    fn tags(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// Arbitrary per-job metadata — distinct from `payload`, which is the
+    /// input to the handler. Use this for trace IDs, user context, source
+    /// attribution — anything the handler doesn't need but admin tooling does.
+    fn metadata(&self) -> Option<serde_json::Value> {
         None
     }
 }

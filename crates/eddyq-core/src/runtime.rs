@@ -23,6 +23,7 @@ pub(crate) struct RuntimeHandles {
     pub workers: Vec<JoinHandle<()>>,
     pub sweeper: JoinHandle<()>,
     pub scheduler: JoinHandle<()>,
+    pub cleanup: JoinHandle<()>,
     pub listener: Option<JoinHandle<()>>,
 }
 
@@ -30,6 +31,7 @@ pub(crate) fn start(
     pool: PgPool,
     registry: Arc<WorkerRegistry>,
     config: QueueConfig,
+    queues: Vec<String>,
     shutdown: CancellationToken,
 ) -> RuntimeHandles {
     let (tx, rx) = mpsc::channel::<ClaimedJob>(config.worker_concurrency.max(1));
@@ -40,6 +42,8 @@ pub(crate) fn start(
         pool.clone(),
         tx,
         config.clone(),
+        registry.clone(),
+        queues,
         shutdown.clone(),
         wakeup.clone(),
     ));
@@ -69,6 +73,12 @@ pub(crate) fn start(
         shutdown.clone(),
     ));
 
+    let cleanup = tokio::spawn(cleanup_loop(
+        pool.clone(),
+        config.clone(),
+        shutdown.clone(),
+    ));
+
     let listener = if config.poll_only {
         None
     } else {
@@ -84,6 +94,7 @@ pub(crate) fn start(
         workers,
         sweeper,
         scheduler,
+        cleanup,
         listener,
     }
 }
@@ -92,11 +103,15 @@ async fn fetch_loop(
     pool: PgPool,
     tx: mpsc::Sender<ClaimedJob>,
     config: QueueConfig,
+    registry: Arc<WorkerRegistry>,
+    queues: Vec<String>,
     shutdown: CancellationToken,
     wakeup: Arc<tokio::sync::Notify>,
 ) {
     let worker_id = Uuid::new_v4();
-    info!(%worker_id, "eddyq fetcher started");
+    let kinds = registry.kinds();
+    info!(%worker_id, ?kinds, ?queues, "eddyq fetcher started");
+    let _ = registry; // keep registry alive only for kinds snapshot
 
     loop {
         if shutdown.is_cancelled() {
@@ -113,7 +128,9 @@ async fn fetch_loop(
         }
 
         let batch_size = config.fetch_batch_size.min(capacity);
-        let claimed = match claim_batch(&pool, worker_id, batch_size).await {
+        let kinds = registry.kinds();
+        let claimed =
+            match claim_batch(&pool, worker_id, batch_size, &kinds, &queues).await {
             Ok(rows) => rows,
             Err(err) => {
                 error!(?err, "fetch failed");
@@ -301,6 +318,42 @@ async fn scheduler_loop(pool: PgPool, config: QueueConfig, shutdown: Cancellatio
     info!("eddyq scheduler stopped");
 }
 
+async fn cleanup_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationToken) {
+    // Short-circuit if no retention is configured — nothing to do.
+    if config.completed_retention.is_none()
+        && config.failed_retention.is_none()
+        && config.cancelled_retention.is_none()
+    {
+        debug!("cleanup disabled (all retentions None)");
+        return;
+    }
+    info!("eddyq cleanup started");
+    let retention = crate::fetch::Retention {
+        completed_secs: config.completed_retention.map(|d| d.as_secs()),
+        failed_secs: config.failed_retention.map(|d| d.as_secs()),
+        cancelled_secs: config.cancelled_retention.map(|d| d.as_secs()),
+    };
+    let mut interval = tokio::time::interval(config.cleanup_interval);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = interval.tick() => {
+                match crate::fetch::cleanup(&pool, retention).await {
+                    Ok((0, 0, 0)) => {}
+                    Ok((c, f, x)) => info!(
+                        completed = c, failed = f, cancelled = x,
+                        "cleanup deleted old finalized jobs"
+                    ),
+                    Err(err) => warn!(?err, "cleanup failed"),
+                }
+            }
+        }
+    }
+    info!("eddyq cleanup stopped");
+}
+
 async fn listener_loop(
     pool: PgPool,
     wakeup: Arc<tokio::sync::Notify>,
@@ -385,6 +438,7 @@ pub(crate) async fn await_all(handles: RuntimeHandles) {
     }
     let _ = handles.sweeper.await;
     let _ = handles.scheduler.await;
+    let _ = handles.cleanup.await;
     if let Some(h) = handles.listener {
         let _ = h.await;
     }

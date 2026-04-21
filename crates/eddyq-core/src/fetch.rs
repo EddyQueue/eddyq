@@ -13,6 +13,7 @@ pub struct ClaimedJob {
     pub attempt: i32,
     pub max_attempts: i32,
     pub group_key: Option<String>,
+    pub queue: String,
     pub worker_id: Uuid,
 }
 
@@ -39,34 +40,88 @@ pub async fn claim_batch(
     pool: &PgPool,
     worker_id: Uuid,
     batch_size: usize,
+    kinds: &[&str],
+    queues: &[String],
 ) -> Result<Vec<ClaimedJob>> {
-    if batch_size == 0 {
+    if batch_size == 0 || kinds.is_empty() || queues.is_empty() {
         return Ok(vec![]);
     }
-    let batch_size_i64 = i64::try_from(batch_size).unwrap_or(i64::MAX);
+    let kinds_vec: Vec<String> = kinds.iter().map(|s| (*s).to_owned()).collect();
 
     let mut tx = pool.begin().await?;
 
-    // Phase 1 — ungrouped candidates (the fastlane). Uses the
-    // eddyq_jobs_fetch_ungrouped partial index.
-    let ungrouped: Vec<(JobId,)> = sqlx::query_as(
-        r#"
-        SELECT j.id
-          FROM eddyq_jobs j
-         WHERE j.state = 'pending'
-           AND j.scheduled_at <= NOW()
-           AND j.group_key IS NULL
-      ORDER BY j.priority DESC, j.scheduled_at ASC, j.id ASC
-         LIMIT $1
-         FOR UPDATE OF j SKIP LOCKED
-        "#,
-    )
-    .bind(batch_size_i64)
-    .fetch_all(&mut *tx)
-    .await?;
+    // Phase 0 — lock + read cross-process queue caps. For any subscribed
+    // queue with a row in eddyq_queues, compute available slots; for queues
+    // without a row, treat as unlimited (i32::MAX).
+    let mut queue_budget: HashMap<String, i32> = HashMap::new();
+    {
+        let rows: Vec<(String, i32, i32, bool)> = sqlx::query_as(
+            r#"
+            SELECT name, running_count, max_concurrency, paused
+              FROM eddyq_queues
+             WHERE name = ANY($1)
+          ORDER BY name
+               FOR UPDATE
+            "#,
+        )
+        .bind(queues)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (name, running, max, paused) in rows {
+            let slots = if paused { 0 } else { (max - running).max(0) };
+            queue_budget.insert(name, slots);
+        }
+    }
+    let budget_for = |qname: &str, tbl: &HashMap<String, i32>| -> i32 {
+        tbl.get(qname).copied().unwrap_or(i32::MAX)
+    };
 
-    let mut accepted: Vec<(JobId, Option<String>)> =
-        ungrouped.into_iter().map(|(id,)| (id, None)).collect();
+    // Phase 1 — ungrouped (fastlane). Claim per queue so the per-queue cap
+    // is enforced alongside the batch_size cap.
+    let mut accepted: Vec<(JobId, Option<String>, String)> = Vec::with_capacity(batch_size);
+    'ungrouped: for qname in queues {
+        if accepted.len() >= batch_size {
+            break;
+        }
+        let q_slots = budget_for(qname, &queue_budget);
+        if q_slots <= 0 {
+            continue;
+        }
+        let take = i64::from(q_slots)
+            .min(i64::try_from(batch_size - accepted.len()).unwrap_or(i64::MAX));
+        if take <= 0 {
+            continue;
+        }
+        let rows: Vec<(JobId,)> = sqlx::query_as(
+            r#"
+            SELECT j.id
+              FROM eddyq_jobs j
+             WHERE j.state = 'pending'
+               AND j.scheduled_at <= NOW()
+               AND j.group_key IS NULL
+               AND j.kind = ANY($2)
+               AND j.queue = $3
+          ORDER BY j.priority DESC, j.scheduled_at ASC, j.id ASC
+             LIMIT $1
+             FOR UPDATE OF j SKIP LOCKED
+            "#,
+        )
+        .bind(take)
+        .bind(&kinds_vec)
+        .bind(qname)
+        .fetch_all(&mut *tx)
+        .await?;
+        let got = i32::try_from(rows.len()).unwrap_or(i32::MAX);
+        for (id,) in rows {
+            accepted.push((id, None, qname.clone()));
+        }
+        queue_budget
+            .entry(qname.clone())
+            .and_modify(|b| *b = (*b - got).max(0));
+        if accepted.len() >= batch_size {
+            break 'ungrouped;
+        }
+    }
 
     let remaining = batch_size.saturating_sub(accepted.len());
 
@@ -82,8 +137,12 @@ pub async fn claim_batch(
              WHERE j.state = 'pending'
                AND j.scheduled_at <= NOW()
                AND j.group_key IS NOT NULL
+               AND j.kind = ANY($1)
+               AND j.queue = ANY($2)
             "#,
         )
+        .bind(&kinds_vec)
+        .bind(queues)
         .fetch_all(&mut *tx)
         .await?;
         rows.into_iter().map(|(k,)| k).collect()
@@ -161,9 +220,9 @@ pub async fn claim_batch(
         }
     }
 
-    // Phase 3 — for each group with slots > 0, fetch up to `slots`
-    // candidates from that specific group. Uses eddyq_jobs_group partial
-    // index. Stops early if we hit batch_size total.
+    // Phase 3 — for each group with slots > 0, fetch up to `min(group_slots,
+    // per-queue_budget)` candidates from that specific group. Stops early if
+    // we hit batch_size total.
     for (key, state) in group_slots.iter_mut() {
         if accepted.len() >= batch_size {
             break;
@@ -177,13 +236,16 @@ pub async fn claim_batch(
         if take_n <= 0 {
             continue;
         }
-        let rows: Vec<(JobId,)> = sqlx::query_as(
+        // Fetch candidates for this group, tagged with queue.
+        let rows: Vec<(JobId, String)> = sqlx::query_as(
             r#"
-            SELECT j.id
+            SELECT j.id, j.queue
               FROM eddyq_jobs j
              WHERE j.state = 'pending'
                AND j.scheduled_at <= NOW()
                AND j.group_key = $1
+               AND j.kind = ANY($3)
+               AND j.queue = ANY($4)
           ORDER BY j.priority DESC, j.scheduled_at ASC, j.id ASC
              LIMIT $2
              FOR UPDATE OF j SKIP LOCKED
@@ -191,13 +253,25 @@ pub async fn claim_batch(
         )
         .bind(key)
         .bind(take_n)
+        .bind(&kinds_vec)
+        .bind(queues)
         .fetch_all(&mut *tx)
         .await?;
-        let got = rows.len();
-        for (id,) in rows {
-            accepted.push((id, Some(key.clone())));
+        // Filter by remaining per-queue budget as we accept.
+        for (id, qname) in rows {
+            if accepted.len() >= batch_size || state.slots <= 0 {
+                break;
+            }
+            let q_slots = budget_for(&qname, &queue_budget);
+            if q_slots <= 0 {
+                continue;
+            }
+            accepted.push((id, Some(key.clone()), qname.clone()));
+            state.slots -= 1;
+            queue_budget
+                .entry(qname)
+                .and_modify(|b| *b = (*b - 1).max(0));
         }
-        state.slots -= i32::try_from(got).unwrap_or(0);
     }
 
     if accepted.is_empty() {
@@ -205,9 +279,9 @@ pub async fn claim_batch(
         return Ok(vec![]);
     }
 
-    // Step 4: UPDATE accepted jobs to 'running'; upsert group counters.
-    let accepted_ids: Vec<JobId> = accepted.iter().map(|(id, _)| *id).collect();
-    let claimed: Vec<(JobId, String, serde_json::Value, i32, i32, Option<String>)> =
+    // Step 4: UPDATE accepted jobs to 'running'; upsert group + queue counters.
+    let accepted_ids: Vec<JobId> = accepted.iter().map(|(id, _, _)| *id).collect();
+    let claimed: Vec<(JobId, String, serde_json::Value, i32, i32, Option<String>, String)> =
         sqlx::query_as(
             r#"
             UPDATE eddyq_jobs AS j
@@ -216,7 +290,7 @@ pub async fn claim_batch(
                    heartbeat_at = NOW(),
                    worker_id    = $2
              WHERE j.id = ANY($1)
-         RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.group_key
+         RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.group_key, j.queue
             "#,
         )
         .bind(&accepted_ids)
@@ -226,13 +300,15 @@ pub async fn claim_batch(
 
     // Aggregate per-group deltas and upsert running_count. For rate-limited
     // groups, also write back the decremented token balance and refill timestamp.
-    let mut deltas: HashMap<String, i32> = HashMap::new();
-    for (_, _, _, _, _, group_key) in &claimed {
+    let mut group_deltas: HashMap<String, i32> = HashMap::new();
+    let mut queue_deltas: HashMap<String, i32> = HashMap::new();
+    for (_, _, _, _, _, group_key, qname) in &claimed {
         if let Some(g) = group_key {
-            *deltas.entry(g.clone()).or_insert(0) += 1;
+            *group_deltas.entry(g.clone()).or_insert(0) += 1;
         }
+        *queue_deltas.entry(qname.clone()).or_insert(0) += 1;
     }
-    for (key, delta) in &deltas {
+    for (key, delta) in &group_deltas {
         sqlx::query(
             r#"
             INSERT INTO eddyq_groups (key, running_count)
@@ -247,7 +323,6 @@ pub async fn claim_batch(
         .execute(&mut *tx)
         .await?;
 
-        // Token writeback for rate-limited groups.
         if let Some(state) = group_slots.get(key) {
             if state.rate_limited {
                 let remaining = (state.refilled_tokens - f64::from(*delta)).max(0.0);
@@ -267,20 +342,39 @@ pub async fn claim_batch(
             }
         }
     }
+    // Queue counter upserts — only bump rows that already exist; queues with
+    // no row are implicitly unlimited and don't need tracking.
+    for (qname, delta) in &queue_deltas {
+        sqlx::query(
+            r#"
+            UPDATE eddyq_queues
+               SET running_count = running_count + $2,
+                   updated_at    = NOW()
+             WHERE name = $1
+            "#,
+        )
+        .bind(qname)
+        .bind(delta)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     tx.commit().await?;
 
     Ok(claimed
         .into_iter()
-        .map(|(id, kind, payload, attempt, max_attempts, group_key)| ClaimedJob {
-            id,
-            kind,
-            payload,
-            attempt,
-            max_attempts,
-            group_key,
-            worker_id,
-        })
+        .map(
+            |(id, kind, payload, attempt, max_attempts, group_key, queue)| ClaimedJob {
+                id,
+                kind,
+                payload,
+                attempt,
+                max_attempts,
+                group_key,
+                queue,
+                worker_id,
+            },
+        )
         .collect())
 }
 
@@ -288,35 +382,111 @@ pub async fn claim_batch(
 #[allow(dead_code)]
 fn _assert_tx_type(_: &mut Transaction<'_, Postgres>) {}
 
+/// Cancel a pending (or future-scheduled) job. No-op if the job is already
+/// running or finalized — you can't abort a job mid-execution from eddyq
+/// itself; the handler must cooperate for that.
+///
+/// Returns `true` if the job was cancelled, `false` if it wasn't eligible.
+pub async fn cancel(pool: &PgPool, id: JobId) -> Result<bool> {
+    // If the job had a group_key, decrement the counter — but only if it was
+    // in a state where it had been counted (it wasn't: pending jobs don't
+    // contribute to running_count). So we just transition state + completed_at.
+    let res = sqlx::query(
+        r#"
+        UPDATE eddyq_jobs
+           SET state        = 'cancelled',
+               completed_at = NOW()
+         WHERE id = $1
+           AND state = 'pending'
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Per-state retention policy (seconds). `None` = keep forever.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Retention {
+    pub completed_secs: Option<u64>,
+    pub failed_secs: Option<u64>,
+    pub cancelled_secs: Option<u64>,
+}
+
+/// Delete finalized jobs older than the per-state retention. Returns
+/// (completed_deleted, failed_deleted, cancelled_deleted).
+pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u64)> {
+    let mut completed = 0u64;
+    let mut failed = 0u64;
+    let mut cancelled = 0u64;
+
+    for (state, maybe_secs, out) in [
+        ("completed", retention.completed_secs, &mut completed),
+        ("failed", retention.failed_secs, &mut failed),
+        ("cancelled", retention.cancelled_secs, &mut cancelled),
+    ] {
+        let Some(secs) = maybe_secs else { continue };
+        let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+        // Uses eddyq_jobs_finalized (completed_at DESC) partial index.
+        let res = sqlx::query(
+            r#"
+            DELETE FROM eddyq_jobs
+             WHERE state = $1
+               AND completed_at IS NOT NULL
+               AND completed_at < NOW() - make_interval(secs => $2)
+            "#,
+        )
+        .bind(state)
+        .bind(secs)
+        .execute(pool)
+        .await?;
+        *out = res.rows_affected();
+    }
+
+    Ok((completed, failed, cancelled))
+}
+
 pub async fn mark_completed(pool: &PgPool, id: JobId, worker_id: Uuid) -> Result<()> {
     // Gate on (state='running' AND worker_id = our uuid) so a worker whose
     // heartbeat was swept can't clobber the job state after another worker
-    // picked it up. The GREATEST(x, 0) clamp on the counter is defensive:
-    // the sweeper already decremented when it reset the job.
-    sqlx::query(
+    // picked it up. Decrements both the group counter (if any) AND the queue
+    // counter.
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<String>, String)> = sqlx::query_as(
         r#"
-        WITH job AS (
-            UPDATE eddyq_jobs
-               SET state        = 'completed',
-                   heartbeat_at = NULL,
-                   worker_id    = NULL,
-                   completed_at = NOW()
-             WHERE id = $1
-               AND state = 'running'
-               AND worker_id = $2
-         RETURNING group_key
-        )
-        UPDATE eddyq_groups g
-           SET running_count = GREATEST(g.running_count - 1, 0),
-               updated_at    = NOW()
-          FROM job
-         WHERE g.key = job.group_key
+        UPDATE eddyq_jobs
+           SET state        = 'completed',
+               heartbeat_at = NULL,
+               worker_id    = NULL,
+               completed_at = NOW()
+         WHERE id = $1
+           AND state = 'running'
+           AND worker_id = $2
+     RETURNING group_key, queue
         "#,
     )
     .bind(id)
     .bind(worker_id)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    if let Some((group_key, queue)) = row {
+        if let Some(g) = group_key {
+            sqlx::query(
+                "UPDATE eddyq_groups SET running_count = GREATEST(running_count - 1, 0), updated_at = NOW() WHERE key = $1",
+            )
+            .bind(&g)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE eddyq_queues SET running_count = GREATEST(running_count - 1, 0), updated_at = NOW() WHERE name = $1",
+        )
+        .bind(&queue)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -349,8 +519,7 @@ pub async fn sweep_stale(
         "message": "heartbeat timeout — worker presumed dead",
     });
 
-    // Two-step to keep the decrements tidy: update the jobs, collect their
-    // group_keys with a CTE, then update eddyq_groups in aggregate.
+    // Sweep + decrement both group and queue counters in one statement.
     let (recovered,): (i64,) = sqlx::query_as(
         r#"
         WITH swept AS (
@@ -362,21 +531,34 @@ pub async fn sweep_stale(
                    completed_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
              WHERE state = 'running'
                AND heartbeat_at < NOW() - make_interval(secs => $1)
-         RETURNING group_key
+         RETURNING group_key, queue
         ),
-        decrements AS (
+        group_decrements AS (
             SELECT group_key AS key, COUNT(*)::int AS delta
               FROM swept
              WHERE group_key IS NOT NULL
           GROUP BY group_key
         ),
-        _drop AS (
+        queue_decrements AS (
+            SELECT queue AS name, COUNT(*)::int AS delta
+              FROM swept
+          GROUP BY queue
+        ),
+        _drop_groups AS (
             UPDATE eddyq_groups g
                SET running_count = GREATEST(g.running_count - d.delta, 0),
                    updated_at    = NOW()
-              FROM decrements d
+              FROM group_decrements d
              WHERE g.key = d.key
             RETURNING g.key
+        ),
+        _drop_queues AS (
+            UPDATE eddyq_queues q
+               SET running_count = GREATEST(q.running_count - d.delta, 0),
+                   updated_at    = NOW()
+              FROM queue_decrements d
+             WHERE q.name = d.name
+            RETURNING q.name
         )
         SELECT COUNT(*) FROM swept
         "#,
@@ -405,61 +587,67 @@ pub async fn mark_failed(
         "message": error,
     });
 
-    if let Some(at) = retry_at {
-        sqlx::query(
+    let mut tx = pool.begin().await?;
+
+    let row: Option<(Option<String>, String)> = if let Some(at) = retry_at {
+        sqlx::query_as(
             r#"
-            WITH job AS (
-                UPDATE eddyq_jobs
-                   SET state        = 'pending',
-                       heartbeat_at = NULL,
-                       worker_id    = NULL,
-                       scheduled_at = $2,
-                       errors       = errors || $3::jsonb
-                 WHERE id = $1
-                   AND state = 'running'
-                   AND worker_id = $4
-             RETURNING group_key
-            )
-            UPDATE eddyq_groups g
-               SET running_count = GREATEST(g.running_count - 1, 0),
-                   updated_at    = NOW()
-              FROM job
-             WHERE g.key = job.group_key
+            UPDATE eddyq_jobs
+               SET state        = 'pending',
+                   heartbeat_at = NULL,
+                   worker_id    = NULL,
+                   scheduled_at = $2,
+                   errors       = errors || $3::jsonb
+             WHERE id = $1
+               AND state = 'running'
+               AND worker_id = $4
+         RETURNING group_key, queue
             "#,
         )
         .bind(id)
         .bind(at)
         .bind(error_entry)
         .bind(worker_id)
-        .execute(pool)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
     } else {
-        sqlx::query(
+        sqlx::query_as(
             r#"
-            WITH job AS (
-                UPDATE eddyq_jobs
-                   SET state        = 'failed',
-                       heartbeat_at = NULL,
-                       worker_id    = NULL,
-                       errors       = errors || $2::jsonb,
-                       completed_at = NOW()
-                 WHERE id = $1
-                   AND state = 'running'
-                   AND worker_id = $3
-             RETURNING group_key
-            )
-            UPDATE eddyq_groups g
-               SET running_count = GREATEST(g.running_count - 1, 0),
-                   updated_at    = NOW()
-              FROM job
-             WHERE g.key = job.group_key
+            UPDATE eddyq_jobs
+               SET state        = 'failed',
+                   heartbeat_at = NULL,
+                   worker_id    = NULL,
+                   errors       = errors || $2::jsonb,
+                   completed_at = NOW()
+             WHERE id = $1
+               AND state = 'running'
+               AND worker_id = $3
+         RETURNING group_key, queue
             "#,
         )
         .bind(id)
         .bind(error_entry)
         .bind(worker_id)
-        .execute(pool)
+        .fetch_optional(&mut *tx)
+        .await?
+    };
+
+    if let Some((group_key, queue)) = row {
+        if let Some(g) = group_key {
+            sqlx::query(
+                "UPDATE eddyq_groups SET running_count = GREATEST(running_count - 1, 0), updated_at = NOW() WHERE key = $1",
+            )
+            .bind(&g)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE eddyq_queues SET running_count = GREATEST(running_count - 1, 0), updated_at = NOW() WHERE name = $1",
+        )
+        .bind(&queue)
+        .execute(&mut *tx)
         .await?;
     }
+    tx.commit().await?;
     Ok(())
 }

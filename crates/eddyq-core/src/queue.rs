@@ -24,6 +24,17 @@ pub struct QueueConfig {
     pub retry_base: Duration,
     pub retry_max: Duration,
     pub scheduler_interval: Duration,
+    /// How often the cleanup task runs.
+    pub cleanup_interval: Duration,
+    /// Delete completed jobs older than this. `None` = keep forever.
+    /// Default: 24h (matches River's `CompletedJobRetentionPeriod`).
+    pub completed_retention: Option<Duration>,
+    /// Delete failed jobs older than this. `None` = keep forever.
+    /// Default: 7 days (matches River's `DiscardedJobRetentionPeriod`).
+    pub failed_retention: Option<Duration>,
+    /// Delete cancelled jobs older than this. `None` = keep forever.
+    /// Default: 7 days.
+    pub cancelled_retention: Option<Duration>,
     /// When `true`, do not spawn a LISTEN/NOTIFY listener. Use this when connected
     /// through PgBouncer in transaction-pooling mode (LISTEN is incompatible).
     pub poll_only: bool,
@@ -42,6 +53,10 @@ impl Default for QueueConfig {
             retry_base: Duration::from_secs(1),
             retry_max: Duration::from_secs(300),
             scheduler_interval: Duration::from_secs(5),
+            cleanup_interval: Duration::from_secs(300), // 5 min
+            completed_retention: Some(Duration::from_secs(24 * 60 * 60)),       // 24h
+            failed_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),      // 7d
+            cancelled_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),   // 7d
             poll_only: false,
         }
     }
@@ -52,6 +67,7 @@ pub struct QueueBuilder {
     registry: WorkerRegistry,
     config: QueueConfig,
     line: String,
+    queues: Vec<String>,
 }
 
 impl QueueBuilder {
@@ -61,7 +77,23 @@ impl QueueBuilder {
             registry: WorkerRegistry::new(),
             config: QueueConfig::default(),
             line: crate::migrate::DEFAULT_LINE.to_owned(),
+            queues: vec![crate::job::DEFAULT_QUEUE.to_owned()],
         }
+    }
+
+    /// Subscribe this queue's workers to specific named queues. Default is
+    /// `["default"]`. Use named queues to split worker pools — e.g., one
+    /// process on `["urgent"]` and another on `["default", "low"]`.
+    pub fn subscribe_to<I, S>(mut self, queues: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.queues = queues.into_iter().map(Into::into).collect();
+        if self.queues.is_empty() {
+            self.queues.push(crate::job::DEFAULT_QUEUE.to_owned());
+        }
+        self
     }
 
     /// Name the migration line this queue uses. Default is `"main"`. Use
@@ -123,6 +155,7 @@ impl QueueBuilder {
             registry: Arc::new(self.registry),
             config: self.config,
             line: self.line,
+            queues: self.queues,
             state: std::sync::Mutex::new(QueueState::Idle),
         }
     }
@@ -141,6 +174,7 @@ pub struct Queue {
     registry: Arc<WorkerRegistry>,
     config: QueueConfig,
     line: String,
+    queues: Vec<String>,
     state: std::sync::Mutex<QueueState>,
 }
 
@@ -183,6 +217,33 @@ impl Queue {
         opts: EnqueueOptions,
     ) -> Result<EnqueueResult> {
         enqueue(&self.pool, job, opts).await
+    }
+
+    /// Bulk-enqueue N jobs of the same kind in a single INSERT. Much faster
+    /// than calling `enqueue` in a loop for large batches. Returns an
+    /// aggregate count (inserted + skipped-via-unique-conflict); for per-row
+    /// results, use `enqueue` in a loop.
+    pub async fn enqueue_many<J: Job>(
+        &self,
+        jobs: &[J],
+    ) -> Result<crate::enqueue::BulkEnqueueResult> {
+        crate::enqueue::enqueue_many(&self.pool, jobs).await
+    }
+
+    /// Transactional bulk enqueue. All or nothing — rolls back with the user's tx.
+    pub async fn enqueue_many_in_tx<J: Job>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        jobs: &[J],
+    ) -> Result<crate::enqueue::BulkEnqueueResult> {
+        crate::enqueue::enqueue_many_in_tx(tx, jobs).await
+    }
+
+    /// Cancel a pending job by id. Returns `true` if cancelled, `false` if
+    /// the job doesn't exist or is already running / finalized. Can't cancel
+    /// a running job — the handler must cooperate for that.
+    pub async fn cancel(&self, id: crate::job::JobId) -> Result<bool> {
+        crate::fetch::cancel(&self.pool, id).await
     }
 
     /// Enqueue a job inside the caller's transaction. The job row is only
@@ -302,6 +363,34 @@ impl Queue {
         crate::group::list_rules(&self.pool).await
     }
 
+    // --- Named-queue cross-process concurrency -----------------------------
+
+    /// Cap the total concurrency of a named queue *across all worker
+    /// processes*. Unlike `worker_concurrency` (which is per-process), this
+    /// is a global cap enforced via a shared counter in `eddyq_queues`.
+    ///
+    /// Useful for: "no matter how many ECS replicas we're running, the
+    /// `integrations` queue runs at most 10 jobs total at once."
+    pub async fn set_queue_concurrency(&self, name: &str, max: i32) -> Result<()> {
+        crate::named_queue::set_concurrency(&self.pool, name, max).await
+    }
+
+    pub async fn pause_queue(&self, name: &str) -> Result<()> {
+        crate::named_queue::set_paused(&self.pool, name, true).await
+    }
+
+    pub async fn resume_queue(&self, name: &str) -> Result<()> {
+        crate::named_queue::set_paused(&self.pool, name, false).await
+    }
+
+    pub async fn get_queue(&self, name: &str) -> Result<Option<crate::named_queue::NamedQueue>> {
+        crate::named_queue::get(&self.pool, name).await
+    }
+
+    pub async fn list_named_queues(&self) -> Result<Vec<crate::named_queue::NamedQueue>> {
+        crate::named_queue::list(&self.pool).await
+    }
+
     pub fn start(&self) -> Result<()> {
         let mut state = self.state.lock().expect("queue state lock poisoned");
         if matches!(*state, QueueState::Running { .. }) {
@@ -313,11 +402,13 @@ impl Queue {
             self.pool.clone(),
             self.registry.clone(),
             self.config.clone(),
+            self.queues.clone(),
             shutdown.clone(),
         );
 
         info!(
             kinds = ?self.registry.kinds(),
+            queues = ?self.queues,
             concurrency = self.config.worker_concurrency,
             "eddyq queue started"
         );
