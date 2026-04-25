@@ -5,10 +5,10 @@
   "license": "(MIT OR Apache-2.0)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/remstone7/eddyq.git",
+    "url": "git+https://github.com/EddyQueue/eddyq.git",
     "directory": "packages/queue"
   },
-  "homepage": "https://github.com/remstone7/eddyq",
+  "homepage": "https://github.com/EddyQueue/eddyq",
   "main": "lib.cjs",
   "types": "lib.d.ts",
   "files": [
