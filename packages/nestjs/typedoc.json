@@ -5,6 +5,8 @@
   "name": "@eddyq/nestjs",
   "readme": "README.md",
   "includeVersion": true,
+  "plugin": ["@typhonjs-typedoc/typedoc-theme-dmt"],
+  "theme": "default-modern",
   "navigationLinks": {
     "GitHub": "https://github.com/eddyqueue/eddyq"
   }

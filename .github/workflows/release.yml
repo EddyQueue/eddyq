@@ -218,13 +218,16 @@ jobs:
       - name: Publish @eddyq/queue (+ per-platform packages)
         # `prepublishOnly` hook runs `napi prepublish -t npm` which publishes
         # every `packages/queue/npm/<target>/` package before npm publishes the
-        # main package. Requires NPM_TOKEN in the environment.
+        # main package. Also creates a GitHub release for the tag — needs
+        # GITHUB_TOKEN. NPM_TOKEN must be a granular access token with
+        # "Bypass 2FA for publishing" enabled.
         run: |
           cd packages/queue
           npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish @eddyq/nestjs
         # `pnpm publish` rewrites `workspace:*` in peerDependencies to the

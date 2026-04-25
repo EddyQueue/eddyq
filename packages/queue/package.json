@@ -44,8 +44,9 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0",
+    "@typhonjs-typedoc/typedoc-theme-dmt": "^0.4.0",
     "pg": "^8.20.0",
-    "typedoc": "^0.28.0"
+    "typedoc": "^0.28.3"
   },
   "engines": {
     "node": ">=20"

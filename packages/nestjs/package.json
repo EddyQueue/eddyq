@@ -29,9 +29,10 @@
   },
   "devDependencies": {
     "@types/node": "^20",
+    "@typhonjs-typedoc/typedoc-theme-dmt": "^0.4.0",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.0",
-    "typedoc": "^0.28.0"
+    "typedoc": "^0.28.3"
   },
   "engines": {
     "node": ">=20"
