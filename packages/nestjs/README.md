@@ -92,6 +92,11 @@ EddyqModule.forRoot({
   autoStart: true,                  // default true — false = register handlers only
   skipMigrationCheck: false,        // default false — match core's deploy-step guard
   runMigrations: false,             // default false — migrations are a deploy step
+
+  // Cron schedules declared in code. Reconciled at boot; see "Cron schedules".
+  schedules: [
+    { name: "daily-report", cronExpr: "0 0 8 * * *", kind: "report.generate", payload: {} },
+  ],
 });
 ```
 
@@ -179,29 +184,44 @@ See `@eddyq/queue` for the full method list: `enqueue`, `cancel`, `getStats`,
 
 ## Cron schedules
 
-```ts
-@Injectable()
-export class ReportSchedules implements OnApplicationBootstrap {
-  constructor(@InjectEddyq() private readonly q: Eddyq) {}
+Declare schedules in module config — eddyq reconciles them against the DB at
+boot, so the code is the source of truth. Adding an entry inserts it; removing
+one deletes it. The cron field is the 6-field dialect (`sec min hour dom month
+dow`). `next_run_at` is preserved across redeploys when the cron is unchanged,
+so an imminent tick won't be reset.
 
-  async onApplicationBootstrap() {
-    // Cron dialect: 6 fields — `sec min hour dom month dow`.
-    await this.q.addSchedule(
-      "daily-report",
-      "0 0 8 * * *",       // every day at 08:00:00 UTC
-      "report.generate",
-      { scope: "daily" },
-      { priority: 5 },
-    );
-  }
-}
+```ts
+import { EddyqModule, type ScheduleDeclaration } from "@eddyq/nestjs";
+
+const schedules: ScheduleDeclaration[] = [
+  {
+    name: "daily-report",
+    cronExpr: "0 0 8 * * *",     // every day at 08:00:00 UTC
+    kind: "report.generate",
+    payload: { scope: "daily" },
+    priority: 5,
+  },
+];
+
+EddyqModule.forRoot({
+  databaseUrl: process.env.DATABASE_URL!,
+  schedules,
+});
 ```
 
-`addSchedule` is an idempotent upsert keyed on `name`, so re-registering on
-every boot is the intended pattern. The scheduler runs with single-leader
-election (Postgres advisory lock) so N replicas never double-fire a tick, and
-uses skip-missed semantics — if the cluster was down for an hour against a
-minute-interval cron, you get one catch-up enqueue, not sixty.
+The scheduler runs with single-leader election (Postgres-backed lease) so N
+replicas never double-fire a tick, and uses skip-missed semantics — if the
+cluster was down for an hour against a minute-interval cron, you get one
+catch-up enqueue, not sixty. On graceful shutdown the leader resigns via
+`pg_notify` so a peer takes over within milliseconds rather than waiting for
+the lease to expire.
+
+> Omitting `schedules` leaves the DB untouched. Pass `[]` to delete every
+> schedule. The declared list is **authoritative** — any DB schedule whose
+> `name` isn't in the list is removed, including ones added by older deploys
+> or imperative `addSchedule` calls. If you need ad-hoc schedules outside this
+> list, manage them entirely via `addSchedule` and don't pass `schedules` at
+> all.
 
 ## Transactional enqueue
 

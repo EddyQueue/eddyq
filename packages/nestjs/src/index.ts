@@ -46,5 +46,6 @@ export type {
   Pagination,
   QueueStateCount,
   Schedule,
+  ScheduleDeclaration,
   StartOptions,
 } from "@eddyq/queue";
