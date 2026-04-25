@@ -32,6 +32,6 @@ export class EddyqBoardModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
     consumer
       .apply(BoardAuthMiddleware)
-      .forRoutes({ path: `${EddyqBoardModule._mountPath}*`, method: RequestMethod.ALL });
+      .forRoutes({ path: `${EddyqBoardModule._mountPath}*path`, method: RequestMethod.ALL });
   }
 }

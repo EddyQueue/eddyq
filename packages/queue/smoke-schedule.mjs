@@ -17,6 +17,11 @@ const q = await Eddyq.connect(DB_URL, { maxConnections: 4 });
 const name = `smoke-sched-${Date.now()}`;
 const kind = "schedule.demo";
 
+// Ensure cleanup even if the test is killed or crashes mid-run.
+const cleanup = async () => { await q.removeSchedule(name).catch(() => {}); };
+process.once('SIGINT', async () => { await cleanup(); await q.close(); process.exit(1); });
+process.once('SIGTERM', async () => { await cleanup(); await q.close(); process.exit(1); });
+
 // cron crate dialect is 6-field (sec min hour dom month dow) — fire every second.
 await q.addSchedule(name, "* * * * * *", kind, { hello: "world" }, { priority: 1 });
 console.log(`added schedule: ${name}`);

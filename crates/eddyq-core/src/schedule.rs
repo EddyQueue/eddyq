@@ -56,8 +56,8 @@ pub async fn upsert_schedule_raw(
     priority: i16,
     max_attempts: i32,
 ) -> Result<()> {
-    let schedule = CronSchedule::from_str(cron_expr)
-        .map_err(|e| crate::error::Error::Cron(e.to_string()))?;
+    let schedule =
+        CronSchedule::from_str(cron_expr).map_err(|e| crate::error::Error::Cron(e.to_string()))?;
     let next = schedule
         .upcoming(Utc)
         .next()
@@ -100,13 +100,12 @@ pub async fn remove_schedule(pool: &PgPool, name: &str) -> Result<bool> {
 }
 
 pub async fn set_enabled(pool: &PgPool, name: &str, enabled: bool) -> Result<bool> {
-    let res = sqlx::query(
-        "UPDATE eddyq_schedules SET enabled = $2, updated_at = NOW() WHERE name = $1",
-    )
-    .bind(name)
-    .bind(enabled)
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("UPDATE eddyq_schedules SET enabled = $2, updated_at = NOW() WHERE name = $1")
+            .bind(name)
+            .bind(enabled)
+            .execute(pool)
+            .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -128,11 +127,10 @@ pub async fn list_schedules(pool: &PgPool) -> Result<Vec<Schedule>> {
 pub(crate) async fn tick(pool: &PgPool) -> Result<usize> {
     let mut tx = pool.begin().await?;
 
-    let got_lock: bool =
-        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-            .bind(SCHEDULER_LOCK_KEY)
-            .fetch_one(&mut *tx)
-            .await?;
+    let got_lock: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(SCHEDULER_LOCK_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
     if !got_lock {
         return Ok(0);
     }

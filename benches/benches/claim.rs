@@ -1,15 +1,10 @@
 use std::str::FromStr;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use eddyq_core::{
-    enqueue::enqueue_many,
-    fetch::claim_batch,
-    job::Job,
-    migrate,
-};
+use eddyq_core::{enqueue::enqueue_many, fetch::claim_batch, job::Job, migrate};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -22,12 +17,13 @@ impl Job for BenchJob {
 }
 
 fn payload() -> BenchJob {
-    BenchJob { data: "x".repeat(256) }
+    BenchJob {
+        data: "x".repeat(256),
+    }
 }
 
 async fn setup() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set to run benchmarks");
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run benchmarks");
     let opts = PgConnectOptions::from_str(&url)
         .expect("invalid DATABASE_URL")
         .options([("search_path", "bench")]);

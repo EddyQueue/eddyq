@@ -14,9 +14,9 @@ use std::time::Duration;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 pub use eddyq_core::{
-    BulkEnqueueResult, Directive, DynEnqueue, EnqueueResult, Error, HandlerFailure,
-    JobContext, JobId, JobResult, JobState, Queue as CoreQueue,
-    QueueBuilder as CoreQueueBuilder, QueueConfig, Result,
+    BulkEnqueueResult, Directive, DynEnqueue, EnqueueResult, Error, HandlerFailure, JobContext,
+    JobId, JobResult, JobState, Queue as CoreQueue, QueueBuilder as CoreQueueBuilder, QueueConfig,
+    Result,
     group::{Group, GroupRule, StoredRule},
     migrate::{Direction, MigrateReport, MigrationStatus},
     named_queue::NamedQueue,
@@ -43,7 +43,12 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
-            max_connections: 10,
+            // 5 is intentionally conservative. Job handlers don't hold
+            // connections — they're only needed briefly for fetch, heartbeat,
+            // and complete/fail. At N pods this becomes N×(max_connections+1)
+            // connections total (the +1 is the LISTEN socket). Size explicitly
+            // for your fleet rather than relying on this default.
+            max_connections: 5,
             min_connections: 0,
             acquire_timeout: Duration::from_secs(30),
             line: eddyq_core::migrate::DEFAULT_LINE.to_owned(),
@@ -52,7 +57,7 @@ impl Default for ClientConfig {
 }
 
 impl Client {
-    /// Connect using sensible defaults (pool size 10, line `"main"`).
+    /// Connect using sensible defaults (pool size 5, line `"main"`).
     pub async fn connect(database_url: &str) -> Result<Self> {
         Self::connect_with(database_url, ClientConfig::default()).await
     }
@@ -64,12 +69,18 @@ impl Client {
             .acquire_timeout(cfg.acquire_timeout)
             .connect(database_url)
             .await?;
-        Ok(Self { pool, line: cfg.line })
+        Ok(Self {
+            pool,
+            line: cfg.line,
+        })
     }
 
     /// Wrap an existing pool (e.g. if the host app already manages one).
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool, line: eddyq_core::migrate::DEFAULT_LINE.to_owned() }
+        Self {
+            pool,
+            line: eddyq_core::migrate::DEFAULT_LINE.to_owned(),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -138,12 +149,7 @@ impl Client {
         eddyq_core::group::set_paused(&self.pool, key, false).await
     }
 
-    pub async fn set_group_rate(
-        &self,
-        key: &str,
-        count: u32,
-        period: Duration,
-    ) -> Result<()> {
+    pub async fn set_group_rate(&self, key: &str, count: u32, period: Duration) -> Result<()> {
         eddyq_core::group::set_rate(&self.pool, key, count, period).await
     }
 
@@ -185,11 +191,7 @@ impl Client {
         eddyq_core::named_queue::set_paused(&self.pool, name, false).await
     }
 
-    pub async fn set_queue_timeout(
-        &self,
-        name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
+    pub async fn set_queue_timeout(&self, name: &str, timeout: Option<Duration>) -> Result<()> {
         eddyq_core::named_queue::set_timeout(&self.pool, name, timeout).await
     }
 

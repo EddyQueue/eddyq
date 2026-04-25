@@ -93,7 +93,7 @@ pub async fn list(pool: &PgPool) -> Result<Vec<NamedQueue>> {
 /// Set a default per-job timeout for this queue. When a worker claims a job
 /// from this queue, the handler is wrapped in `tokio::time::timeout(duration)`.
 /// On expiry the job is marked failed (with retry if under `max_attempts`).
-/// Default is no timeout — matches River's `Worker.Timeout=0` convention.
+/// Default is no timeout — opt in per queue.
 pub async fn set_timeout(pool: &PgPool, name: &str, timeout: Option<Duration>) -> Result<()> {
     let ms: Option<i32> = timeout
         .map(|d| i32::try_from(d.as_millis()).unwrap_or(i32::MAX))

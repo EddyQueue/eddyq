@@ -1,4 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use rand::Rng;
 use sqlx::{PgPool, postgres::PgListener};
@@ -9,14 +16,16 @@ use uuid::Uuid;
 
 use crate::{
     QueueConfig,
-    fetch::{
-        ClaimedJob, claim_batch, mark_completed, mark_failed, sweep_stale, update_heartbeat,
-    },
+    fetch::{ClaimedJob, claim_batch, mark_completed, mark_failed, sweep_stale, update_heartbeat_batch},
     job::{JobContext, JobId},
+    leader::{self, MAINTENANCE_ROLE},
     worker::WorkerRegistry,
 };
 
 pub(crate) const NOTIFY_CHANNEL: &str = "eddyq_job";
+
+/// Shared set of in-flight job IDs for the batch heartbeat task.
+type InFlightJobs = Arc<std::sync::Mutex<HashSet<i64>>>;
 
 pub(crate) struct RuntimeHandles {
     pub fetcher: JoinHandle<()>,
@@ -25,6 +34,8 @@ pub(crate) struct RuntimeHandles {
     pub scheduler: JoinHandle<()>,
     pub cleanup: JoinHandle<()>,
     pub listener: Option<JoinHandle<()>>,
+    pub heartbeat: JoinHandle<()>,
+    pub leader: JoinHandle<()>,
 }
 
 pub(crate) fn start(
@@ -37,6 +48,13 @@ pub(crate) fn start(
     let (tx, rx) = mpsc::channel::<ClaimedJob>(config.worker_concurrency.max(1));
     let rx = Arc::new(tokio::sync::Mutex::new(rx));
     let wakeup = Arc::new(tokio::sync::Notify::new());
+
+    // Shared in-flight job set for batch heartbeats.
+    let in_flight: InFlightJobs = Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+    // Leader election state.
+    let is_leader = Arc::new(AtomicBool::new(false));
+    let maintenance_id = Uuid::new_v4();
 
     let fetcher = tokio::spawn(fetch_loop(
         pool.clone(),
@@ -57,26 +75,45 @@ pub(crate) fn start(
                 rx.clone(),
                 config.clone(),
                 shutdown.clone(),
+                in_flight.clone(),
             ))
         })
         .collect();
+
+    let heartbeat = tokio::spawn(heartbeat_loop(
+        pool.clone(),
+        in_flight,
+        config.clone(),
+        shutdown.clone(),
+    ));
+
+    let leader = tokio::spawn(leader_loop(
+        pool.clone(),
+        maintenance_id,
+        is_leader.clone(),
+        config.clone(),
+        shutdown.clone(),
+    ));
 
     let sweeper = tokio::spawn(sweeper_loop(
         pool.clone(),
         config.clone(),
         shutdown.clone(),
+        is_leader.clone(),
     ));
 
     let scheduler = tokio::spawn(scheduler_loop(
         pool.clone(),
         config.clone(),
         shutdown.clone(),
+        is_leader.clone(),
     ));
 
     let cleanup = tokio::spawn(cleanup_loop(
         pool.clone(),
         config.clone(),
         shutdown.clone(),
+        is_leader.clone(),
     ));
 
     let listener = if config.poll_only {
@@ -96,6 +133,8 @@ pub(crate) fn start(
         scheduler,
         cleanup,
         listener,
+        heartbeat,
+        leader,
     }
 }
 
@@ -129,8 +168,7 @@ async fn fetch_loop(
 
         let batch_size = config.fetch_batch_size.min(capacity);
         let kinds = registry.kinds();
-        let claimed =
-            match claim_batch(&pool, worker_id, batch_size, &kinds, &queues).await {
+        let claimed = match claim_batch(&pool, worker_id, batch_size, &kinds, &queues).await {
             Ok(rows) => rows,
             Err(err) => {
                 error!(?err, "fetch failed");
@@ -181,6 +219,7 @@ async fn worker_loop(
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ClaimedJob>>>,
     config: QueueConfig,
     shutdown: CancellationToken,
+    in_flight: InFlightJobs,
 ) {
     let worker_id = Uuid::new_v4();
     info!(worker = n, %worker_id, "eddyq worker started");
@@ -196,6 +235,12 @@ async fn worker_loop(
         };
 
         let Some(job) = job else { break };
+
+        // Register this job as in-flight for the shared heartbeat loop.
+        {
+            let mut set = in_flight.lock().expect("in_flight lock poisoned");
+            set.insert(job.id);
+        }
 
         let ctx = JobContext {
             id: job.id,
@@ -215,41 +260,19 @@ async fn worker_loop(
                     ..Default::default()
                 }
                 .as_error_entry();
-                if let Err(db_err) =
-                    mark_failed(&pool, job.id, job.worker_id, entry, None).await
                 {
+                    let mut set = in_flight.lock().expect("in_flight lock poisoned");
+                    set.remove(&job.id);
+                }
+                if let Err(db_err) = mark_failed(&pool, job.id, job.worker_id, entry, None).await {
                     error!(?db_err, "failed to mark unknown-kind job as failed");
                 }
                 continue;
             }
         };
 
-        // Heartbeat ticker so the sweeper knows this worker is alive.
-        let hb_pool = pool.clone();
-        let hb_job_id = job.id;
-        let hb_worker_id = job.worker_id;
-        let hb_interval = config.heartbeat_interval;
-        let hb_stop = CancellationToken::new();
-        let hb_stop_child = hb_stop.clone();
-        let heartbeat_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(hb_interval);
-            interval.tick().await; // immediate tick is free (just resets the schedule)
-            loop {
-                tokio::select! {
-                    biased;
-                    () = hb_stop_child.cancelled() => break,
-                    _ = interval.tick() => {
-                        if let Err(err) = update_heartbeat(&hb_pool, hb_job_id, hb_worker_id).await {
-                            warn!(id = hb_job_id, ?err, "heartbeat update failed");
-                        }
-                    }
-                }
-            }
-        });
-
         let inner = handler(job.payload.clone(), ctx.clone());
-        let caught_fut =
-            futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(inner));
+        let caught_fut = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(inner));
 
         // If the queue has a configured default timeout, wrap the handler in
         // `tokio::time::timeout`. On timeout, synthesize a JobResult::Err so
@@ -257,16 +280,16 @@ async fn worker_loop(
         let result = match job.timeout {
             Some(t) => match tokio::time::timeout(t, caught_fut).await {
                 Ok(caught) => caught,
-                Err(_elapsed) => Ok(Err(anyhow::anyhow!(format!(
-                    "job timed out after {:?}",
-                    t
-                )))),
+                Err(_elapsed) => Ok(Err(anyhow::anyhow!(format!("job timed out after {:?}", t)))),
             },
             None => caught_fut.await,
         };
 
-        hb_stop.cancel();
-        let _ = heartbeat_task.await;
+        // Remove from in-flight set on all exit paths.
+        {
+            let mut set = in_flight.lock().expect("in_flight lock poisoned");
+            set.remove(&job.id);
+        }
 
         match result {
             Ok(Ok(value)) => {
@@ -288,10 +311,9 @@ async fn worker_loop(
                     .unwrap_or_else(|| crate::error::HandlerFailure::from_message(err.to_string()));
                 let retry_at = match failure.directive {
                     Some(crate::error::Directive::Cancel) => None,
-                    Some(crate::error::Directive::Retry { delay_ms }) => Some(
-                        chrono::Utc::now()
-                            + chrono::Duration::milliseconds(delay_ms as i64),
-                    ),
+                    Some(crate::error::Directive::Retry { delay_ms }) => {
+                        Some(chrono::Utc::now() + chrono::Duration::milliseconds(delay_ms as i64))
+                    }
                     None => retry_schedule(job.attempt, job.max_attempts, &config),
                 };
                 warn!(
@@ -299,8 +321,14 @@ async fn worker_loop(
                     retry_at = ?retry_at, directive = ?failure.directive,
                     error = %failure, "job failed"
                 );
-                if let Err(db_err) =
-                    mark_failed(&pool, job.id, job.worker_id, failure.as_error_entry(), retry_at).await
+                if let Err(db_err) = mark_failed(
+                    &pool,
+                    job.id,
+                    job.worker_id,
+                    failure.as_error_entry(),
+                    retry_at,
+                )
+                .await
                 {
                     error!(id = job.id, ?db_err, "failed to record job failure");
                 }
@@ -327,7 +355,107 @@ async fn worker_loop(
     info!(worker = n, "eddyq worker stopped");
 }
 
-async fn sweeper_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationToken) {
+/// Single shared heartbeat loop — one pool acquire every `heartbeat_interval`
+/// regardless of concurrency. Replaces per-job heartbeat tasks.
+async fn heartbeat_loop(
+    pool: PgPool,
+    in_flight: InFlightJobs,
+    config: QueueConfig,
+    shutdown: CancellationToken,
+) {
+    info!("eddyq heartbeat loop started");
+    let mut interval = tokio::time::interval(config.heartbeat_interval);
+    interval.tick().await; // first tick fires immediately; skip it
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = interval.tick() => {
+                let ids: Vec<i64> = {
+                    let set = in_flight.lock().expect("in_flight lock poisoned");
+                    set.iter().copied().collect()
+                };
+                if ids.is_empty() {
+                    continue;
+                }
+                if let Err(err) = update_heartbeat_batch(&pool, &ids).await {
+                    warn!(?err, count = ids.len(), "batch heartbeat update failed");
+                }
+            }
+        }
+    }
+    info!("eddyq heartbeat loop stopped");
+}
+
+/// Leader election loop — runs try_elect on a regular cadence. Sets `is_leader`
+/// so other loops can gate maintenance work on leadership.
+async fn leader_loop(
+    pool: PgPool,
+    worker_id: Uuid,
+    is_leader: Arc<AtomicBool>,
+    config: QueueConfig,
+    shutdown: CancellationToken,
+) {
+    info!(%worker_id, "eddyq leader loop started");
+    let refresh_interval = Duration::from_secs(config.leader_lease_secs / 3)
+        .max(Duration::from_secs(5));
+    let mut interval = tokio::time::interval(refresh_interval);
+
+    // Run an immediate election before entering the tick loop so maintenance
+    // tasks (sweeper, scheduler, cleanup) can start working right away.
+    match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs).await {
+        Ok(won) => {
+            is_leader.store(won, Ordering::Relaxed);
+            if won {
+                info!(%worker_id, "elected as maintenance leader (initial)");
+            }
+        }
+        Err(err) => {
+            warn!(?err, "initial leader election failed");
+        }
+    }
+    interval.tick().await; // consume the first tick (already ran above)
+
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = interval.tick() => {
+                match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs).await {
+                    Ok(won) => {
+                        let was_leader = is_leader.swap(won, Ordering::Relaxed);
+                        if won && !was_leader {
+                            info!(%worker_id, "elected as maintenance leader");
+                        } else if !won && was_leader {
+                            warn!(%worker_id, "lost maintenance leadership");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(?err, "leader election failed");
+                    }
+                }
+            }
+        }
+    }
+
+    // On shutdown, resign if we were leader so another pod can take over immediately.
+    if is_leader.load(Ordering::Relaxed) {
+        if let Err(err) = leader::resign(&pool, worker_id, MAINTENANCE_ROLE).await {
+            warn!(?err, "leader resign failed on shutdown");
+        } else {
+            info!(%worker_id, "resigned maintenance leadership on shutdown");
+        }
+    }
+
+    info!("eddyq leader loop stopped");
+}
+
+async fn sweeper_loop(
+    pool: PgPool,
+    config: QueueConfig,
+    shutdown: CancellationToken,
+    is_leader: Arc<AtomicBool>,
+) {
     info!("eddyq sweeper started");
     let mut interval = tokio::time::interval(config.sweep_interval);
     interval.tick().await; // immediate
@@ -336,6 +464,9 @@ async fn sweeper_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationT
             biased;
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {
+                if !is_leader.load(Ordering::Relaxed) {
+                    continue;
+                }
                 match sweep_stale(&pool, config.stale_after).await {
                     Ok(0) => {}
                     Ok(n) => info!(recovered = n, "sweeper recovered stale jobs"),
@@ -347,7 +478,12 @@ async fn sweeper_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationT
     info!("eddyq sweeper stopped");
 }
 
-async fn scheduler_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationToken) {
+async fn scheduler_loop(
+    pool: PgPool,
+    config: QueueConfig,
+    shutdown: CancellationToken,
+    is_leader: Arc<AtomicBool>,
+) {
     info!("eddyq scheduler started");
     let mut interval = tokio::time::interval(config.scheduler_interval);
     interval.tick().await;
@@ -356,6 +492,9 @@ async fn scheduler_loop(pool: PgPool, config: QueueConfig, shutdown: Cancellatio
             biased;
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {
+                if !is_leader.load(Ordering::Relaxed) {
+                    continue;
+                }
                 match crate::schedule::tick(&pool).await {
                     Ok(0) => {}
                     Ok(n) => info!(enqueued = n, "scheduler enqueued due jobs"),
@@ -367,7 +506,12 @@ async fn scheduler_loop(pool: PgPool, config: QueueConfig, shutdown: Cancellatio
     info!("eddyq scheduler stopped");
 }
 
-async fn cleanup_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationToken) {
+async fn cleanup_loop(
+    pool: PgPool,
+    config: QueueConfig,
+    shutdown: CancellationToken,
+    is_leader: Arc<AtomicBool>,
+) {
     // Short-circuit if no retention is configured — nothing to do.
     if config.completed_retention.is_none()
         && config.failed_retention.is_none()
@@ -389,6 +533,9 @@ async fn cleanup_loop(pool: PgPool, config: QueueConfig, shutdown: CancellationT
             biased;
             () = shutdown.cancelled() => break,
             _ = interval.tick() => {
+                if !is_leader.load(Ordering::Relaxed) {
+                    continue;
+                }
                 match crate::fetch::cleanup(&pool, retention).await {
                     Ok((0, 0, 0)) => {}
                     Ok((c, f, x)) => info!(
@@ -412,7 +559,10 @@ async fn listener_loop(
     let mut listener = match PgListener::connect_with(&pool).await {
         Ok(l) => l,
         Err(err) => {
-            warn!(?err, "LISTEN connection failed, falling back to polling only");
+            warn!(
+                ?err,
+                "LISTEN connection failed, falling back to polling only"
+            );
             return;
         }
     };
@@ -491,8 +641,10 @@ pub(crate) async fn await_all(handles: RuntimeHandles) {
     if let Some(h) = handles.listener {
         let _ = h.await;
     }
+    let _ = handles.heartbeat.await;
+    let _ = handles.leader.await;
 }
 
-// JobId import so the `id = hb_job_id` tracing field resolves cleanly.
+// JobId import so the `id = job_id` tracing field resolves cleanly.
 #[allow(dead_code)]
 fn _assert_job_id_type(_: JobId) {}

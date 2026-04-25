@@ -7,8 +7,8 @@ use eddyq_core::{
     migrate,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgConnectOptions;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct BenchJob {
@@ -20,12 +20,13 @@ impl Job for BenchJob {
 }
 
 fn payload(size: usize) -> BenchJob {
-    BenchJob { data: "x".repeat(size) }
+    BenchJob {
+        data: "x".repeat(size),
+    }
 }
 
 async fn setup() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set to run benchmarks");
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run benchmarks");
     let opts = PgConnectOptions::from_str(&url)
         .expect("invalid DATABASE_URL")
         .options([("search_path", "bench")]);

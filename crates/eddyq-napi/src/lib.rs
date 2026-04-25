@@ -63,7 +63,20 @@ where
 /// Connection options for `Queue.connect`.
 #[napi(object)]
 pub struct ConnectOptions {
-    /// Max pool connections. Default 10.
+    /// Max sqlx pool connections per process. Default 5.
+    ///
+    /// **Size this for your fleet, not just one process.**
+    /// Each worker process opens `max_connections + 1` connections to Postgres
+    /// (the +1 is a dedicated LISTEN socket). At 10 pods with the default you
+    /// use 60 connections. Postgres ships with `max_connections = 100`, so
+    /// you'll run out fast if you scale without adjusting this.
+    ///
+    /// Job handlers themselves do NOT hold a connection while running — a
+    /// connection is only acquired briefly for fetch, heartbeat ticks, and
+    /// complete/fail. So `max_connections` can be much smaller than
+    /// `workerConcurrency` (roughly concurrency ÷ 5 is a reasonable starting
+    /// point). When using PgBouncer, set this to your per-process PgBouncer
+    /// pool allocation, not your raw Postgres `max_connections`.
     pub max_connections: Option<u32>,
     /// Min idle pool connections. Default 0.
     pub min_connections: Option<u32>,
@@ -71,6 +84,15 @@ pub struct ConnectOptions {
     pub acquire_timeout_ms: Option<u32>,
     /// Migration line name. Default "main".
     pub line: Option<String>,
+    /// Disable the LISTEN/NOTIFY subscriber and use polling only.
+    ///
+    /// Required when connecting through PgBouncer in **transaction-pooling
+    /// mode** — LISTEN needs a persistent session connection, which
+    /// transaction pooling does not provide. In poll-only mode the worker
+    /// falls back to a configurable poll interval (default 1 s) instead of
+    /// being woken immediately on new jobs. Session-mode PgBouncer and direct
+    /// Postgres connections do not need this.
+    pub poll_only: Option<bool>,
 }
 
 /// Per-enqueue overrides. All fields optional.
@@ -330,6 +352,7 @@ pub struct Queue {
     client: Client,
     state: Arc<Mutex<WorkerState>>,
     abort_handler: Arc<Mutex<Option<JsAbortFn>>>,
+    poll_only: bool,
 }
 
 enum WorkerState {
@@ -362,14 +385,16 @@ impl Queue {
     /// call `migrate()` on first boot (or on app deploy).
     #[napi(factory)]
     pub async fn connect(database_url: String, options: Option<ConnectOptions>) -> Result<Queue> {
+        let poll_only = options.as_ref().and_then(|o| o.poll_only).unwrap_or(false);
         let cfg = build_cfg(options);
-        let client = run(move || async move {
-            Client::connect_with(&database_url, cfg).await.map_err(err)
-        }).await?;
+        let client =
+            run(move || async move { Client::connect_with(&database_url, cfg).await.map_err(err) })
+                .await?;
         Ok(Queue {
             client,
             state: Arc::new(Mutex::new(WorkerState::default())),
             abort_handler: Arc::new(Mutex::new(None)),
+            poll_only,
         })
     }
 
@@ -425,10 +450,7 @@ impl Queue {
     /// Batch size is capped at 5,000 items per call — split larger workloads
     /// client-side.
     #[napi]
-    pub async fn enqueue_many(
-        &self,
-        items: Vec<EnqueueManyItem>,
-    ) -> Result<BulkEnqueueOutcome> {
+    pub async fn enqueue_many(&self, items: Vec<EnqueueManyItem>) -> Result<BulkEnqueueOutcome> {
         let client = self.client.clone();
         run(move || do_enqueue_many(client, items)).await
     }
@@ -450,8 +472,12 @@ impl Queue {
     pub async fn set_group_concurrency(&self, group_key: String, max: i32) -> Result<()> {
         let client = self.client.clone();
         run(move || async move {
-            client.set_group_concurrency(&group_key, max).await.map_err(err)
-        }).await
+            client
+                .set_group_concurrency(&group_key, max)
+                .await
+                .map_err(err)
+        })
+        .await
     }
 
     #[napi]
@@ -478,8 +504,12 @@ impl Queue {
         let client = self.client.clone();
         let period = Duration::from_millis(u64::from(period_ms));
         run(move || async move {
-            client.set_group_rate(&group_key, count, period).await.map_err(err)
-        }).await
+            client
+                .set_group_rate(&group_key, count, period)
+                .await
+                .map_err(err)
+        })
+        .await
     }
 
     #[napi]
@@ -494,9 +524,8 @@ impl Queue {
     #[napi]
     pub async fn set_queue_concurrency(&self, queue: String, max: i32) -> Result<()> {
         let client = self.client.clone();
-        run(move || async move {
-            client.set_queue_concurrency(&queue, max).await.map_err(err)
-        }).await
+        run(move || async move { client.set_queue_concurrency(&queue, max).await.map_err(err) })
+            .await
     }
 
     #[napi]
@@ -517,9 +546,8 @@ impl Queue {
     pub async fn set_queue_timeout(&self, queue: String, timeout_ms: Option<u32>) -> Result<()> {
         let client = self.client.clone();
         let timeout = timeout_ms.map(|ms| Duration::from_millis(u64::from(ms)));
-        run(move || async move {
-            client.set_queue_timeout(&queue, timeout).await.map_err(err)
-        }).await
+        run(move || async move { client.set_queue_timeout(&queue, timeout).await.map_err(err) })
+            .await
     }
 
     // --- Dashboard / list queries -----------------------------------------
@@ -733,8 +761,8 @@ impl Queue {
 
         // Pending-migration guard. Migrations are a DEPLOY-STEP concern — we
         // intentionally don't auto-apply at boot because a slow migration
-        // would block app startup for every replica (River's model; proven
-        // right in prod). If anything's pending, we refuse to start and tell
+        // would block app startup for every replica. If anything's pending,
+        // we refuse to start and tell
         // the operator how to fix it.
         let skip_check = options
             .as_ref()
@@ -742,12 +770,14 @@ impl Queue {
             .unwrap_or(false);
         if !skip_check {
             let client = self.client.clone();
-            let statuses = run(move || async move { client.migration_status().await.map_err(err) })
-                .await?;
+            let statuses =
+                run(move || async move { client.migration_status().await.map_err(err) }).await?;
             let pending: Vec<_> = statuses.iter().filter(|s| s.applied_at.is_none()).collect();
             if !pending.is_empty() {
-                let names: Vec<String> =
-                    pending.iter().map(|p| format!("{}:{}", p.version, p.name)).collect();
+                let names: Vec<String> = pending
+                    .iter()
+                    .map(|p| format!("{}:{}", p.version, p.name))
+                    .collect();
                 return Err(napi::Error::from_reason(format!(
                     "eddyq: {} pending migration(s) — will not start workers against stale schema.\n\
                      Pending: {}.\n\n\
@@ -762,7 +792,9 @@ impl Queue {
             }
         }
 
-        let mut builder = CoreQueueBuilder::new(self.client.pool().clone()).line(self.client.line());
+        let mut builder = CoreQueueBuilder::new(self.client.pool().clone())
+            .line(self.client.line())
+            .poll_only(self.poll_only);
         if let Some(n) = concurrency {
             builder = builder.worker_concurrency(n);
         }
@@ -789,7 +821,10 @@ impl Queue {
     /// Most users don't call this directly — lib.cjs wires it automatically.
     #[napi(ts_args_type = "handler: (reason: string) => void")]
     pub fn set_abort_handler(&self, handler: JsAbortFn) -> Result<()> {
-        let mut slot = self.abort_handler.lock().expect("abort handler lock poisoned");
+        let mut slot = self
+            .abort_handler
+            .lock()
+            .expect("abort handler lock poisoned");
         *slot = Some(handler);
         Ok(())
     }
@@ -814,9 +849,15 @@ impl Queue {
         // Fire abort to JS so any in-flight handler's AbortSignal flips.
         // Held across `.call()` but it's NonBlocking — no await.
         {
-            let guard = self.abort_handler.lock().expect("abort handler lock poisoned");
+            let guard = self
+                .abort_handler
+                .lock()
+                .expect("abort handler lock poisoned");
             if let Some(handler) = guard.as_ref() {
-                handler.call("shutdown".to_owned(), ThreadsafeFunctionCallMode::NonBlocking);
+                handler.call(
+                    "shutdown".to_owned(),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
             }
         }
 
@@ -840,7 +881,8 @@ impl Queue {
         run(move || async move {
             client.close().await;
             Ok(())
-        }).await
+        })
+        .await
     }
 }
 
@@ -851,7 +893,10 @@ impl Queue {
 /// the core runtime's retry/fail logic kicks in.
 fn dispatcher(
     tsfn: JsHandler,
-) -> impl Fn(serde_json::Value, JobContext)
+) -> impl Fn(
+    serde_json::Value,
+    JobContext,
+)
     -> std::pin::Pin<Box<dyn std::future::Future<Output = JobResult<serde_json::Value>> + Send>>
 + Send
 + Sync
@@ -965,27 +1010,49 @@ async fn do_enqueue(
 ) -> Result<EnqueueOutcome> {
     let mut req = DynEnqueue::new(kind, payload);
     if let Some(opts) = options {
-        if let Some(n) = opts.max_attempts { req.max_attempts = n; }
-        if let Some(p) = opts.priority { req.priority = p; }
-        if let Some(q) = opts.queue { req.queue = q; }
+        if let Some(n) = opts.max_attempts {
+            req.max_attempts = n;
+        }
+        if let Some(p) = opts.priority {
+            req.priority = p;
+        }
+        if let Some(q) = opts.queue {
+            req.queue = q;
+        }
         if opts.scheduled_at_ms.is_some() && opts.delay_ms.is_some() {
             return Err(napi::Error::from_reason(
                 "enqueue: pass either scheduledAtMs or delayMs, not both",
             ));
         }
-        if let Some(ms) = opts.scheduled_at_ms { req.scheduled_at = Some(ms_to_utc(ms)); }
+        if let Some(ms) = opts.scheduled_at_ms {
+            req.scheduled_at = Some(ms_to_utc(ms));
+        }
         if let Some(ms) = opts.delay_ms {
             req.scheduled_at = Some(Utc::now() + chrono::Duration::milliseconds(ms));
         }
-        if let Some(k) = opts.unique_key { req.unique_key = Some(k); }
-        if let Some(g) = opts.group_key { req.group_key = Some(g); }
-        if let Some(t) = opts.tags { req.tags = t; }
-        if let Some(m) = opts.metadata { req.metadata = m; }
+        if let Some(k) = opts.unique_key {
+            req.unique_key = Some(k);
+        }
+        if let Some(g) = opts.group_key {
+            req.group_key = Some(g);
+        }
+        if let Some(t) = opts.tags {
+            req.tags = t;
+        }
+        if let Some(m) = opts.metadata {
+            req.metadata = m;
+        }
     }
     let result = client.enqueue(req).await.map_err(err)?;
     Ok(match result {
-        eddyq_client::EnqueueResult::Inserted(id) => EnqueueOutcome { inserted: true, id: Some(id) },
-        eddyq_client::EnqueueResult::Skipped => EnqueueOutcome { inserted: false, id: None },
+        eddyq_client::EnqueueResult::Inserted(id) => EnqueueOutcome {
+            inserted: true,
+            id: Some(id),
+        },
+        eddyq_client::EnqueueResult::Skipped => EnqueueOutcome {
+            inserted: false,
+            id: None,
+        },
     })
 }
 
@@ -1199,28 +1266,44 @@ async fn do_list_schedules(client: Client) -> Result<Vec<Schedule>> {
 fn build_cfg(options: Option<ConnectOptions>) -> ClientConfig {
     let mut c = ClientConfig::default();
     let Some(o) = options else { return c };
-    if let Some(n) = o.max_connections { c.max_connections = n; }
-    if let Some(n) = o.min_connections { c.min_connections = n; }
+    if let Some(n) = o.max_connections {
+        c.max_connections = n;
+    }
+    if let Some(n) = o.min_connections {
+        c.min_connections = n;
+    }
     if let Some(ms) = o.acquire_timeout_ms {
         c.acquire_timeout = Duration::from_millis(u64::from(ms));
     }
-    if let Some(line) = o.line { c.line = line; }
+    if let Some(line) = o.line {
+        c.line = line;
+    }
     c
 }
 
 fn ms_to_utc(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+    Utc.timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(Utc::now)
 }
 
 fn report_to_dto(report: &eddyq_client::MigrateReport) -> MigrateReport {
     MigrateReport {
-        applied: report.applied.iter().map(|(v, n)| MigrationRow {
-            version: *v,
-            name: (*n).to_owned(),
-        }).collect(),
-        rolled_back: report.rolled_back.iter().map(|(v, n)| MigrationRow {
-            version: *v,
-            name: (*n).to_owned(),
-        }).collect(),
+        applied: report
+            .applied
+            .iter()
+            .map(|(v, n)| MigrationRow {
+                version: *v,
+                name: (*n).to_owned(),
+            })
+            .collect(),
+        rolled_back: report
+            .rolled_back
+            .iter()
+            .map(|(v, n)| MigrationRow {
+                version: *v,
+                name: (*n).to_owned(),
+            })
+            .collect(),
     }
 }

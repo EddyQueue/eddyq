@@ -120,12 +120,12 @@ pub struct BulkEnqueueResult {
 ///
 /// Returns the aggregate count: inserted + skipped (due to unique-key
 /// conflicts). For per-row results, use `enqueue` in a loop.
-pub async fn enqueue_many<J: Job>(
-    pool: &PgPool,
-    jobs: &[J],
-) -> Result<BulkEnqueueResult> {
+pub async fn enqueue_many<J: Job>(pool: &PgPool, jobs: &[J]) -> Result<BulkEnqueueResult> {
     if jobs.is_empty() {
-        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+        return Ok(BulkEnqueueResult {
+            inserted: 0,
+            skipped: 0,
+        });
     }
     let mut tx = pool.begin().await?;
     let result = enqueue_many_in_tx(&mut tx, jobs).await?;
@@ -140,7 +140,10 @@ pub async fn enqueue_many_in_tx<J: Job>(
     jobs: &[J],
 ) -> Result<BulkEnqueueResult> {
     if jobs.is_empty() {
-        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+        return Ok(BulkEnqueueResult {
+            inserted: 0,
+            skipped: 0,
+        });
     }
     let conn: &mut PgConnection = tx;
     let (result, any_due_now, distinct_groups) = insert_many(conn, jobs).await?;
@@ -186,7 +189,10 @@ async fn insert_many<J: Job>(
         unique_keys.push(job.unique_key());
         group_keys.push(job.group_key());
         tags.push(serde_json::Value::Array(
-            job.tags().into_iter().map(serde_json::Value::String).collect(),
+            job.tags()
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
         ));
         metadatas.push(
             job.metadata()
@@ -237,8 +243,7 @@ async fn insert_many<J: Job>(
     let total = jobs.len() as u64;
     let skipped = total.saturating_sub(inserted);
 
-    let mut distinct_groups: Vec<String> =
-        group_keys.into_iter().flatten().collect();
+    let mut distinct_groups: Vec<String> = group_keys.into_iter().flatten().collect();
     distinct_groups.sort();
     distinct_groups.dedup();
 
@@ -286,10 +291,7 @@ impl DynEnqueue {
     }
 }
 
-async fn insert_dyn(
-    conn: &mut PgConnection,
-    req: DynEnqueue,
-) -> Result<(EnqueueResult, bool)> {
+async fn insert_dyn(conn: &mut PgConnection, req: DynEnqueue) -> Result<(EnqueueResult, bool)> {
     let scheduled_at = req.scheduled_at.unwrap_or_else(Utc::now);
     let due_now = scheduled_at <= Utc::now();
 
@@ -395,7 +397,10 @@ async fn insert_many_dyn(
         unique_keys.push(req.unique_key);
         group_keys.push(req.group_key);
         tags.push(serde_json::Value::Array(
-            req.tags.into_iter().map(serde_json::Value::String).collect(),
+            req.tags
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
         ));
         metadatas.push(req.metadata);
         queues.push(req.queue);
@@ -460,12 +465,12 @@ async fn insert_many_dyn(
 ///
 /// **Atomicity:** INSERT + group-rule materialization + the workers NOTIFY all
 /// commit (or roll back) together in one transaction.
-pub async fn enqueue_many_dyn(
-    pool: &PgPool,
-    reqs: Vec<DynEnqueue>,
-) -> Result<BulkEnqueueResult> {
+pub async fn enqueue_many_dyn(pool: &PgPool, reqs: Vec<DynEnqueue>) -> Result<BulkEnqueueResult> {
     if reqs.is_empty() {
-        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+        return Ok(BulkEnqueueResult {
+            inserted: 0,
+            skipped: 0,
+        });
     }
     let mut tx = pool.begin().await?;
     let result = enqueue_many_dyn_in_tx(&mut tx, reqs).await?;
@@ -479,7 +484,10 @@ pub async fn enqueue_many_dyn_in_tx(
     reqs: Vec<DynEnqueue>,
 ) -> Result<BulkEnqueueResult> {
     if reqs.is_empty() {
-        return Ok(BulkEnqueueResult { inserted: 0, skipped: 0 });
+        return Ok(BulkEnqueueResult {
+            inserted: 0,
+            skipped: 0,
+        });
     }
     let conn: &mut PgConnection = tx;
     let (result, any_due_now, distinct_groups) = insert_many_dyn(conn, reqs).await?;

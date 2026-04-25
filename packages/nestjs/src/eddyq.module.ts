@@ -111,6 +111,22 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
       return;
     }
 
+    const pool = this.options.connectOptions?.maxConnections ?? 5;
+    const concurrency = this.options.workerConcurrency ?? 10;
+    const listenSocket = this.options.connectOptions?.pollOnly ? 0 : 1;
+    const totalPerPod = pool + listenSocket;
+    EddyqModule.logger.log(
+      `connection budget: pool=${pool} concurrency=${concurrency} listen=${listenSocket} → ${totalPerPod}/pod` +
+      ` — at N pods: N×${totalPerPod} connections to Postgres`,
+    );
+    if (concurrency > pool * 5) {
+      EddyqModule.logger.warn(
+        `workerConcurrency (${concurrency}) is high relative to maxConnections (${pool}). ` +
+        `Jobs will queue waiting for pool slots under sustained load. ` +
+        `Consider raising connectOptions.maxConnections or lowering workerConcurrency.`,
+      );
+    }
+
     await this.queue.start({
       skipMigrationCheck: this.options.skipMigrationCheck,
     });

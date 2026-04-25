@@ -8,6 +8,7 @@ pub mod error;
 pub mod fetch;
 pub mod group;
 pub mod job;
+pub mod leader;
 pub mod migrate;
 pub mod named_queue;
 pub mod queue;

@@ -5,7 +5,7 @@
 //! with their entire schema history. Each migration has an up and a down.
 //!
 //! The `get_sql` API lets users export the raw SQL for integration with an
-//! existing migration framework, same escape hatch River's `migrate-get` offers.
+//! existing migration framework via the `get_sql` escape hatch.
 //!
 //! # Lines
 //!
@@ -23,7 +23,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::error::Result;
 
-/// Default line name. Matches River.
+/// Default line name.
 pub const DEFAULT_LINE: &str = "main";
 
 /// A single migration, embedded at compile time.
@@ -74,12 +74,20 @@ pub struct MigrateReport {
 ///
 /// **Policy:** append-only from v0.1.0 onward. Never edit an applied
 /// migration's SQL — add a new one. Pre-v0.1.0 we're still collapsing.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 20_260_421_000_001,
-    name: "init",
-    up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
-    down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 20_260_421_000_001,
+        name: "init",
+        up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
+        down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
+    },
+    Migration {
+        version: 20_260_421_000_002,
+        name: "leader",
+        up_sql: include_str!("../migrations/20260421000002_leader.up.sql"),
+        down_sql: include_str!("../migrations/20260421000002_leader.down.sql"),
+    },
+];
 
 /// Fresh-install DDL for the tracking table: composite PK `(line, version)`
 /// so each line has an independent applied-version history.
@@ -116,7 +124,9 @@ END$$;
 
 async fn ensure_tracking_table(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::raw_sql(TRACKING_TABLE_DDL).execute(&mut **tx).await?;
-    sqlx::raw_sql(TRACKING_TABLE_UPGRADE).execute(&mut **tx).await?;
+    sqlx::raw_sql(TRACKING_TABLE_UPGRADE)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -209,14 +219,13 @@ pub async fn up(pool: &PgPool, line: &str) -> Result<MigrateReport> {
             migration_err = Some(e.into());
             break;
         }
-        if let Err(e) = sqlx::query(
-            "INSERT INTO _eddyq_migrations (line, version, name) VALUES ($1, $2, $3)",
-        )
-        .bind(line)
-        .bind(m.version)
-        .bind(m.name)
-        .execute(&mut *tx)
-        .await
+        if let Err(e) =
+            sqlx::query("INSERT INTO _eddyq_migrations (line, version, name) VALUES ($1, $2, $3)")
+                .bind(line)
+                .bind(m.version)
+                .bind(m.name)
+                .execute(&mut *tx)
+                .await
         {
             migration_err = Some(e.into());
             break;
@@ -286,11 +295,10 @@ pub async fn status(pool: &PgPool, line: &str) -> Result<Vec<MigrationStatus>> {
 /// `eddyq migrate lines` (not yet wired) or admin tooling.
 pub async fn list_lines(pool: &PgPool) -> Result<Vec<String>> {
     ensure_tracking_table_pool(pool).await?;
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT line FROM _eddyq_migrations ORDER BY line",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT line FROM _eddyq_migrations ORDER BY line")
+            .fetch_all(pool)
+            .await?;
     Ok(rows.into_iter().map(|(l,)| l).collect())
 }
 

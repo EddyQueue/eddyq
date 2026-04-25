@@ -7,7 +7,7 @@ import { BOARD_OPTIONS } from './board.constants.js';
 import { BoardService } from './board.service.js';
 import type { EddyqBoardOptions } from './board.types.js';
 
-const DIST_PUBLIC = join(dirname(fileURLToPath(import.meta.url)), '..', 'public');
+const DIST_PUBLIC = join(dirname(fileURLToPath(import.meta.url)), 'public');
 const VALID_STATES = new Set(['pending', 'running', 'completed', 'failed', 'scheduled', 'cancelled']);
 
 @Controller()
@@ -24,7 +24,7 @@ export class BoardControllerBase {
       const raw = readFileSync(htmlPath, 'utf-8');
       this.indexHtml = raw
         .replace('__BOARD_BASE__', `${mountPath}/`)
-        .replace('__EDDYQ_API_BASE__', mountPath);
+        .replace("'__EDDYQ_API_BASE__'", `'${mountPath}'`);
     }
   }
 
@@ -106,11 +106,17 @@ export class BoardControllerBase {
 
   // --- SPA serving (catch-all, must be last) ---
 
-  @Get('*')
-  serveStatic(@Param('*') path: string, @Res() res: Response) {
+  @Get()
+  serveRoot(@Res() res: Response) {
+    return this.serveStatic('', res);
+  }
+
+  @Get('*path')
+  serveStatic(@Param('path') path: string | string[], @Res() res: Response) {
     // Serve built assets; fall back to index.html for client-side routes.
-    const filePath = join(DIST_PUBLIC, path);
-    if (path && existsSync(filePath) && statSync(filePath).isFile()) {
+    const resolved = Array.isArray(path) ? path.join('/') : path;
+    const filePath = join(DIST_PUBLIC, resolved);
+    if (resolved && existsSync(filePath) && statSync(filePath).isFile()) {
       res.sendFile(filePath);
       return;
     }

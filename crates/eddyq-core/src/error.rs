@@ -67,14 +67,20 @@ impl std::error::Error for HandlerFailure {}
 
 impl HandlerFailure {
     pub fn from_message(message: impl Into<String>) -> Self {
-        Self { message: message.into(), ..Default::default() }
+        Self {
+            message: message.into(),
+            ..Default::default()
+        }
     }
 
     /// Build the JSON entry stored in `eddyq_jobs.errors` for this failure.
     pub fn as_error_entry(&self) -> serde_json::Value {
         let mut obj = serde_json::Map::new();
         obj.insert("at".into(), serde_json::json!(chrono::Utc::now()));
-        obj.insert("message".into(), serde_json::Value::String(self.message.clone()));
+        obj.insert(
+            "message".into(),
+            serde_json::Value::String(self.message.clone()),
+        );
         if let Some(name) = &self.name {
             obj.insert("name".into(), serde_json::Value::String(name.clone()));
         }

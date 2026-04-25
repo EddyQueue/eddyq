@@ -163,7 +163,9 @@ pub async fn set_rule(pool: &PgPool, pattern: &str, rule: GroupRule) -> Result<(
     let period_ms = rule
         .rate_period
         .map(|p| i32::try_from(p.as_millis()).unwrap_or(i32::MAX));
-    let rate_count = rule.rate_count.map(|c| i32::try_from(c).unwrap_or(i32::MAX));
+    let rate_count = rule
+        .rate_count
+        .map(|c| i32::try_from(c).unwrap_or(i32::MAX));
 
     if rule.max_concurrency.is_none() && rate_count.is_none() {
         return Err(crate::error::Error::InvalidArgument(

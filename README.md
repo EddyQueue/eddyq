@@ -9,7 +9,6 @@
 - **Postgres-native.** No new infrastructure. If you're already running Postgres, you can run eddyq.
 - **Transactional enqueue.** Enqueue a job in the same transaction as your business write. No more "the job ran before the row committed" bugs.
 - **First-class Node bindings.** `pnpm add @eddyq/queue` and ship from NestJS, Next.js, or any Node app.
-- **River-grade Postgres semantics.** Hybrid LISTEN/NOTIFY + polling wakeup with jitter and debouncing. PgBouncer-aware deployment modes.
 - **Group concurrency.** Limit concurrent jobs per tenant, per provider, per anything.
 
 ## Migrations are a deploy step
@@ -39,13 +38,7 @@ benches/           # benchmark harness vs sqlxmq, graphile-worker, BullMQ
 
 ## License
 
-Dual-licensed under either of:
-
-- [Apache License, Version 2.0](LICENSE-APACHE)
 - [MIT license](LICENSE-MIT)
 
 at your option.
 
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues, PRs, and design discussions all welcome — but note the architecture is largely locked via [ADRs](docs/decisions/).

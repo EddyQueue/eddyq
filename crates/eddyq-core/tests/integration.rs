@@ -15,9 +15,7 @@ use std::{
 };
 
 use eddyq_core::{
-    Job, JobContext, JobResult, Queue, QueueConfig, Worker,
-    async_trait,
-    fetch::sweep_stale,
+    Job, JobContext, JobResult, Queue, QueueConfig, Worker, async_trait, fetch::sweep_stale,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -110,6 +108,7 @@ fn fast_config() -> QueueConfig {
         failed_retention: None,
         cancelled_retention: None,
         poll_only: false,
+        leader_lease_secs: 30,
     }
 }
 
@@ -335,7 +334,11 @@ async fn scheduled_job_waits_until_due(pool: PgPool) {
 
     // After 150ms, only the immediate job should be done.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "future-dated job should not run yet");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "future-dated job should not run yet"
+    );
 
     // After another 500ms, both should be done.
     tokio::time::timeout(Duration::from_millis(800), async {
@@ -432,7 +435,10 @@ async fn cron_schedule_fires_recurring(pool: PgPool) {
     // And the schedule's last_run_at should be recent.
     let schedules = eddyq_core::schedule::list_schedules(&pool).await.unwrap();
     assert_eq!(schedules.len(), 1);
-    assert!(schedules[0].last_run_at.is_some(), "last_run_at set after firing");
+    assert!(
+        schedules[0].last_run_at.is_some(),
+        "last_run_at set after firing"
+    );
     assert!(schedules[0].next_run_at > chrono::Utc::now());
 }
 
@@ -532,12 +538,10 @@ impl Worker<Probe> for ProbeWorker {
         let c = self.current.fetch_add(1, Ordering::SeqCst) + 1;
         let mut max = self.max_observed.load(Ordering::SeqCst);
         while c > max {
-            match self.max_observed.compare_exchange(
-                max,
-                c,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+            match self
+                .max_observed
+                .compare_exchange(max, c, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(actual) => max = actual,
             }
@@ -606,7 +610,10 @@ async fn group_concurrency_cap_is_enforced(pool: PgPool) {
         peak <= 3,
         "group cap=3 was violated: observed peak concurrency={peak}"
     );
-    assert!(peak >= 2, "should actually run >1 at a time, got peak={peak}");
+    assert!(
+        peak >= 2,
+        "should actually run >1 at a time, got peak={peak}"
+    );
 
     // After completion, the group's running_count should be back to 0.
     let g = queue
@@ -752,7 +759,12 @@ async fn migrate_up_applies_all_known_migrations(pool: PgPool) {
     );
 
     // All expected tables exist.
-    for tbl in &["eddyq_jobs", "eddyq_schedules", "eddyq_groups", "_eddyq_migrations"] {
+    for tbl in &[
+        "eddyq_jobs",
+        "eddyq_schedules",
+        "eddyq_groups",
+        "_eddyq_migrations",
+    ] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
         )
@@ -789,11 +801,13 @@ async fn migrate_up_is_idempotent(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn migrate_down_rolls_back_all(pool: PgPool) {
     eddyq_core::migrate::up(&pool, "main").await.unwrap();
-    let report = eddyq_core::migrate::down(&pool, "main", usize::MAX).await.unwrap();
+    let report = eddyq_core::migrate::down(&pool, "main", usize::MAX)
+        .await
+        .unwrap();
     assert!(!report.rolled_back.is_empty());
 
     // All our tables are gone (except _eddyq_migrations, which we keep
-    // around as an empty tracking table — that matches River's behavior).
+    // around as an empty tracking table).
     for tbl in &["eddyq_jobs", "eddyq_schedules", "eddyq_groups"] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
@@ -805,9 +819,14 @@ async fn migrate_down_rolls_back_all(pool: PgPool) {
         assert!(!exists, "table {tbl} should be gone after migrate down");
     }
 
-    let remaining: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations").fetch_one(&pool).await.unwrap();
-    assert_eq!(remaining, 0, "tracking table should be empty after full rollback");
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "tracking table should be empty after full rollback"
+    );
 }
 
 #[sqlx::test(migrations = false)]
@@ -881,7 +900,10 @@ async fn queue_uses_its_builder_line(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert!(canary_rows >= 1, "expected ≥1 canary row, got {canary_rows}");
+    assert!(
+        canary_rows >= 1,
+        "expected ≥1 canary row, got {canary_rows}"
+    );
 
     let main_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM _eddyq_migrations WHERE line = 'main'")
@@ -1060,12 +1082,10 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
             let c = self.current.fetch_add(1, Ordering::SeqCst) + 1;
             let mut m = self.max_observed.load(Ordering::SeqCst);
             while c > m {
-                match self.max_observed.compare_exchange(
-                    m,
-                    c,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                ) {
+                match self
+                    .max_observed
+                    .compare_exchange(m, c, Ordering::SeqCst, Ordering::SeqCst)
+                {
                     Ok(_) => break,
                     Err(actual) => m = actual,
                 }
@@ -1078,12 +1098,10 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
     }
 
     // Set the cross-process cap BEFORE anything runs.
-    sqlx::query(
-        "INSERT INTO eddyq_queues (name, max_concurrency) VALUES ('integrations', 3)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO eddyq_queues (name, max_concurrency) VALUES ('integrations', 3)")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // Spin up FIVE independent "processes" — each with its own PgPool to
     // simulate separate ECS tasks. Per-process cap would permit 5 × 4 = 20
@@ -1135,18 +1153,16 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
     .await;
 
     if outcome.is_err() {
-        let states: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT state, COUNT(*) FROM eddyq_jobs GROUP BY state ORDER BY state",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        let qstate: Vec<(String, i32, i32, bool)> = sqlx::query_as(
-            "SELECT name, running_count, max_concurrency, paused FROM eddyq_queues",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let states: Vec<(String, i64)> =
+            sqlx::query_as("SELECT state, COUNT(*) FROM eddyq_jobs GROUP BY state ORDER BY state")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let qstate: Vec<(String, i32, i32, bool)> =
+            sqlx::query_as("SELECT name, running_count, max_concurrency, paused FROM eddyq_queues")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         panic!(
             "timed out: completed={} states={:?} queue={:?} atomic_current={}",
             completed.load(Ordering::SeqCst),
@@ -1165,7 +1181,10 @@ async fn queue_cap_holds_across_many_worker_processes(pool: PgPool) {
         peak <= 3,
         "cross-process queue cap=3 was violated: observed peak={peak} (across 5 processes of worker_concurrency=8 each)"
     );
-    assert!(peak >= 2, "should have actually run ≥2 at once to be a real test; peak was {peak}");
+    assert!(
+        peak >= 2,
+        "should have actually run ≥2 at once to be a real test; peak was {peak}"
+    );
 
     // And the counter is back to 0 after everything finishes.
     let q = enqueuer.get_queue("integrations").await.unwrap().unwrap();
@@ -1246,9 +1265,7 @@ async fn named_queues_route_to_separate_pools(pool: PgPool) {
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if urgent_done.load(Ordering::SeqCst) >= 5
-                && default_done.load(Ordering::SeqCst) >= 5
-            {
+            if urgent_done.load(Ordering::SeqCst) >= 5 && default_done.load(Ordering::SeqCst) >= 5 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1343,20 +1360,14 @@ async fn tags_and_metadata_round_trip_and_filter(pool: PgPool) {
         })
         .await
         .unwrap();
-    queue
-        .enqueue(&Tagged {
-            what: "sms".into(),
-        })
-        .await
-        .unwrap();
+    queue.enqueue(&Tagged { what: "sms".into() }).await.unwrap();
 
     // Filter by "urgent" — both match.
-    let urgent: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM eddyq_jobs WHERE tags @> ARRAY['urgent']::text[]",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let urgent: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs WHERE tags @> ARRAY['urgent']::text[]")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(urgent, 2);
 
     // Filter by specific what-tag — only one matches.
@@ -1539,7 +1550,10 @@ async fn cleanup_does_not_touch_pending_or_running(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(remaining, 2, "pending and running must never be deleted by cleanup");
+    assert_eq!(
+        remaining, 2,
+        "pending and running must never be deleted by cleanup"
+    );
 }
 
 #[test]
@@ -1592,7 +1606,10 @@ async fn transactional_enqueue_rolls_back_with_user_tx(pool: PgPool) {
         .unwrap();
 
     assert_eq!(invoices, 0, "rollback: invoice gone");
-    assert_eq!(jobs, 0, "rollback: job must also be gone (this is the feature)");
+    assert_eq!(
+        jobs, 0,
+        "rollback: job must also be gone (this is the feature)"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1615,10 +1632,7 @@ async fn transactional_enqueue_commits_and_runs(pool: PgPool) {
         .execute(&mut *tx)
         .await
         .unwrap();
-    queue
-        .enqueue_in_tx(&mut tx, &Count { n: 7 })
-        .await
-        .unwrap();
+    queue.enqueue_in_tx(&mut tx, &Count { n: 7 }).await.unwrap();
     tx.commit().await.unwrap();
 
     queue.start().unwrap();
@@ -1688,7 +1702,10 @@ async fn transactional_enqueue_mixed_commits_and_rollbacks(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(jobs as u64, committed, "rolled-back jobs should leave no trace");
+    assert_eq!(
+        jobs as u64, committed,
+        "rolled-back jobs should leave no trace"
+    );
     assert_eq!(counter.load(Ordering::SeqCst) as u64, committed);
 }
 
@@ -1786,7 +1803,10 @@ async fn rate_limit_refills_after_idle(pool: PgPool) {
     let rc = refill_count.unwrap();
     let rp = refill_period_ms.unwrap();
     let refilled = (tokens + elapsed_ms * f64::from(rc) / f64::from(rp)).min(f64::from(rc));
-    assert!((4.99..=5.01).contains(&refilled), "bucket should refill to cap=5, got {refilled}");
+    assert!(
+        (4.99..=5.01).contains(&refilled),
+        "bucket should refill to cap=5, got {refilled}"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -1995,10 +2015,7 @@ async fn fastlane_does_not_starve_behind_slowlane(pool: PgPool) {
     .await
     .expect("fastlane jobs should not be starved by slowlane backlog");
 
-    assert!(
-        fast_done.load(Ordering::SeqCst) >= 20,
-        "fast jobs done"
-    );
+    assert!(fast_done.load(Ordering::SeqCst) >= 20, "fast jobs done");
     // Slow is still working — we don't wait for all of them.
     queue.shutdown().await.unwrap();
 }
@@ -2210,7 +2227,11 @@ async fn rule_with_rate_materializes_token_bucket(pool: PgPool) {
         .await
         .unwrap();
 
-    let g = queue.get_group("tenant:acme:openai").await.unwrap().unwrap();
+    let g = queue
+        .get_group("tenant:acme:openai")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(g.max_concurrency, 20);
     assert_eq!(g.rate_count, Some(1000));
     assert_eq!(g.rate_period_ms, Some(60_000));
@@ -2290,8 +2311,14 @@ async fn per_integration_concurrency_cap(pool: PgPool) {
         .build();
 
     // Two integrations, each capped at 2 concurrent.
-    queue.set_group_concurrency("shopify:acme", 2).await.unwrap();
-    queue.set_group_concurrency("shopify:globex", 2).await.unwrap();
+    queue
+        .set_group_concurrency("shopify:acme", 2)
+        .await
+        .unwrap();
+    queue
+        .set_group_concurrency("shopify:globex", 2)
+        .await
+        .unwrap();
 
     // 30 tasks for each integration.
     for item in 0..30 {
@@ -2440,11 +2467,21 @@ async fn sql_enqueue_function_parity(pool: PgPool) {
     .unwrap();
     let sql_id = sql_id.expect("sql enqueue should have returned an id");
 
+    type JobRow = (
+        String,
+        serde_json::Value,
+        String,
+        i16,
+        i32,
+        chrono::DateTime<chrono::Utc>,
+        Option<String>,
+        Vec<String>,
+        serde_json::Value,
+        String,
+    );
+
     // Compare every column that's supposed to match between the two.
-    let row: (
-        String, serde_json::Value, String, i16, i32, chrono::DateTime<chrono::Utc>,
-        Option<String>, Vec<String>, serde_json::Value, String,
-    ) = sqlx::query_as(
+    let row: JobRow = sqlx::query_as(
         r#"
         SELECT kind, payload, state::text, priority, max_attempts, scheduled_at,
                group_key, tags, metadata, queue
@@ -2462,10 +2499,7 @@ async fn sql_enqueue_function_parity(pool: PgPool) {
     .unwrap();
 
     // Fetch both rows in one query for a side-by-side compare.
-    let rows: Vec<(
-        String, serde_json::Value, String, i16, i32, chrono::DateTime<chrono::Utc>,
-        Option<String>, Vec<String>, serde_json::Value, String,
-    )> = sqlx::query_as(
+    let rows: Vec<JobRow> = sqlx::query_as(
         r#"
         SELECT kind, payload, state::text, priority, max_attempts, scheduled_at,
                group_key, tags, metadata, queue
@@ -2520,7 +2554,10 @@ async fn sql_enqueue_rolls_back_with_user_tx(pool: PgPool) {
         .fetch_one(&mut *tx)
         .await
         .unwrap();
-    assert!(id.is_some(), "enqueue inside tx should return an id pre-rollback");
+    assert!(
+        id.is_some(),
+        "enqueue inside tx should return an id pre-rollback"
+    );
     tx.rollback().await.unwrap();
 
     // Both the widget and the job must be gone.
@@ -2529,11 +2566,15 @@ async fn sql_enqueue_rolls_back_with_user_tx(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(widgets, 0, "widget must be rolled back");
-    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs WHERE kind = 'sql.tx.test'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(jobs, 0, "job must be rolled back alongside the domain write");
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs WHERE kind = 'sql.tx.test'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        jobs, 0,
+        "job must be rolled back alongside the domain write"
+    );
 }
 
 /// unique_key collisions via the SQL function return NULL rather than raising.
@@ -2601,11 +2642,169 @@ async fn sql_enqueue_materializes_group_rule(pool: PgPool) {
     .await
     .unwrap();
 
-    let cap: i32 = sqlx::query_scalar(
-        "SELECT max_concurrency FROM eddyq_groups WHERE key = 'shopify:42'",
+    let cap: i32 =
+        sqlx::query_scalar("SELECT max_concurrency FROM eddyq_groups WHERE key = 'shopify:42'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        cap, 5,
+        "pattern rule 'shopify:*' should have materialized the row"
+    );
+}
+
+// ─── Batch heartbeat tests ────────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_heartbeat_updates_all_in_flight(pool: PgPool) {
+    use eddyq_core::fetch::{claim_batch, update_heartbeat_batch};
+    use uuid::Uuid;
+
+    let worker_id = Uuid::new_v4();
+
+    // Insert 3 pending jobs.
+    for n in 0..3i64 {
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state) VALUES ('count', $1::jsonb, 'pending')",
+        )
+        .bind(serde_json::json!({"n": n}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Claim them so they're in 'running' state.
+    let claimed = claim_batch(&pool, worker_id, 10, &["count".to_string()], &["default".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 3, "should have claimed 3 jobs");
+
+    // Record heartbeat_at before the batch update.
+    let ids: Vec<i64> = claimed.iter().map(|j| j.id).collect();
+
+    // Sleep briefly to ensure NOW() advances past the initial heartbeat_at.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let updated = update_heartbeat_batch(&pool, &ids).await.unwrap();
+    assert_eq!(updated, 3, "should have updated 3 heartbeats");
+
+    // Verify heartbeat_at was updated for all 3.
+    let updated_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM eddyq_jobs WHERE id = ANY($1) AND heartbeat_at IS NOT NULL AND state = 'running'",
     )
+    .bind(&ids)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(cap, 5, "pattern rule 'shopify:*' should have materialized the row");
+    assert_eq!(updated_count, 3);
+}
+
+// ─── Leader election tests ────────────────────────────────────────────────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn leader_election_only_one_wins(pool: PgPool) {
+    use eddyq_core::leader::try_elect;
+    use uuid::Uuid;
+
+    let worker_a = Uuid::new_v4();
+    let worker_b = Uuid::new_v4();
+
+    // First worker to try wins.
+    let a_won = try_elect(&pool, worker_a, "test_role", 30).await.unwrap();
+    assert!(a_won, "first worker should win the election");
+
+    // Second worker trying immediately should lose.
+    let b_won = try_elect(&pool, worker_b, "test_role", 30).await.unwrap();
+    assert!(!b_won, "second worker should lose — first is still leader");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn leader_resign_allows_takeover(pool: PgPool) {
+    use eddyq_core::leader::{resign, try_elect};
+    use uuid::Uuid;
+
+    let worker_a = Uuid::new_v4();
+    let worker_b = Uuid::new_v4();
+
+    // Worker A wins.
+    let a_won = try_elect(&pool, worker_a, "resign_role", 30).await.unwrap();
+    assert!(a_won);
+
+    // Worker B is denied.
+    let b_won = try_elect(&pool, worker_b, "resign_role", 30).await.unwrap();
+    assert!(!b_won);
+
+    // Worker A resigns.
+    resign(&pool, worker_a, "resign_role").await.unwrap();
+
+    // Worker B can now win.
+    let b_won_after = try_elect(&pool, worker_b, "resign_role", 30).await.unwrap();
+    assert!(b_won_after, "worker B should win after A resigns");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn leader_expired_lease_allows_takeover(pool: PgPool) {
+    use eddyq_core::leader::try_elect;
+    use uuid::Uuid;
+
+    let worker_a = Uuid::new_v4();
+    let worker_b = Uuid::new_v4();
+
+    // Worker A wins with a 1-second lease.
+    let a_won = try_elect(&pool, worker_a, "expire_role", 1).await.unwrap();
+    assert!(a_won);
+
+    // Wait 2 seconds for the lease to expire.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Worker B can now win.
+    let b_won = try_elect(&pool, worker_b, "expire_role", 30).await.unwrap();
+    assert!(b_won, "worker B should win after A's lease expires");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn leader_refresh_keeps_leadership(pool: PgPool) {
+    use eddyq_core::leader::try_elect;
+    use uuid::Uuid;
+
+    let worker_a = Uuid::new_v4();
+    let worker_b = Uuid::new_v4();
+
+    // Worker A wins.
+    let a_won = try_elect(&pool, worker_a, "refresh_role", 30).await.unwrap();
+    assert!(a_won);
+
+    // Worker A refreshes.
+    let a_refreshed = try_elect(&pool, worker_a, "refresh_role", 30).await.unwrap();
+    assert!(a_refreshed, "leader should be able to refresh its own lease");
+
+    // Worker B still can't win.
+    let b_won = try_elect(&pool, worker_b, "refresh_role", 30).await.unwrap();
+    assert!(!b_won, "B should still lose after A refreshes");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sweeper_recovers_stale_running_direct(pool: PgPool) {
+    use eddyq_core::fetch::sweep_stale;
+
+    // Insert a stale running job directly.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, heartbeat_at, worker_id)
+        VALUES ('count', '{"n":99}', 'running', 1, 3, NOW() - INTERVAL '10 seconds', gen_random_uuid())
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // sweep_stale should recover it.
+    let recovered = sweep_stale(&pool, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(recovered, 1, "should have recovered 1 stale job");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM eddyq_jobs LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "pending", "recovered job should go back to pending");
 }

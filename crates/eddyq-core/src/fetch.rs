@@ -79,7 +79,9 @@ pub async fn claim_batch(
                 if ms > 0 {
                     queue_timeout.insert(
                         name,
-                        Some(std::time::Duration::from_millis(u64::try_from(ms).unwrap_or(0))),
+                        Some(std::time::Duration::from_millis(
+                            u64::try_from(ms).unwrap_or(0),
+                        )),
                     );
                 }
             }
@@ -100,8 +102,8 @@ pub async fn claim_batch(
         if q_slots <= 0 {
             continue;
         }
-        let take = i64::from(q_slots)
-            .min(i64::try_from(batch_size - accepted.len()).unwrap_or(i64::MAX));
+        let take =
+            i64::from(q_slots).min(i64::try_from(batch_size - accepted.len()).unwrap_or(i64::MAX));
         if take <= 0 {
             continue;
         }
@@ -243,9 +245,8 @@ pub async fn claim_batch(
         if state.slots <= 0 {
             continue;
         }
-        let take_n = i64::from(state.slots).min(
-            i64::try_from(batch_size - accepted.len()).unwrap_or(i64::MAX),
-        );
+        let take_n = i64::from(state.slots)
+            .min(i64::try_from(batch_size - accepted.len()).unwrap_or(i64::MAX));
         if take_n <= 0 {
             continue;
         }
@@ -293,11 +294,18 @@ pub async fn claim_batch(
     }
 
     // Step 4: UPDATE accepted jobs to 'running'; upsert group + queue counters.
-    type ClaimedRow = (JobId, String, serde_json::Value, i32, i32, Option<String>, String);
+    type ClaimedRow = (
+        JobId,
+        String,
+        serde_json::Value,
+        i32,
+        i32,
+        Option<String>,
+        String,
+    );
     let accepted_ids: Vec<JobId> = accepted.iter().map(|(id, _, _)| *id).collect();
-    let claimed: Vec<ClaimedRow> =
-        sqlx::query_as(
-            r#"
+    let claimed: Vec<ClaimedRow> = sqlx::query_as(
+        r#"
             UPDATE eddyq_jobs AS j
                SET state        = 'running',
                    attempt      = j.attempt + 1,
@@ -306,11 +314,11 @@ pub async fn claim_batch(
              WHERE j.id = ANY($1)
          RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.group_key, j.queue
             "#,
-        )
-        .bind(&accepted_ids)
-        .bind(worker_id)
-        .fetch_all(&mut *tx)
-        .await?;
+    )
+    .bind(&accepted_ids)
+    .bind(worker_id)
+    .fetch_all(&mut *tx)
+    .await?;
 
     // Aggregate per-group deltas and upsert running_count. For rate-limited
     // groups, also write back the decremented token balance and refill timestamp.
@@ -517,33 +525,34 @@ pub async fn mark_completed(
     Ok(())
 }
 
-pub async fn update_heartbeat(pool: &PgPool, id: JobId, worker_id: Uuid) -> Result<()> {
-    sqlx::query(
+/// Update heartbeat for multiple in-flight jobs in a single query.
+/// Returns the number of rows updated.
+pub async fn update_heartbeat_batch(pool: &PgPool, ids: &[i64]) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query(
         r#"
         UPDATE eddyq_jobs
            SET heartbeat_at = NOW()
-         WHERE id = $1 AND state = 'running' AND worker_id = $2
+         WHERE id = ANY($1) AND state = 'running'
         "#,
     )
-    .bind(id)
-    .bind(worker_id)
+    .bind(ids)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(res.rows_affected())
 }
 
 /// Sweep running jobs whose heartbeat is older than `stale_after`. Jobs that have
 /// hit `max_attempts` are marked failed; the rest are returned to `pending` for
 /// another worker to pick up. In both cases the group counter is decremented.
 /// Returns the number of rows touched.
-pub async fn sweep_stale(
-    pool: &PgPool,
-    stale_after: std::time::Duration,
-) -> Result<u64> {
+pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Result<u64> {
     let secs = i64::try_from(stale_after.as_secs()).unwrap_or(i64::MAX);
     let error_entry = serde_json::json!({
         "at": chrono::Utc::now(),
-        "message": "heartbeat timeout — worker presumed dead",
+        "message": "worker lost contact — job recovered",
     });
 
     // Sweep + decrement both group and queue counters in one statement.
@@ -609,7 +618,6 @@ pub async fn mark_failed(
     error_entry: serde_json::Value,
     retry_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-
     let mut tx = pool.begin().await?;
 
     let row: Option<(Option<String>, String)> = if let Some(at) = retry_at {

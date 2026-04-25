@@ -27,8 +27,7 @@ impl JobState {
     }
 }
 
-/// Default queue name. Matches the convention used by River, BullMQ, and
-/// Sidekiq — jobs with no explicit queue go here, workers subscribe here by
+/// Default queue name. Jobs with no explicit queue go here, workers subscribe here by
 /// default.
 pub const DEFAULT_QUEUE: &str = "default";
 

@@ -141,23 +141,14 @@ async fn run_migrate(cmd: MigrateCmd) -> Result<()> {
                 .await
                 .context("migrate list failed")?;
             println!("line: {}", args.line);
-            println!(
-                "{:<5} {:<16} {:<10} applied_at",
-                "#", "version", "name"
-            );
+            println!("{:<5} {:<16} {:<10} applied_at", "#", "version", "name");
             println!("{}", "-".repeat(60));
             for (i, s) in statuses.iter().enumerate() {
                 let applied = s
                     .applied_at
                     .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                     .unwrap_or_else(|| "— pending —".into());
-                println!(
-                    "{:<5} {:<16} {:<10} {}",
-                    i + 1,
-                    s.version,
-                    s.name,
-                    applied
-                );
+                println!("{:<5} {:<16} {:<10} {}", i + 1, s.version, s.name, applied);
             }
             Ok(())
         }

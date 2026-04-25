@@ -44,7 +44,11 @@ pub async fn get_stats(pool: &PgPool) -> Result<JobStats> {
     let by_queue_state = rows
         .into_iter()
         .filter_map(|(queue, state, count)| {
-            parse_state(&state).map(|state| QueueStateCount { queue, state, count })
+            parse_state(&state).map(|state| QueueStateCount {
+                queue,
+                state,
+                count,
+            })
         })
         .collect();
 
@@ -84,7 +88,10 @@ pub struct Pagination {
 
 impl Default for Pagination {
     fn default() -> Self {
-        Self { limit: 50, offset: 0 }
+        Self {
+            limit: 50,
+            offset: 0,
+        }
     }
 }
 
@@ -137,10 +144,7 @@ pub async fn list_jobs(
     let mut cq: QueryBuilder<Postgres> =
         QueryBuilder::new("SELECT COUNT(*)::bigint FROM eddyq_jobs WHERE TRUE");
     push_filters(&mut cq, &filter, state_str.as_deref());
-    let total: i64 = cq
-        .build_query_scalar()
-        .fetch_one(pool)
-        .await?;
+    let total: i64 = cq.build_query_scalar().fetch_one(pool).await?;
 
     let mut q: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT id, queue, kind, state, priority, attempt, max_attempts, \

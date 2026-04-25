@@ -18,9 +18,10 @@ pub trait Worker<J: Job>: Send + Sync + 'static {
 /// failure. `result_value` is persisted to `eddyq_jobs.result`; trait-based
 /// Rust workers produce `Value::Null` here since their perform() returns `()`.
 pub(crate) type Handler = Arc<
-    dyn Fn(serde_json::Value, JobContext)
-        -> BoxFuture<'static, JobResult<serde_json::Value>>
-    + Send + Sync + 'static,
+    dyn Fn(serde_json::Value, JobContext) -> BoxFuture<'static, JobResult<serde_json::Value>>
+        + Send
+        + Sync
+        + 'static,
 >;
 
 #[derive(Default)]
@@ -43,7 +44,10 @@ impl WorkerRegistry {
             let worker = worker.clone();
             Box::pin(async move {
                 let job: J = serde_json::from_value(payload)?;
-                worker.perform(job, ctx).await.map(|_| serde_json::Value::Null)
+                worker
+                    .perform(job, ctx)
+                    .await
+                    .map(|_| serde_json::Value::Null)
             })
         });
         self.handlers.insert(J::KIND.to_owned(), handler);

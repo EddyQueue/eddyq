@@ -27,10 +27,10 @@ pub struct QueueConfig {
     /// How often the cleanup task runs.
     pub cleanup_interval: Duration,
     /// Delete completed jobs older than this. `None` = keep forever.
-    /// Default: 24h (matches River's `CompletedJobRetentionPeriod`).
+    /// Default: 24h.
     pub completed_retention: Option<Duration>,
     /// Delete failed jobs older than this. `None` = keep forever.
-    /// Default: 7 days (matches River's `DiscardedJobRetentionPeriod`).
+    /// Default: 7 days.
     pub failed_retention: Option<Duration>,
     /// Delete cancelled jobs older than this. `None` = keep forever.
     /// Default: 7 days.
@@ -38,6 +38,9 @@ pub struct QueueConfig {
     /// When `true`, do not spawn a LISTEN/NOTIFY listener. Use this when connected
     /// through PgBouncer in transaction-pooling mode (LISTEN is incompatible).
     pub poll_only: bool,
+    /// Leader election lease duration in seconds. The elected leader refreshes
+    /// its lease every `leader_lease_secs / 3` seconds. Default: 30.
+    pub leader_lease_secs: u64,
 }
 
 impl Default for QueueConfig {
@@ -54,10 +57,11 @@ impl Default for QueueConfig {
             retry_max: Duration::from_secs(300),
             scheduler_interval: Duration::from_secs(5),
             cleanup_interval: Duration::from_secs(300), // 5 min
-            completed_retention: Some(Duration::from_secs(24 * 60 * 60)),       // 24h
-            failed_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),      // 7d
-            cancelled_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)),   // 7d
+            completed_retention: Some(Duration::from_secs(24 * 60 * 60)), // 24h
+            failed_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
+            cancelled_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             poll_only: false,
+            leader_lease_secs: 30,
         }
     }
 }
@@ -159,6 +163,11 @@ impl QueueBuilder {
 
     pub fn sweep_interval(mut self, d: Duration) -> Self {
         self.config.sweep_interval = d;
+        self
+    }
+
+    pub fn leader_lease_secs(mut self, s: u64) -> Self {
+        self.config.leader_lease_secs = s;
         self
     }
 
@@ -282,12 +291,7 @@ impl Queue {
     /// Register or update a recurring schedule. Jobs will be auto-enqueued when
     /// each cron occurrence is due. Skip-missed semantics: one enqueue per tick,
     /// regardless of how many runs were missed while the scheduler was down.
-    pub async fn add_schedule<J: Job>(
-        &self,
-        name: &str,
-        cron_expr: &str,
-        job: &J,
-    ) -> Result<()> {
+    pub async fn add_schedule<J: Job>(&self, name: &str, cron_expr: &str, job: &J) -> Result<()> {
         crate::schedule::upsert_schedule(&self.pool, name, cron_expr, job).await
     }
 
@@ -328,12 +332,7 @@ impl Queue {
     /// Set a throughput rate limit: at most `count` jobs may *start* per `period`
     /// for this group. Independent of `max_concurrency` — both constraints apply.
     /// Useful for external-API rate limits (e.g. 1000 req/min for OpenAI).
-    pub async fn set_group_rate(
-        &self,
-        key: &str,
-        count: u32,
-        period: Duration,
-    ) -> Result<()> {
+    pub async fn set_group_rate(&self, key: &str, count: u32, period: Duration) -> Result<()> {
         crate::group::set_rate(&self.pool, key, count, period).await
     }
 
@@ -360,11 +359,7 @@ impl Queue {
     ///     GroupRule::both(20, 2000, Duration::from_secs(60)),
     /// ).await?;
     /// ```
-    pub async fn set_group_rule(
-        &self,
-        pattern: &str,
-        rule: crate::group::GroupRule,
-    ) -> Result<()> {
+    pub async fn set_group_rule(&self, pattern: &str, rule: crate::group::GroupRule) -> Result<()> {
         crate::group::set_rule(&self.pool, pattern, rule).await
     }
 
@@ -425,17 +420,12 @@ impl Queue {
     /// don't return within the duration are aborted and the job is marked
     /// failed (with retry if under `max_attempts`). Pass `None` to clear.
     ///
-    /// **Default is no timeout** — matches River's `Worker.Timeout=0`
-    /// convention. Opt in per queue.
+    /// **Default is no timeout** — opt in per queue.
     ///
     /// Limitation inherited from tokio: only I/O-yielding handlers can be
     /// cancelled. A handler doing tight CPU work without `.await` won't be
     /// interrupted by the timeout.
-    pub async fn set_queue_timeout(
-        &self,
-        name: &str,
-        timeout: Option<Duration>,
-    ) -> Result<()> {
+    pub async fn set_queue_timeout(&self, name: &str, timeout: Option<Duration>) -> Result<()> {
         crate::named_queue::set_timeout(&self.pool, name, timeout).await
     }
 
