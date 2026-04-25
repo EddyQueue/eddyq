@@ -81,12 +81,6 @@ pub const MIGRATIONS: &[Migration] = &[
         up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
         down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
     },
-    Migration {
-        version: 20_260_421_000_002,
-        name: "leader",
-        up_sql: include_str!("../migrations/20260421000002_leader.up.sql"),
-        down_sql: include_str!("../migrations/20260421000002_leader.down.sql"),
-    },
 ];
 
 /// Fresh-install DDL for the tracking table: composite PK `(line, version)`

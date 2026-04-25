@@ -1,7 +1,12 @@
-import type { ConnectOptions, Eddyq, JobCall } from "@eddyq/queue";
+import type {
+  ConnectOptions,
+  Eddyq,
+  JobCall,
+  ScheduleDeclaration,
+} from "@eddyq/queue";
 import type { ModuleMetadata, Type } from "@nestjs/common";
 
-export type { ConnectOptions, Eddyq, JobCall };
+export type { ConnectOptions, Eddyq, JobCall, ScheduleDeclaration };
 
 /**
  * A JS worker handler — async function invoked with the decoded JobCall. Throw
@@ -46,6 +51,15 @@ export interface EddyqModuleOptions {
    * a deploy-step concern, not a runtime one. Flip on only for toy apps or tests.
    */
   runMigrations?: boolean;
+
+  /**
+   * Cron schedules declared in code. When provided, the module reconciles the
+   * DB against this list at boot — entries are upserted, and any DB schedule
+   * not in the list is **deleted**. Pass `[]` to delete all declared
+   * schedules; omit to leave schedules untouched (useful when managing them
+   * imperatively via `queue.addSchedule`).
+   */
+  schedules?: ScheduleDeclaration[];
 }
 
 /** Async-config shape for `EddyqModule.forRootAsync`. */

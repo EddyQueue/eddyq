@@ -20,7 +20,7 @@ pub use eddyq_core::{
     group::{Group, GroupRule, StoredRule},
     migrate::{Direction, MigrateReport, MigrationStatus},
     named_queue::NamedQueue,
-    schedule::Schedule,
+    schedule::{Schedule, ScheduleDeclaration, SyncReport},
     stats::{JobList, JobRow, JobStats, ListJobsFilter, Pagination, QueueStateCount},
 };
 
@@ -238,6 +238,15 @@ impl Client {
 
     pub async fn set_schedule_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
         eddyq_core::schedule::set_enabled(&self.pool, name, enabled).await
+    }
+
+    /// Reconcile DB schedules against a code-declared list. Upserts each entry
+    /// and deletes any DB schedule whose name is not in the list. Idempotent.
+    pub async fn sync_schedules(
+        &self,
+        declared: &[eddyq_core::schedule::ScheduleDeclaration],
+    ) -> Result<eddyq_core::schedule::SyncReport> {
+        eddyq_core::schedule::sync_schedules(&self.pool, declared).await
     }
 
     // --- Stats / list-jobs -------------------------------------------------

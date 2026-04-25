@@ -307,6 +307,15 @@ impl Queue {
         crate::schedule::list_schedules(&self.pool).await
     }
 
+    /// Reconcile DB schedules against a code-declared list. Each entry is
+    /// upserted; any DB schedule not in the list is deleted. Idempotent.
+    pub async fn sync_schedules(
+        &self,
+        declared: &[crate::schedule::ScheduleDeclaration],
+    ) -> Result<crate::schedule::SyncReport> {
+        crate::schedule::sync_schedules(&self.pool, declared).await
+    }
+
     /// Set the concurrency cap for a group. Jobs with `group_key(key)` will not
     /// run more than `max` at a time.
     pub async fn set_group_concurrency(&self, key: &str, max: i32) -> Result<()> {

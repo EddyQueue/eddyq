@@ -63,6 +63,8 @@ pub async fn upsert_schedule_raw(
         .next()
         .ok_or_else(|| crate::error::Error::Cron("cron never fires".into()))?;
 
+    // Preserve `next_run_at` when the cron expression is unchanged so that
+    // re-calling upsert (e.g. on redeploy) doesn't reset an imminent tick.
     sqlx::query(
         r#"
         INSERT INTO eddyq_schedules
@@ -72,7 +74,11 @@ pub async fn upsert_schedule_raw(
             SET kind         = EXCLUDED.kind,
                 payload      = EXCLUDED.payload,
                 cron_expr    = EXCLUDED.cron_expr,
-                next_run_at  = EXCLUDED.next_run_at,
+                next_run_at  = CASE
+                                  WHEN eddyq_schedules.cron_expr = EXCLUDED.cron_expr
+                                  THEN eddyq_schedules.next_run_at
+                                  ELSE EXCLUDED.next_run_at
+                               END,
                 priority     = EXCLUDED.priority,
                 max_attempts = EXCLUDED.max_attempts,
                 updated_at   = NOW()
@@ -89,6 +95,92 @@ pub async fn upsert_schedule_raw(
     .await?;
 
     Ok(())
+}
+
+/// A schedule declared in code (e.g. `EddyqModule.forRoot({ schedules: [...] })`).
+#[derive(Debug, Clone)]
+pub struct ScheduleDeclaration {
+    pub name: String,
+    pub cron_expr: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub priority: i16,
+    pub max_attempts: i32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SyncReport {
+    pub upserted: usize,
+    pub deleted: Vec<String>,
+}
+
+/// Reconcile DB schedules against a code-declared list. Treats the declared
+/// list as authoritative: each entry is upserted, and any DB schedule whose
+/// name is NOT in the list is deleted. Idempotent — safe to run on every boot.
+pub async fn sync_schedules(
+    pool: &PgPool,
+    declared: &[ScheduleDeclaration],
+) -> Result<SyncReport> {
+    // Pre-validate every cron expression and compute next_run_at upfront so a
+    // bad entry fails the whole sync without partially mutating state.
+    let mut prepared = Vec::with_capacity(declared.len());
+    for d in declared {
+        let schedule = CronSchedule::from_str(&d.cron_expr)
+            .map_err(|e| crate::error::Error::Cron(format!("{}: {}", d.name, e)))?;
+        let next = schedule
+            .upcoming(Utc)
+            .next()
+            .ok_or_else(|| crate::error::Error::Cron(format!("{}: cron never fires", d.name)))?;
+        prepared.push((d, next));
+    }
+
+    let mut tx = pool.begin().await?;
+
+    for (d, next) in &prepared {
+        sqlx::query(
+            r#"
+            INSERT INTO eddyq_schedules
+                (name, kind, payload, cron_expr, next_run_at, priority, max_attempts)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (name) DO UPDATE
+                SET kind         = EXCLUDED.kind,
+                    payload      = EXCLUDED.payload,
+                    cron_expr    = EXCLUDED.cron_expr,
+                    next_run_at  = CASE
+                                      WHEN eddyq_schedules.cron_expr = EXCLUDED.cron_expr
+                                      THEN eddyq_schedules.next_run_at
+                                      ELSE EXCLUDED.next_run_at
+                                   END,
+                    priority     = EXCLUDED.priority,
+                    max_attempts = EXCLUDED.max_attempts,
+                    updated_at   = NOW()
+            "#,
+        )
+        .bind(&d.name)
+        .bind(&d.kind)
+        .bind(&d.payload)
+        .bind(&d.cron_expr)
+        .bind(next)
+        .bind(d.priority)
+        .bind(d.max_attempts)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let names: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
+    let deleted: Vec<(String,)> = sqlx::query_as(
+        "DELETE FROM eddyq_schedules WHERE name <> ALL($1) RETURNING name",
+    )
+    .bind(&names)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(SyncReport {
+        upserted: declared.len(),
+        deleted: deleted.into_iter().map(|(n,)| n).collect(),
+    })
 }
 
 pub async fn remove_schedule(pool: &PgPool, name: &str) -> Result<bool> {

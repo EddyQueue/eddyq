@@ -465,6 +465,93 @@ async fn schedule_upsert_and_remove(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn sync_schedules_reconciles(pool: PgPool) {
+    use eddyq_core::schedule::ScheduleDeclaration;
+
+    let queue = Queue::builder(pool.clone()).build();
+
+    // Pre-existing imperatively-added schedule that is NOT in the declared list.
+    queue
+        .add_schedule("orphan", "0 0 0 * * *", &Count { n: 9 })
+        .await
+        .unwrap();
+
+    // First sync: insert two declared schedules, delete the orphan.
+    let declared_v1 = vec![
+        ScheduleDeclaration {
+            name: "alpha".into(),
+            cron_expr: "0 0 9 * * *".into(),
+            kind: Count::KIND.into(),
+            payload: serde_json::json!({ "n": 1 }),
+            priority: 0,
+            max_attempts: 3,
+        },
+        ScheduleDeclaration {
+            name: "beta".into(),
+            cron_expr: "0 0 10 * * *".into(),
+            kind: Count::KIND.into(),
+            payload: serde_json::json!({ "n": 2 }),
+            priority: 0,
+            max_attempts: 3,
+        },
+    ];
+    let report = queue.sync_schedules(&declared_v1).await.unwrap();
+    assert_eq!(report.upserted, 2);
+    assert_eq!(report.deleted, vec!["orphan".to_string()]);
+
+    let names: Vec<String> = queue
+        .list_schedules()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+
+    // Capture alpha's next_run_at; re-syncing with the same cron must preserve it.
+    let alpha_before = queue
+        .list_schedules()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "alpha")
+        .unwrap()
+        .next_run_at;
+
+    // Second sync: drop beta, change alpha's cron, leave alpha's name alone.
+    let declared_v2 = vec![ScheduleDeclaration {
+        name: "alpha".into(),
+        cron_expr: "0 0 9 * * *".into(), // unchanged
+        kind: Count::KIND.into(),
+        payload: serde_json::json!({ "n": 1 }),
+        priority: 0,
+        max_attempts: 3,
+    }];
+    let report = queue.sync_schedules(&declared_v2).await.unwrap();
+    assert_eq!(report.upserted, 1);
+    assert_eq!(report.deleted, vec!["beta".to_string()]);
+
+    let alpha_after = queue
+        .list_schedules()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.name == "alpha")
+        .unwrap()
+        .next_run_at;
+    assert_eq!(
+        alpha_before, alpha_after,
+        "next_run_at must be preserved when cron is unchanged"
+    );
+
+    // Third sync: empty list deletes everything.
+    let report = queue.sync_schedules(&[]).await.unwrap();
+    assert_eq!(report.upserted, 0);
+    assert_eq!(report.deleted, vec!["alpha".to_string()]);
+    assert_eq!(queue.list_schedules().await.unwrap().len(), 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn unique_key_dedupes(pool: PgPool) {
     use eddyq_core::{EnqueueOptions, EnqueueResult};
 

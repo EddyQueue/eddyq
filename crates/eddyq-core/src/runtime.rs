@@ -18,7 +18,7 @@ use crate::{
     QueueConfig,
     fetch::{ClaimedJob, claim_batch, mark_completed, mark_failed, sweep_stale, update_heartbeat_batch},
     job::{JobContext, JobId},
-    leader::{self, MAINTENANCE_ROLE},
+    leader::{self, LEADER_RESIGN_CHANNEL, MAINTENANCE_ROLE},
     worker::WorkerRegistry,
 };
 
@@ -401,39 +401,77 @@ async fn leader_loop(
         .max(Duration::from_secs(5));
     let mut interval = tokio::time::interval(refresh_interval);
 
-    // Run an immediate election before entering the tick loop so maintenance
-    // tasks (sweeper, scheduler, cleanup) can start working right away.
-    match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs).await {
-        Ok(won) => {
-            is_leader.store(won, Ordering::Relaxed);
-            if won {
-                info!(%worker_id, "elected as maintenance leader (initial)");
+    // Subscribe to peer-resignation NOTIFYs so we can fire an immediate election
+    // when the current leader gracefully shuts down. Optional — falls back to
+    // tick-driven elections if the LISTEN connection can't be established.
+    let mut resign_listener = match PgListener::connect_with(&pool).await {
+        Ok(mut l) => match l.listen(LEADER_RESIGN_CHANNEL).await {
+            Ok(()) => Some(l),
+            Err(err) => {
+                warn!(?err, "leader-resign LISTEN setup failed; relying on tick-driven elections");
+                None
+            }
+        },
+        Err(err) => {
+            warn!(?err, "leader-resign LISTEN connection failed; relying on tick-driven elections");
+            None
+        }
+    };
+
+    let try_elect_once = |reason: &'static str, was: &Arc<AtomicBool>| {
+        let pool = pool.clone();
+        let was = was.clone();
+        async move {
+            match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs).await {
+                Ok(won) => {
+                    let prev = was.swap(won, Ordering::Relaxed);
+                    if won && !prev {
+                        info!(%worker_id, reason, "elected as maintenance leader");
+                    } else if !won && prev {
+                        warn!(%worker_id, reason, "lost maintenance leadership");
+                    }
+                }
+                Err(err) => {
+                    warn!(?err, reason, "leader election failed");
+                }
             }
         }
-        Err(err) => {
-            warn!(?err, "initial leader election failed");
-        }
-    }
+    };
+
+    // Run an immediate election before entering the tick loop so maintenance
+    // tasks (sweeper, scheduler, cleanup) can start working right away.
+    try_elect_once("initial", &is_leader).await;
     interval.tick().await; // consume the first tick (already ran above)
 
     loop {
+        // Build the recv future inline; if no listener we await a never-ready
+        // future so the tokio::select! still has a valid arm.
+        let recv: std::pin::Pin<Box<dyn std::future::Future<Output = sqlx::Result<sqlx::postgres::PgNotification>> + Send>> =
+            match resign_listener.as_mut() {
+                Some(l) => Box::pin(l.recv()),
+                None => Box::pin(std::future::pending()),
+            };
+
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
-            _ = interval.tick() => {
-                match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs).await {
-                    Ok(won) => {
-                        let was_leader = is_leader.swap(won, Ordering::Relaxed);
-                        if won && !was_leader {
-                            info!(%worker_id, "elected as maintenance leader");
-                        } else if !won && was_leader {
-                            warn!(%worker_id, "lost maintenance leadership");
+            ev = recv => {
+                match ev {
+                    Ok(_) => {
+                        // A peer resigned — if we're not the leader, race for the lease.
+                        if !is_leader.load(Ordering::Relaxed) {
+                            try_elect_once("peer_resigned", &is_leader).await;
                         }
                     }
                     Err(err) => {
-                        warn!(?err, "leader election failed");
+                        warn!(?err, "leader-resign listener error");
+                        // Drop the listener; subsequent loop iterations fall back to ticks.
+                        resign_listener = None;
                     }
                 }
+            }
+            _ = interval.tick() => {
+                try_elect_once("tick", &is_leader).await;
             }
         }
     }

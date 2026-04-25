@@ -130,6 +130,17 @@ CREATE TABLE eddyq_schedules (
 
 CREATE INDEX eddyq_schedules_due ON eddyq_schedules (next_run_at) WHERE enabled;
 
+-- ─── Leader election ───────────────────────────────────────────────────────
+-- One row per role (currently just 'maintenance'). Workers compete with an
+-- upsert: the holder refreshes before expiry; if a holder dies, expires_at
+-- passes and any other worker wins the next election.
+CREATE TABLE eddyq_leader (
+    role        TEXT        PRIMARY KEY,
+    worker_id   UUID        NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    elected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 -- ─── SQL enqueue functions ─────────────────────────────────────────────────
 -- Expose the enqueue path to non-Rust callers so Node/Python/Ruby can
 -- participate in transactional enqueue through their own DB client. The

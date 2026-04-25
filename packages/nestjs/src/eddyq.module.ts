@@ -86,6 +86,17 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
       }
     }
 
+    if (this.options.schedules !== undefined) {
+      const declared = this.options.schedules;
+      const report = await this.queue.syncSchedules(declared);
+      EddyqModule.logger.log(
+        `synced schedules: upserted ${report.upserted}` +
+          (report.deleted.length > 0
+            ? `, deleted ${report.deleted.length} (${report.deleted.join(", ")})`
+            : ""),
+      );
+    }
+
     const handlers = this.explorer.discover();
     for (const { kind, handler } of handlers) {
       this.queue.work(kind, handler as Parameters<Eddyq["work"]>[1]);

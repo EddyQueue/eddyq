@@ -15,7 +15,7 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use eddyq_client::{
     Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DynEnqueue, HandlerFailure,
-    JobContext, JobResult, JobState,
+    JobContext, JobResult, JobState, ScheduleDeclaration as CoreScheduleDeclaration,
 };
 use napi::{
     bindgen_prelude::*,
@@ -312,6 +312,27 @@ pub struct ScheduleOptions {
     pub priority: Option<i16>,
     /// Max total attempts before the job is marked failed. Default 3.
     pub max_attempts: Option<i32>,
+}
+
+/// A single declared schedule in `syncSchedules`. Same shape as `addSchedule`'s
+/// arguments, just packaged as an object so the whole declared list can be
+/// passed in one call.
+#[napi(object)]
+pub struct ScheduleDeclaration {
+    pub name: String,
+    pub cron_expr: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub priority: Option<i16>,
+    pub max_attempts: Option<i32>,
+}
+
+/// Result of `syncSchedules`: the names that were upserted (count) and any
+/// schedules that were deleted because they weren't in the declared list.
+#[napi(object)]
+pub struct SyncSchedulesReport {
+    pub upserted: u32,
+    pub deleted: Vec<String>,
 }
 
 /// Argument passed to a JS worker handler. The payload is whatever JSON was
@@ -637,6 +658,37 @@ impl Queue {
     pub async fn remove_schedule(&self, name: String) -> Result<bool> {
         let client = self.client.clone();
         run(move || async move { client.remove_schedule(&name).await.map_err(err) }).await
+    }
+
+    /// Reconcile DB schedules against a code-declared list. Each entry is
+    /// upserted; any DB schedule whose name is not in `declared` is deleted.
+    /// Idempotent — safe to run on every boot. Use this when schedules are
+    /// declared in module config (e.g. `EddyqModule.forRoot({ schedules })`).
+    #[napi]
+    pub async fn sync_schedules(
+        &self,
+        declared: Vec<ScheduleDeclaration>,
+    ) -> Result<SyncSchedulesReport> {
+        let client = self.client.clone();
+        let mapped: Vec<CoreScheduleDeclaration> = declared
+            .into_iter()
+            .map(|d| CoreScheduleDeclaration {
+                name: d.name,
+                cron_expr: d.cron_expr,
+                kind: d.kind,
+                payload: d.payload,
+                priority: d.priority.unwrap_or(0),
+                max_attempts: d.max_attempts.unwrap_or(3),
+            })
+            .collect();
+        run(move || async move {
+            let report = client.sync_schedules(&mapped).await.map_err(err)?;
+            Ok(SyncSchedulesReport {
+                upserted: report.upserted as u32,
+                deleted: report.deleted,
+            })
+        })
+        .await
     }
 
     /// Toggle a schedule on or off without deleting it. Returns `true` if a
