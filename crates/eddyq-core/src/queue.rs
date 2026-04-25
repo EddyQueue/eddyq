@@ -166,6 +166,29 @@ impl QueueBuilder {
         self
     }
 
+    pub fn cleanup_interval(mut self, d: Duration) -> Self {
+        self.config.cleanup_interval = d;
+        self
+    }
+
+    /// Retention for completed jobs. `None` keeps them forever.
+    pub fn completed_retention(mut self, d: Option<Duration>) -> Self {
+        self.config.completed_retention = d;
+        self
+    }
+
+    /// Retention for failed jobs. `None` keeps them forever.
+    pub fn failed_retention(mut self, d: Option<Duration>) -> Self {
+        self.config.failed_retention = d;
+        self
+    }
+
+    /// Retention for cancelled jobs. `None` keeps them forever.
+    pub fn cancelled_retention(mut self, d: Option<Duration>) -> Self {
+        self.config.cancelled_retention = d;
+        self
+    }
+
     pub fn leader_lease_secs(mut self, s: u64) -> Self {
         self.config.leader_lease_secs = s;
         self

@@ -9,8 +9,6 @@
 // Types and error classes from @eddyq/queue are re-exported for convenience
 // so downstream code can `import { Eddyq, JobCall, CancelError } from "@eddyq/nestjs"`.
 
-export const VERSION = "0.0.1";
-
 export { EddyqModule } from "./eddyq.module.js";
 export { EddyqExplorer } from "./eddyq.explorer.js";
 export type { DiscoveredHandler } from "./eddyq.explorer.js";
@@ -26,6 +24,7 @@ export {
 export type {
   EddyqModuleAsyncOptions,
   EddyqModuleOptions,
+  EddyqTuningOptions,
   JobHandlerFn,
 } from "./eddyq.types.js";
 

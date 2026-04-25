@@ -1,9 +1,6 @@
 //! eddyq-napi — Node.js bindings for `eddyq-client`.
 //!
 //! Built into a cdylib consumed by the `@eddyq/queue` npm package via NAPI-RS.
-//! This crate exposes the **enqueue and admin** surface — workers (JS handler
-//! callbacks) are not yet implemented; process jobs with `eddyq-cli` or a
-//! Rust worker for now.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -183,7 +180,9 @@ pub struct MigrationRow {
     pub name: String,
 }
 
-/// Options for `eddyq.start()`.
+/// Options for `eddyq.start()`. All tuning fields are optional — omit to use
+/// the core defaults. Defaults are sensible for most workloads; tune only when
+/// you have a measured reason to.
 #[napi(object)]
 pub struct StartOptions {
     /// Skip the pending-migration check. Default `false` — `start()` errors
@@ -193,6 +192,43 @@ pub struct StartOptions {
     /// Set to `true` only when you've applied migrations via a separate
     /// deploy step (recommended) and don't want the boot-time check.
     pub skip_migration_check: Option<bool>,
+
+    /// How often the heartbeat sweeper reclaims stale running jobs.
+    /// Default 30_000 (30s).
+    pub sweep_interval_ms: Option<u32>,
+
+    /// A running job is considered stale if its heartbeat is older than this.
+    /// The sweeper requeues stale jobs on the next tick. Default 60_000 (60s).
+    /// Should be at least 2× `heartbeatIntervalMs`.
+    pub stale_after_ms: Option<u32>,
+
+    /// How often each running handler refreshes its lease. Default 15_000 (15s).
+    pub heartbeat_interval_ms: Option<u32>,
+
+    /// How often the cleanup task deletes finalized jobs past retention.
+    /// Default 300_000 (5m).
+    pub cleanup_interval_ms: Option<u32>,
+
+    /// Retention (seconds) for completed jobs. Default 86_400 (24h).
+    /// Pass `-1` to keep forever (table grows unbounded).
+    pub completed_retention_secs: Option<i64>,
+
+    /// Retention (seconds) for failed jobs. Default 604_800 (7d).
+    /// Pass `-1` to keep forever.
+    pub failed_retention_secs: Option<i64>,
+
+    /// Retention (seconds) for cancelled jobs. Default 604_800 (7d).
+    /// Pass `-1` to keep forever.
+    pub cancelled_retention_secs: Option<i64>,
+
+    /// Leader-election lease in seconds — the elected maintenance node
+    /// (scheduler + cleanup) refreshes every `leaseSecs / 3` seconds.
+    /// Default 30.
+    pub leader_lease_secs: Option<u32>,
+
+    /// Fetch poll interval in poll-only mode (no LISTEN/NOTIFY).
+    /// Default 1_000 (1s). Ignored when LISTEN is enabled.
+    pub fetch_poll_interval_ms: Option<u32>,
 }
 
 // -- Dashboard DTOs ----------------------------------------------------------
@@ -853,6 +889,35 @@ impl Queue {
         if let Some(qs) = subscribe {
             builder = builder.subscribe_to(qs);
         }
+        if let Some(o) = options.as_ref() {
+            if let Some(ms) = o.sweep_interval_ms {
+                builder = builder.sweep_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.stale_after_ms {
+                builder = builder.stale_after(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.heartbeat_interval_ms {
+                builder = builder.heartbeat_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.cleanup_interval_ms {
+                builder = builder.cleanup_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(secs) = o.completed_retention_secs {
+                builder = builder.completed_retention(retention_from_secs(secs));
+            }
+            if let Some(secs) = o.failed_retention_secs {
+                builder = builder.failed_retention(retention_from_secs(secs));
+            }
+            if let Some(secs) = o.cancelled_retention_secs {
+                builder = builder.cancelled_retention(retention_from_secs(secs));
+            }
+            if let Some(s) = o.leader_lease_secs {
+                builder = builder.leader_lease_secs(u64::from(s));
+            }
+            if let Some(ms) = o.fetch_poll_interval_ms {
+                builder = builder.fetch_poll_interval(Duration::from_millis(u64::from(ms)));
+            }
+        }
         for (kind, tsfn) in handlers {
             builder = builder.register_dyn(kind, dispatcher(tsfn));
         }
@@ -1331,6 +1396,16 @@ fn build_cfg(options: Option<ConnectOptions>) -> ClientConfig {
         c.line = line;
     }
     c
+}
+
+/// Map a JS-supplied retention value to the core's `Option<Duration>`.
+/// Convention: `< 0` → keep forever (`None`); `>= 0` → that many seconds.
+fn retention_from_secs(secs: i64) -> Option<Duration> {
+    if secs < 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs as u64))
+    }
 }
 
 fn ms_to_utc(ms: i64) -> DateTime<Utc> {

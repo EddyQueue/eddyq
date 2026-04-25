@@ -2,7 +2,7 @@
   "name": "@eddyq/nestjs",
   "version": "0.0.1",
   "description": "NestJS module for eddyq — decorators and DI for the eddyq job queue",
-  "license": "(MIT OR Apache-2.0)",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/EddyQueue/eddyq.git",
@@ -29,10 +29,8 @@
   },
   "devDependencies": {
     "@types/node": "^20",
-    "@typhonjs-typedoc/typedoc-theme-dmt": "^0.4.0",
     "reflect-metadata": "^0.2.0",
-    "rxjs": "^7.8.0",
-    "typedoc": "^0.28.3"
+    "rxjs": "^7.8.0"
   },
   "engines": {
     "node": ">=20"

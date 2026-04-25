@@ -1,13 +1,16 @@
 {
   "entryPoints": ["src/index.ts"],
   "tsconfig": "tsconfig.json",
-  "out": "docs",
+  "out": "../../docs/public/api/nestjs",
   "name": "@eddyq/nestjs",
   "readme": "README.md",
   "includeVersion": true,
+  "excludeExternals": true,
+  "externalPattern": ["**/node_modules/**", "**/packages/queue/**"],
   "plugin": ["@typhonjs-typedoc/typedoc-theme-dmt"],
   "theme": "default-modern",
   "navigationLinks": {
-    "GitHub": "https://github.com/eddyqueue/eddyq"
+    "← Docs": "/eddyq/",
+    "GitHub": "https://github.com/EddyQueue/eddyq"
   }
 }

@@ -230,10 +230,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish @eddyq/nestjs
-        # `pnpm publish` rewrites `workspace:*` in peerDependencies to the
-        # actual version being published, which `npm publish` would leave as-is.
+        # `pnpm pack` rewrites `workspace:*` in peerDependencies to the
+        # resolved version. We then hand the tarball to `npm publish` directly
+        # because `pnpm publish` in pnpm 10 has flag-passthrough quirks with
+        # --provenance that produce npm EUSAGE errors.
         run: |
-          pnpm -C packages/nestjs publish --access public --no-git-checks --provenance
+          cd packages/nestjs
+          pnpm pack
+          npm publish eddyq-nestjs-*.tgz --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
