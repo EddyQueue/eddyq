@@ -40,66 +40,34 @@ await q.start();
 await q.shutdown(10_000);   // 10s grace; fires abort signals
 ```
 
-## Migrations — DEPLOY STEP, not auto-apply
+## Migrations
 
-**eddyq does not run migrations at app boot.** Slow migrations (index builds,
-table rewrites) would block every replica's startup. We follow River's /
-Oban's / Prisma's discipline: **you apply migrations as an explicit deploy
-step, then boot workers.**
+eddyq does not auto-migrate at boot — slow migrations would stall every
+replica's startup. Run them as an explicit deploy step before booting workers.
 
-`eddyq.start()` refuses to boot if migrations are pending and tells you how
-to fix it. That's the safety net.
+The package ships a CLI:
 
-### The two ways to migrate
+```bash
+DATABASE_URL=postgres://... npx eddyq migrate run
+DATABASE_URL=postgres://... npx eddyq migrate list
+DATABASE_URL=postgres://... npx eddyq migrate down --max-steps 1 --confirm
+```
 
-**1. Node script (good for Node-only deploys):**
+Or call from code:
 
 ```ts
-// scripts/migrate.mjs — run this BEFORE booting workers.
-import pkg from '@eddyq/queue';
-const q = await pkg.Eddyq.connect(process.env.DATABASE_URL);
+import { Eddyq } from '@eddyq/queue';
+const q = await Eddyq.connect(process.env.DATABASE_URL);
 const report = await q.migrate();
 console.log("applied:", report.applied.map(m => `${m.version}:${m.name}`));
 await q.close();
 ```
 
-Wire it into your deploy pipeline:
+`eddyq.start()` refuses to boot if migrations are pending. To bypass when
+schema is managed out-of-band, pass `{ skipMigrationCheck: true }`.
 
-```yaml
-# deploy.yml (sketch)
-- run: node scripts/migrate.mjs
-- run: systemctl restart workers.service
-```
-
-**2. CLI (good for non-Node / polyglot deploys):**
-
-```bash
-cargo install eddyq-cli   # or download binary
-eddyq migrate run --database-url "$DATABASE_URL"
-```
-
-Both are idempotent. Both hold a `pg_advisory_lock` keyed per migration-line,
-so running them twice (or from two deploy hosts simultaneously) serializes
-safely instead of racing.
-
-### Why not auto-migrate?
-
-See [ADR 011](../../docs/decisions/011-migrations-deploy-step.md) for the
-full reasoning. Short version:
-- Slow migrations shouldn't block app boot.
-- Enterprises want DDL reviewed.
-- Every mature DB-backed queue (River, Oban, Prisma, Ecto) works this way.
-
-### If you *really* know what you're doing
-
-Skip the boot-time check:
-
-```ts
-await eddyq.start({ skipMigrationCheck: true });
-```
-
-For cases where schema is managed fully out-of-band and you've verified it's
-in sync. Not the default.
+`migrate()` is idempotent and holds a `pg_advisory_lock` per migration line,
+so running it twice (or from two deploy hosts at once) serializes safely.
 
 ## Retry convention
 
@@ -148,6 +116,35 @@ next surviving worker.
 | `getStats()` / `listJobs(filter?, pagination?)` | Dashboard-oriented reads. |
 | `migrate()` / `migrateDown(n)` / `migrationStatus()` | Schema control. |
 
+## Tuning
+
+Defaults are sized for typical workloads — most users should leave them alone.
+Pass any of these to `start()` when you need to deviate:
+
+```ts
+await q.start({
+  sweepIntervalMs:        30_000,    // heartbeat sweeper cadence
+  staleAfterMs:           60_000,    // when a running job is considered orphaned
+  heartbeatIntervalMs:    15_000,    // worker → DB heartbeat (must be ≪ staleAfterMs)
+  cleanupIntervalMs:     300_000,    // retention sweep cadence
+  completedRetentionSecs: 24 * 3600, // delete completed older than this
+  failedRetentionSecs:    7 * 86400,
+  cancelledRetentionSecs: 7 * 86400, // pass -1 to keep forever
+  leaderLeaseSecs:        30,        // single-leader maintenance lease
+  fetchPollIntervalMs:    1_000,     // ignored unless poll-only
+});
+```
+
+When to touch them:
+
+- **High throughput (millions of completed jobs/day)** — drop
+  `completedRetentionSecs` to a few hours so cleanup keeps up.
+- **Long handlers (jobs that legitimately run > 60s)** — raise `staleAfterMs`
+  past your worst-case duration so the sweeper doesn't reclaim live jobs.
+  Also raise `heartbeatIntervalMs` proportionally.
+- **Many replicas (50+ pods)** — raise `sweepIntervalMs` so you're not
+  hammering the sweep query from every pod.
+
 ## License
 
-Dual-licensed MIT or Apache-2.0.
+MIT

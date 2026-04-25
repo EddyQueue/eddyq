@@ -139,6 +139,7 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     }
 
     await this.queue.start({
+      ...(this.options.tuning ?? {}),
       skipMigrationCheck: this.options.skipMigrationCheck,
     });
     this.started = true;

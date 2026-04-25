@@ -2,7 +2,7 @@
   "name": "@eddyq/queue",
   "version": "0.0.1",
   "description": "Node.js client for eddyq — a Rust + Postgres job queue",
-  "license": "(MIT OR Apache-2.0)",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/EddyQueue/eddyq.git",
@@ -11,11 +11,15 @@
   "homepage": "https://github.com/EddyQueue/eddyq",
   "main": "lib.cjs",
   "types": "lib.d.ts",
+  "bin": {
+    "eddyq": "bin/eddyq.js"
+  },
   "files": [
     "index.js",
     "index.d.ts",
     "lib.cjs",
     "lib.d.ts",
+    "bin/eddyq.js",
     "README.md"
   ],
   "napi": {
@@ -44,9 +48,7 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0",
-    "@typhonjs-typedoc/typedoc-theme-dmt": "^0.4.0",
-    "pg": "^8.20.0",
-    "typedoc": "^0.28.3"
+    "pg": "^8.20.0"
   },
   "engines": {
     "node": ">=20"

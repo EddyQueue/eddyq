@@ -1,12 +1,13 @@
 {
   "entryPoints": ["index.d.ts"],
-  "out": "docs",
+  "out": "../../docs/public/api/queue",
   "name": "@eddyq/queue",
   "readme": "README.md",
   "includeVersion": true,
   "plugin": ["@typhonjs-typedoc/typedoc-theme-dmt"],
   "theme": "default-modern",
   "navigationLinks": {
-    "GitHub": "https://github.com/eddyqueue/eddyq"
+    "← Docs": "/eddyq/",
+    "GitHub": "https://github.com/EddyQueue/eddyq"
   }
 }

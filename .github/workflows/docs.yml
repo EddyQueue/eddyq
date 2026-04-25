@@ -31,46 +31,10 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm --filter @eddyq/queue build:debug
       - run: pnpm --filter @eddyq/nestjs build
-      - run: pnpm --filter @eddyq/queue docs
-      - run: pnpm --filter @eddyq/nestjs docs
-      - name: Assemble site
-        run: |
-          mkdir -p _site/queue _site/nestjs
-          cp -r packages/queue/docs/. _site/queue/
-          cp -r packages/nestjs/docs/. _site/nestjs/
-          cat > _site/index.html <<'EOF'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8">
-            <title>eddyq — API docs</title>
-            <meta name="viewport" content="width=device-width,initial-scale=1">
-            <style>
-              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1rem; line-height: 1.5; color: #1a1a1a; }
-              h1 { margin-bottom: 0.25rem; }
-              p.lead { color: #555; margin-top: 0; }
-              ul { padding-left: 1.25rem; }
-              li { margin: 0.5rem 0; }
-              a { color: #0a66c2; text-decoration: none; }
-              a:hover { text-decoration: underline; }
-              code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; font-size: 0.9em; }
-              footer { margin-top: 3rem; color: #888; font-size: 0.85rem; }
-            </style>
-          </head>
-          <body>
-            <h1>eddyq</h1>
-            <p class="lead">Rust + Postgres job queue with first-class Node bindings.</p>
-            <ul>
-              <li><a href="./queue/"><code>@eddyq/queue</code></a> — Node client</li>
-              <li><a href="./nestjs/"><code>@eddyq/nestjs</code></a> — NestJS module</li>
-            </ul>
-            <footer><a href="https://github.com/EddyQueue/eddyq">GitHub →</a></footer>
-          </body>
-          </html>
-          EOF
+      - run: pnpm docs:build
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: _site
+          path: docs/.vitepress/dist
 
   deploy:
     needs: build

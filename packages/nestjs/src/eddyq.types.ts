@@ -3,10 +3,14 @@ import type {
   Eddyq,
   JobCall,
   ScheduleDeclaration,
+  StartOptions,
 } from "@eddyq/queue";
 import type { ModuleMetadata, Type } from "@nestjs/common";
 
-export type { ConnectOptions, Eddyq, JobCall, ScheduleDeclaration };
+export type { ConnectOptions, Eddyq, JobCall, ScheduleDeclaration, StartOptions };
+
+/** Tuning knobs for the worker runtime — `StartOptions` minus the fields the module manages itself. */
+export type EddyqTuningOptions = Omit<StartOptions, "skipMigrationCheck">;
 
 /**
  * A JS worker handler — async function invoked with the decoded JobCall. Throw
@@ -51,6 +55,13 @@ export interface EddyqModuleOptions {
    * a deploy-step concern, not a runtime one. Flip on only for toy apps or tests.
    */
   runMigrations?: boolean;
+
+  /**
+   * Worker-runtime tuning forwarded to `eddyq.start()` — sweep/cleanup
+   * intervals, retention windows, lease durations, etc. Omit to use defaults.
+   * `skipMigrationCheck` is not included here; set it at the top level.
+   */
+  tuning?: EddyqTuningOptions;
 
   /**
    * Cron schedules declared in code. When provided, the module reconciles the

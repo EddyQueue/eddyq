@@ -97,6 +97,12 @@ EddyqModule.forRoot({
   schedules: [
     { name: "daily-report", cronExpr: "0 0 8 * * *", kind: "report.generate", payload: {} },
   ],
+
+  // Worker-runtime tuning. Defaults are sensible — only tune with a measured reason.
+  tuning: {
+    completedRetentionSecs: 3600,    // 1h instead of 24h for a high-volume queue
+    staleAfterMs:           300_000, // long handlers — bump from 60s
+  },
 });
 ```
 
@@ -302,4 +308,4 @@ to silence the boot-time guard.
 
 ## License
 
-MIT OR Apache-2.0
+MIT
