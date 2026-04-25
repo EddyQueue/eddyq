@@ -1,8 +1,8 @@
 {
-  "name": "@eddyq/board",
+  "name": "@eddyq/wakeboard",
   "version": "0.0.1",
   "private": true,
-  "description": "eddyq-board — Svelte admin dashboard for eddyq, mountable as a NestJS module",
+  "description": "eddyq-wakeboard — Svelte admin dashboard for eddyq, mountable as a NestJS module",
   "license": "(MIT OR Apache-2.0)",
   "type": "module",
   "main": "dist/index.js",

@@ -3,7 +3,7 @@ import { InjectEddyq } from '@eddyq/nestjs';
 import type { Eddyq, ListJobsFilter, Pagination } from '@eddyq/queue';
 
 @Injectable()
-export class BoardService {
+export class WakeboardService {
   constructor(@InjectEddyq() private readonly q: Eddyq) {}
 
   getStats() { return this.q.getStats(); }

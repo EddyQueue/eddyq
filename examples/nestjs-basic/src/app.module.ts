@@ -1,6 +1,6 @@
 import { Module } from "@nestjs/common";
 
-import { EddyqBoardModule } from "@eddyq/board";
+import { EddyqWakeboardModule } from "@eddyq/wakeboard";
 import { EddyqModule } from "@eddyq/nestjs";
 
 import { EmailModule } from "./email/email.module.js";
@@ -21,9 +21,9 @@ const DEFAULT_DATABASE_URL =
       databaseUrl: process.env.EDDYQ_DATABASE_URL ?? DEFAULT_DATABASE_URL,
       autoStart: false,
     }),
-    EddyqBoardModule.forRoot({
-      mountPath: '/board',
-      auth: { password: process.env.BOARD_PASSWORD ?? 'admin' },
+    EddyqWakeboardModule.forRoot({
+      mountPath: '/wakeboard',
+      auth: { password: process.env.WAKEBOARD_PASSWORD ?? 'admin' },
     }),
     EmailModule,
     ReportsModule,

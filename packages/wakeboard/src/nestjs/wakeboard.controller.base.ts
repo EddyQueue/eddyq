@@ -3,27 +3,27 @@ import type { Response } from 'express';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BOARD_OPTIONS } from './board.constants.js';
-import { BoardService } from './board.service.js';
-import type { EddyqBoardOptions } from './board.types.js';
+import { WAKEBOARD_OPTIONS } from './wakeboard.constants.js';
+import { WakeboardService } from './wakeboard.service.js';
+import type { EddyqWakeboardOptions } from './wakeboard.types.js';
 
 const DIST_PUBLIC = join(dirname(fileURLToPath(import.meta.url)), 'public');
 const VALID_STATES = new Set(['pending', 'running', 'completed', 'failed', 'scheduled', 'cancelled']);
 
 @Controller()
-export class BoardControllerBase {
+export class WakeboardControllerBase {
   private readonly indexHtml: string | null = null;
 
   constructor(
-    protected readonly service: BoardService,
-    @Inject(BOARD_OPTIONS) protected readonly opts: EddyqBoardOptions,
+    protected readonly service: WakeboardService,
+    @Inject(WAKEBOARD_OPTIONS) protected readonly opts: EddyqWakeboardOptions,
   ) {
-    const mountPath = opts.mountPath ?? '/board';
+    const mountPath = opts.mountPath ?? '/wakeboard';
     const htmlPath = join(DIST_PUBLIC, 'index.html');
     if (existsSync(htmlPath)) {
       const raw = readFileSync(htmlPath, 'utf-8');
       this.indexHtml = raw
-        .replace('__BOARD_BASE__', `${mountPath}/`)
+        .replace('__WAKEBOARD_BASE__', `${mountPath}/`)
         .replace("'__EDDYQ_API_BASE__'", `'${mountPath}'`);
     }
   }
@@ -123,7 +123,7 @@ export class BoardControllerBase {
     if (this.indexHtml) {
       res.type('html').send(this.indexHtml);
     } else {
-      res.status(503).send('Run "pnpm build:frontend" in packages/board first.');
+      res.status(503).send('Run "pnpm build:frontend" in packages/wakeboard first.');
     }
   }
 }

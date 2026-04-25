@@ -7,7 +7,7 @@ import { ReportsModule } from "./reports/reports.module.js";
 
 // Cron schedules declared in code. Reconciled against the DB at boot:
 // new entries are inserted, removed entries are deleted. The list is the
-// source of truth — no out-of-band drift via the board UI.
+// source of truth — no out-of-band drift via the wakeboard UI.
 const SCHEDULES: ScheduleDeclaration[] = [
   {
     name: "daily-report",

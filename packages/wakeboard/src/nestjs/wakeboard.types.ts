@@ -1,5 +1,5 @@
-export interface EddyqBoardOptions {
-  /** URL path to mount the board at. Default: '/board' */
+export interface EddyqWakeboardOptions {
+  /** URL path to mount the wakeboard at. Default: '/wakeboard' */
   mountPath?: string;
   auth?: {
     /** Default: 'admin' */

@@ -2761,9 +2761,15 @@ async fn batch_heartbeat_updates_all_in_flight(pool: PgPool) {
     }
 
     // Claim them so they're in 'running' state.
-    let claimed = claim_batch(&pool, worker_id, 10, &["count".to_string()], &["default".to_string()])
-        .await
-        .unwrap();
+    let claimed = claim_batch(
+        &pool,
+        worker_id,
+        10,
+        &["count".to_string()],
+        &["default".to_string()],
+    )
+    .await
+    .unwrap();
     assert_eq!(claimed.len(), 3, "should have claimed 3 jobs");
 
     // Record heartbeat_at before the batch update.
@@ -2858,15 +2864,24 @@ async fn leader_refresh_keeps_leadership(pool: PgPool) {
     let worker_b = Uuid::new_v4();
 
     // Worker A wins.
-    let a_won = try_elect(&pool, worker_a, "refresh_role", 30).await.unwrap();
+    let a_won = try_elect(&pool, worker_a, "refresh_role", 30)
+        .await
+        .unwrap();
     assert!(a_won);
 
     // Worker A refreshes.
-    let a_refreshed = try_elect(&pool, worker_a, "refresh_role", 30).await.unwrap();
-    assert!(a_refreshed, "leader should be able to refresh its own lease");
+    let a_refreshed = try_elect(&pool, worker_a, "refresh_role", 30)
+        .await
+        .unwrap();
+    assert!(
+        a_refreshed,
+        "leader should be able to refresh its own lease"
+    );
 
     // Worker B still can't win.
-    let b_won = try_elect(&pool, worker_b, "refresh_role", 30).await.unwrap();
+    let b_won = try_elect(&pool, worker_b, "refresh_role", 30)
+        .await
+        .unwrap();
     assert!(!b_won, "B should still lose after A refreshes");
 }
 

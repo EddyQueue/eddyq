@@ -2,7 +2,7 @@ declare global {
   interface Window { __EDDYQ_API_BASE__: string }
 }
 
-const base = (): string => window.__EDDYQ_API_BASE__ ?? '/board';
+const base = (): string => window.__EDDYQ_API_BASE__ ?? '/wakeboard';
 
 async function req<T>(path: string, method = 'GET'): Promise<T> {
   const res = await fetch(`${base()}${path}`, { method });

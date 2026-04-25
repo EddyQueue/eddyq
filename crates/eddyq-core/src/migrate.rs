@@ -74,14 +74,12 @@ pub struct MigrateReport {
 ///
 /// **Policy:** append-only from v0.1.0 onward. Never edit an applied
 /// migration's SQL — add a new one. Pre-v0.1.0 we're still collapsing.
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 20_260_421_000_001,
-        name: "init",
-        up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
-        down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
-    },
-];
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 20_260_421_000_001,
+    name: "init",
+    up_sql: include_str!("../migrations/20260421000001_init.up.sql"),
+    down_sql: include_str!("../migrations/20260421000001_init.down.sql"),
+}];
 
 /// Fresh-install DDL for the tracking table: composite PK `(line, version)`
 /// so each line has an independent applied-version history.

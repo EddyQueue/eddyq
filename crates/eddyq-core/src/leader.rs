@@ -1,6 +1,6 @@
+use crate::error::Result;
 use sqlx::PgPool;
 use uuid::Uuid;
-use crate::error::Result;
 
 pub const MAINTENANCE_ROLE: &str = "maintenance";
 
@@ -11,7 +11,12 @@ pub(crate) const LEADER_RESIGN_CHANNEL: &str = "eddyq_leader_resign";
 
 /// Try to win or refresh leadership. Returns true if this worker_id is now leader.
 /// Single upsert handles: first boot (insert), lease expired (take over), already leader (refresh), other leader active (no-op).
-pub async fn try_elect(pool: &PgPool, worker_id: Uuid, role: &str, lease_secs: u64) -> Result<bool> {
+pub async fn try_elect(
+    pool: &PgPool,
+    worker_id: Uuid,
+    role: &str,
+    lease_secs: u64,
+) -> Result<bool> {
     // The CASE logic: expired → take over; same worker → refresh; other valid leader → keep theirs
     let row: Option<(Uuid,)> = sqlx::query_as(r#"
         INSERT INTO eddyq_leader (role, worker_id, expires_at, elected_at)

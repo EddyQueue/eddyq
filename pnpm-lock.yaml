@@ -17,15 +17,15 @@ importers:
 
   examples/nestjs-basic:
     dependencies:
-      '@eddyq/board':
-        specifier: workspace:*
-        version: link:../../packages/board
       '@eddyq/nestjs':
         specifier: workspace:*
         version: link:../../packages/nestjs
       '@eddyq/queue':
         specifier: workspace:*
         version: link:../../packages/queue
+      '@eddyq/wakeboard':
+        specifier: workspace:*
+        version: link:../../packages/wakeboard
       '@nestjs/common':
         specifier: ^11.0.0
         version: 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -49,7 +49,44 @@ importers:
         specifier: ^5.4.0
         version: 5.9.3
 
-  packages/board:
+  packages/nestjs:
+    dependencies:
+      '@eddyq/queue':
+        specifier: workspace:*
+        version: link:../queue
+      '@nestjs/common':
+        specifier: ^10 || ^11
+        version: 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core':
+        specifier: ^10 || ^11
+        version: 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@11.1.19)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.39
+      reflect-metadata:
+        specifier: ^0.2.0
+        version: 0.2.2
+      rxjs:
+        specifier: ^7.8.0
+        version: 7.8.2
+      typedoc:
+        specifier: ^0.28.0
+        version: 0.28.19(typescript@5.9.3)
+
+  packages/queue:
+    devDependencies:
+      '@napi-rs/cli':
+        specifier: ^3.0.0
+        version: 3.6.2(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)(@types/node@20.19.39)
+      pg:
+        specifier: ^8.20.0
+        version: 8.20.0
+      typedoc:
+        specifier: ^0.28.0
+        version: 0.28.19(typescript@5.9.3)
+
+  packages/wakeboard:
     dependencies:
       '@eddyq/nestjs':
         specifier: workspace:*
@@ -100,43 +137,6 @@ importers:
       vite:
         specifier: ^6.0.0
         version: 6.4.2(@types/node@20.19.39)(jiti@1.21.7)(yaml@2.8.3)
-
-  packages/nestjs:
-    dependencies:
-      '@eddyq/queue':
-        specifier: workspace:*
-        version: link:../queue
-      '@nestjs/common':
-        specifier: ^10 || ^11
-        version: 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
-      '@nestjs/core':
-        specifier: ^10 || ^11
-        version: 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@11.1.19)(reflect-metadata@0.2.2)(rxjs@7.8.2)
-    devDependencies:
-      '@types/node':
-        specifier: ^20
-        version: 20.19.39
-      reflect-metadata:
-        specifier: ^0.2.0
-        version: 0.2.2
-      rxjs:
-        specifier: ^7.8.0
-        version: 7.8.2
-      typedoc:
-        specifier: ^0.28.0
-        version: 0.28.19(typescript@5.9.3)
-
-  packages/queue:
-    devDependencies:
-      '@napi-rs/cli':
-        specifier: ^3.0.0
-        version: 3.6.2(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)(@types/node@20.19.39)
-      pg:
-        specifier: ^8.20.0
-        version: 8.20.0
-      typedoc:
-        specifier: ^0.28.0
-        version: 0.28.19(typescript@5.9.3)
 
 packages:
 

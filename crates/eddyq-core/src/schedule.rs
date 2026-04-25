@@ -117,10 +117,7 @@ pub struct SyncReport {
 /// Reconcile DB schedules against a code-declared list. Treats the declared
 /// list as authoritative: each entry is upserted, and any DB schedule whose
 /// name is NOT in the list is deleted. Idempotent — safe to run on every boot.
-pub async fn sync_schedules(
-    pool: &PgPool,
-    declared: &[ScheduleDeclaration],
-) -> Result<SyncReport> {
+pub async fn sync_schedules(pool: &PgPool, declared: &[ScheduleDeclaration]) -> Result<SyncReport> {
     // Pre-validate every cron expression and compute next_run_at upfront so a
     // bad entry fails the whole sync without partially mutating state.
     let mut prepared = Vec::with_capacity(declared.len());
@@ -168,12 +165,11 @@ pub async fn sync_schedules(
     }
 
     let names: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
-    let deleted: Vec<(String,)> = sqlx::query_as(
-        "DELETE FROM eddyq_schedules WHERE name <> ALL($1) RETURNING name",
-    )
-    .bind(&names)
-    .fetch_all(&mut *tx)
-    .await?;
+    let deleted: Vec<(String,)> =
+        sqlx::query_as("DELETE FROM eddyq_schedules WHERE name <> ALL($1) RETURNING name")
+            .bind(&names)
+            .fetch_all(&mut *tx)
+            .await?;
 
     tx.commit().await?;
 

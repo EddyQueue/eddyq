@@ -1,0 +1,1 @@
+export const WAKEBOARD_OPTIONS = Symbol('WAKEBOARD_OPTIONS');

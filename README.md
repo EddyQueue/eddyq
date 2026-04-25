@@ -31,7 +31,7 @@ crates/
 packages/
   queue/           # @eddyq/queue — TS wrapper
   nestjs/          # @eddyq/nestjs — NestJS module + decorators
-  dashboard/       # web UI
+  wakeboard/       # @eddyq/wakeboard — web UI (Svelte SPA + NestJS module)
 docs/decisions/    # ADRs
 benches/           # benchmark harness vs sqlxmq, graphile-worker, BullMQ
 ```

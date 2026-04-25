@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::{
     QueueConfig,
-    fetch::{ClaimedJob, claim_batch, mark_completed, mark_failed, sweep_stale, update_heartbeat_batch},
+    fetch::{
+        ClaimedJob, claim_batch, mark_completed, mark_failed, sweep_stale, update_heartbeat_batch,
+    },
     job::{JobContext, JobId},
     leader::{self, LEADER_RESIGN_CHANNEL, MAINTENANCE_ROLE},
     worker::WorkerRegistry,
@@ -397,8 +399,8 @@ async fn leader_loop(
     shutdown: CancellationToken,
 ) {
     info!(%worker_id, "eddyq leader loop started");
-    let refresh_interval = Duration::from_secs(config.leader_lease_secs / 3)
-        .max(Duration::from_secs(5));
+    let refresh_interval =
+        Duration::from_secs(config.leader_lease_secs / 3).max(Duration::from_secs(5));
     let mut interval = tokio::time::interval(refresh_interval);
 
     // Subscribe to peer-resignation NOTIFYs so we can fire an immediate election
@@ -408,12 +410,18 @@ async fn leader_loop(
         Ok(mut l) => match l.listen(LEADER_RESIGN_CHANNEL).await {
             Ok(()) => Some(l),
             Err(err) => {
-                warn!(?err, "leader-resign LISTEN setup failed; relying on tick-driven elections");
+                warn!(
+                    ?err,
+                    "leader-resign LISTEN setup failed; relying on tick-driven elections"
+                );
                 None
             }
         },
         Err(err) => {
-            warn!(?err, "leader-resign LISTEN connection failed; relying on tick-driven elections");
+            warn!(
+                ?err,
+                "leader-resign LISTEN connection failed; relying on tick-driven elections"
+            );
             None
         }
     };
@@ -422,7 +430,9 @@ async fn leader_loop(
         let pool = pool.clone();
         let was = was.clone();
         async move {
-            match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs).await {
+            match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs)
+                .await
+            {
                 Ok(won) => {
                     let prev = was.swap(won, Ordering::Relaxed);
                     if won && !prev {
@@ -446,11 +456,15 @@ async fn leader_loop(
     loop {
         // Build the recv future inline; if no listener we await a never-ready
         // future so the tokio::select! still has a valid arm.
-        let recv: std::pin::Pin<Box<dyn std::future::Future<Output = sqlx::Result<sqlx::postgres::PgNotification>> + Send>> =
-            match resign_listener.as_mut() {
-                Some(l) => Box::pin(l.recv()),
-                None => Box::pin(std::future::pending()),
-            };
+        let recv: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = sqlx::Result<sqlx::postgres::PgNotification>>
+                    + Send,
+            >,
+        > = match resign_listener.as_mut() {
+            Some(l) => Box::pin(l.recv()),
+            None => Box::pin(std::future::pending()),
+        };
 
         tokio::select! {
             biased;
