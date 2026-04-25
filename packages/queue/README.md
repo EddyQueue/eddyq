@@ -142,6 +142,7 @@ next surviving worker.
 | `pauseQueue / resumeQueue` | Same, for a named queue. |
 | `setQueueTimeout(queue, ms \| null)` | Default per-job timeout on this queue. |
 | `addSchedule(name, cron, kind, payload, opts?)` | Upsert a cron schedule. 6-field cron (`sec min hour dom month dow`). `opts` covers `priority`, `maxAttempts`. |
+| `syncSchedules(declared)` | Reconcile DB against a declared list — upserts each entry, deletes any schedule not in the list. Idempotent; the boot-time pattern when schedules are managed in code. |
 | `removeSchedule(name)` / `setScheduleEnabled(name, enabled)` | Delete or toggle a schedule. |
 | `listSchedules()` / `listNamedQueues()` / `listGroups()` | Read the admin state. |
 | `getStats()` / `listJobs(filter?, pagination?)` | Dashboard-oriented reads. |

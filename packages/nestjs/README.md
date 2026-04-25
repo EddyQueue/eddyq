@@ -184,44 +184,21 @@ See `@eddyq/queue` for the full method list: `enqueue`, `cancel`, `getStats`,
 
 ## Cron schedules
 
-Declare schedules in module config — eddyq reconciles them against the DB at
-boot, so the code is the source of truth. Adding an entry inserts it; removing
-one deletes it. The cron field is the 6-field dialect (`sec min hour dom month
-dow`). `next_run_at` is preserved across redeploys when the cron is unchanged,
-so an imminent tick won't be reset.
+Declare them in `forRoot`. The list is reconciled at boot — added entries are
+upserted, removed ones are deleted. 6-field cron (`sec min hour dom month dow`).
 
 ```ts
 import { EddyqModule, type ScheduleDeclaration } from "@eddyq/nestjs";
 
 const schedules: ScheduleDeclaration[] = [
-  {
-    name: "daily-report",
-    cronExpr: "0 0 8 * * *",     // every day at 08:00:00 UTC
-    kind: "report.generate",
-    payload: { scope: "daily" },
-    priority: 5,
-  },
+  { name: "daily-report", cronExpr: "0 0 8 * * *", kind: "report.generate", payload: { scope: "daily" } },
 ];
 
-EddyqModule.forRoot({
-  databaseUrl: process.env.DATABASE_URL!,
-  schedules,
-});
+EddyqModule.forRoot({ databaseUrl: process.env.DATABASE_URL!, schedules });
 ```
 
-The scheduler runs with single-leader election (Postgres-backed lease) so N
-replicas never double-fire a tick, and uses skip-missed semantics — if the
-cluster was down for an hour against a minute-interval cron, you get one
-catch-up enqueue, not sixty. On graceful shutdown the leader resigns via
-`pg_notify` so a peer takes over within milliseconds rather than waiting for
-the lease to expire.
-
-> Omitting `schedules` leaves the DB untouched. Pass `[]` to delete every
-> schedule. The declared list is **authoritative** — any DB schedule whose
-> `name` isn't in the list is removed, including ones added by older deploys
-> or imperative `addSchedule` calls. If you need ad-hoc schedules outside this
-> list, manage them entirely via `addSchedule` and don't pass `schedules` at
-> all.
+Single-leader election with skip-missed semantics, so N replicas never
+double-fire and a long outage doesn't replay every missed tick.
 
 ## Transactional enqueue
 

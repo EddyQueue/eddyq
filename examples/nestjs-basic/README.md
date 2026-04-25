@@ -5,7 +5,7 @@ every real queue-using app needs:
 
 - **A controller that enqueues a job** → **a processor that handles it**
   (the `email/` module)
-- **A service that registers a cron schedule** → **a processor that handles
+- **A cron schedule declared in module config** → **a processor that handles
   the scheduled job** (the `reports/` module)
 
 Wrapped in the Nest feature-module pattern, with separate **API** and
@@ -25,9 +25,8 @@ src/
 │   ├── email.controller.ts     # POST /email/send → queue.enqueue("send.email", ...)
 │   └── email.processor.ts      # @JobHandler("send.email")
 │
-└── reports/                    # feature: cron registration, processor handles
+└── reports/                    # feature: handler for the cron-scheduled job
     ├── reports.module.ts
-    ├── reports.service.ts      # onApplicationBootstrap → queue.addSchedule(...)
     └── reports.processor.ts    # @JobHandler("report.generate")
 ```
 
@@ -88,8 +87,8 @@ curl -X POST http://localhost:3000/email/send-bulk \
 Watch the worker terminal — you'll see:
 
 - `EmailProcessor` firing when the enqueued job is picked up
-- `ReportsProcessor` firing every 10s from the cron registered by
-  `ReportsService.onApplicationBootstrap`
+- `EddyqModule` logging `synced schedules: upserted 1` on boot
+- `ReportsProcessor` firing on the `daily-report` cron — change to `*/10 * * * * *` if you want to watch it locally
 
 ## The patterns this shows
 
@@ -139,28 +138,19 @@ export class EmailProcessor {
 }
 ```
 
-### 4. Cron schedule registered at bootstrap
+### 4. Cron schedules declared in module config
 
 ```ts
-// reports/reports.service.ts
-@Injectable()
-export class ReportsService implements OnApplicationBootstrap {
-  constructor(@InjectEddyq() private readonly queue: Eddyq) {}
-
-  async onApplicationBootstrap() {
-    // 6-field cron: `sec min hour dom month dow`
-    await this.queue.addSchedule(
-      "daily-report",
-      "*/10 * * * * *",              // every 10s for demo; use "0 0 9 * * *" for 09:00 daily
-      "report.generate",
-      { scope: "daily" },
-    );
-  }
-}
+// workers.module.ts
+EddyqModule.forRoot({
+  databaseUrl: process.env.EDDYQ_DATABASE_URL!,
+  schedules: [
+    { name: "daily-report", cronExpr: "0 0 8 * * *", kind: "report.generate", payload: { scope: "daily" } },
+  ],
+});
 ```
 
-`addSchedule` is idempotent (upsert on `name`), so re-registering on every
-boot is the intended pattern.
+Reconciled against the DB at boot — added entries are upserted, removed ones deleted.
 
 ### 5. Two processes, one image
 
