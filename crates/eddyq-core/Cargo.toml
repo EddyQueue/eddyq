@@ -11,6 +11,7 @@ authors.workspace = true
 readme = "README.md"
 keywords = ["queue", "postgres", "background-jobs", "worker", "async"]
 categories = ["asynchronous", "database"]
+publish = false
 
 [lints]
 workspace = true

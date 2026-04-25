@@ -32,7 +32,7 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release --manifest-path=../../Cargo.toml --package eddyq-napi --output-dir .",
+    "build": "napi build --platform --release --strip --manifest-path=../../Cargo.toml --package eddyq-napi --output-dir .",
     "build:debug": "napi build --platform --manifest-path=../../Cargo.toml --package eddyq-napi --output-dir .",
     "create-npm-dirs": "napi create-npm-dirs",
     "artifacts": "napi artifacts",

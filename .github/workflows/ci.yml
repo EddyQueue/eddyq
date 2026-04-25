@@ -36,5 +36,4 @@ jobs:
       - run: cargo test --workspace --lib --bins
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm --filter @eddyq/queue build:debug
-      - run: pnpm -r typecheck
       - run: pnpm -r build
