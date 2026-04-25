@@ -44,7 +44,7 @@ jobs:
             target: aarch64-apple-darwin
             build: pnpm -C packages/queue build --target aarch64-apple-darwin
 
-          - host: macos-13
+          - host: macos-latest
             target: x86_64-apple-darwin
             build: pnpm -C packages/queue build --target x86_64-apple-darwin
 
@@ -72,7 +72,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -87,7 +87,7 @@ jobs:
           targets: ${{ matrix.settings.target }}
 
       - name: Cargo cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -116,7 +116,7 @@ jobs:
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.settings.target }}
           path: packages/queue/${{ env.APP_NAME }}.*.node
@@ -136,7 +136,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -175,7 +175,7 @@ jobs:
           npm --prefix packages/nestjs version "$V" --no-git-tag-version --allow-same-version
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: packages/queue/artifacts
 
