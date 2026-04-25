@@ -40,7 +40,7 @@ jobs:
       fail-fast: false
       matrix:
         settings:
-          - host: macos-14
+          - host: macos-latest
             target: aarch64-apple-darwin
             build: pnpm -C packages/queue build -- --target aarch64-apple-darwin
 
@@ -54,23 +54,19 @@ jobs:
 
           - host: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
             build: pnpm -C packages/queue build -- --target x86_64-unknown-linux-gnu --use-napi-cross
 
           - host: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust-cross:lts-debian-aarch64
             build: pnpm -C packages/queue build -- --target aarch64-unknown-linux-gnu --use-napi-cross
 
           - host: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-alpine
-            build: pnpm -C packages/queue build -- --target x86_64-unknown-linux-musl
+            build: pnpm -C packages/queue build -- --target x86_64-unknown-linux-musl -x
 
           - host: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            docker: ghcr.io/napi-rs/napi-rs/nodejs-rust-cross:lts-alpine-aarch64
-            build: pnpm -C packages/queue build -- --target aarch64-unknown-linux-musl
+            build: pnpm -C packages/queue build -- --target aarch64-unknown-linux-musl -x
 
     steps:
       - uses: actions/checkout@v5
@@ -79,14 +75,12 @@ jobs:
         uses: pnpm/action-setup@v4
 
       - name: Setup Node
-        if: ${{ !matrix.settings.docker }}
         uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: pnpm
 
       - name: Setup Rust toolchain
-        if: ${{ !matrix.settings.docker }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95"
@@ -103,26 +97,10 @@ jobs:
           key: cargo-${{ matrix.settings.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-${{ matrix.settings.target }}-
 
-      - name: Install dependencies (host)
-        if: ${{ !matrix.settings.docker }}
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile=false
 
-      - name: Build (docker)
-        if: ${{ matrix.settings.docker }}
-        uses: addnab/docker-run-action@v3
-        with:
-          image: ${{ matrix.settings.docker }}
-          options: |
-            --user 0:0
-            -v ${{ github.workspace }}:/build
-            -w /build
-          run: |
-            corepack enable
-            pnpm install --frozen-lockfile=false
-            ${{ matrix.settings.build }}
-
-      - name: Build (host)
-        if: ${{ !matrix.settings.docker }}
+      - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash
 
