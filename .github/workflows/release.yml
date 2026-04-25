@@ -100,9 +100,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile=false
 
+      # `-x` matrix rows (musl) cross-compile via cargo-zigbuild, which needs zig on PATH.
+      - name: Setup zig
+        if: contains(matrix.settings.build, ' -x')
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
       - name: Build
         run: ${{ matrix.settings.build }}
         shell: bash
+        env:
+          # ring 0.17 requires __ARM_ARCH; the napi-cross gcc toolchain does
+          # not auto-define it. See briansmith/ring#1728.
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
