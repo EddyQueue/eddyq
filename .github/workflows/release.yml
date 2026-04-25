@@ -123,6 +123,21 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      # napi build generates index.js / index.d.ts alongside the .node binary.
+      # They're identical across platforms, so we upload them from one row only.
+      # The publish job needs them so @eddyq/nestjs's tsc can resolve types
+      # re-exported through @eddyq/queue's lib.d.ts.
+      - name: Upload JS bindings (one platform)
+        if: matrix.settings.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: bindings-js
+          path: |
+            packages/queue/index.js
+            packages/queue/index.d.ts
+          if-no-files-found: error
+          retention-days: 3
+
   publish:
     name: publish to npm
     needs: [build]
@@ -187,6 +202,15 @@ jobs:
 
       - name: List artifacts for sanity
         run: ls -R packages/queue/npm
+
+      # @eddyq/queue's lib.d.ts re-exports types from ./index.js, which is
+      # napi-generated — without it tsc can't resolve @eddyq/queue's type
+      # surface from inside @eddyq/nestjs.
+      - name: Restore JS bindings into @eddyq/queue
+        uses: actions/download-artifact@v8
+        with:
+          name: bindings-js
+          path: packages/queue
 
       - name: Build @eddyq/nestjs
         run: pnpm -C packages/nestjs build
