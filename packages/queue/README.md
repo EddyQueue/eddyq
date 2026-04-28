@@ -2,8 +2,6 @@
 
 Node.js client for [eddyq](https://github.com/eddyqueue/eddyq) — a Rust + Postgres job queue.
 
-**Pre-alpha.** APIs are unstable; the schema is not yet frozen.
-
 ## Install
 
 ```bash
