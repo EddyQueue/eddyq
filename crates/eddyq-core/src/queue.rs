@@ -35,6 +35,10 @@ pub struct QueueConfig {
     /// Delete cancelled jobs older than this. `None` = keep forever.
     /// Default: 7 days.
     pub cancelled_retention: Option<Duration>,
+    /// Delete finalized batch rows (`eddyq_batches`) older than this. `None`
+    /// keeps them forever (table grows unbounded for batch-heavy workloads).
+    /// Default: 7 days.
+    pub batch_retention: Option<Duration>,
     /// When `true`, do not spawn a LISTEN/NOTIFY listener. Use this when connected
     /// through PgBouncer in transaction-pooling mode (LISTEN is incompatible).
     pub poll_only: bool,
@@ -60,6 +64,7 @@ impl Default for QueueConfig {
             completed_retention: Some(Duration::from_secs(24 * 60 * 60)), // 24h
             failed_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             cancelled_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
+            batch_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             poll_only: false,
             leader_lease_secs: 30,
         }
@@ -186,6 +191,13 @@ impl QueueBuilder {
     /// Retention for cancelled jobs. `None` keeps them forever.
     pub fn cancelled_retention(mut self, d: Option<Duration>) -> Self {
         self.config.cancelled_retention = d;
+        self
+    }
+
+    /// Retention for finalized batch rows. `None` keeps them forever — the
+    /// `eddyq_batches` table grows unbounded for batch-heavy workloads.
+    pub fn batch_retention(mut self, d: Option<Duration>) -> Self {
+        self.config.batch_retention = d;
         self
     }
 

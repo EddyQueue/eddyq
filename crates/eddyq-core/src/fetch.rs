@@ -450,14 +450,20 @@ pub struct Retention {
     pub completed_secs: Option<u64>,
     pub failed_secs: Option<u64>,
     pub cancelled_secs: Option<u64>,
+    /// Delete finalized batch rows (`state='complete'`) past this age. Pending
+    /// batches are never reaped. Job rows hold a `batch_id` FK with
+    /// `ON DELETE SET NULL`, so deleting a batch row is safe regardless of
+    /// whether its jobs have already been reaped.
+    pub batch_secs: Option<u64>,
 }
 
-/// Delete finalized jobs older than the per-state retention. Returns
-/// (completed_deleted, failed_deleted, cancelled_deleted).
-pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u64)> {
+/// Delete finalized rows older than the configured retention. Returns
+/// (completed_jobs, failed_jobs, cancelled_jobs, batches).
+pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u64, u64)> {
     let mut completed = 0u64;
     let mut failed = 0u64;
     let mut cancelled = 0u64;
+    let mut batches = 0u64;
 
     for (state, maybe_secs, out) in [
         ("completed", retention.completed_secs, &mut completed),
@@ -482,7 +488,24 @@ pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u
         *out = res.rows_affected();
     }
 
-    Ok((completed, failed, cancelled))
+    if let Some(secs) = retention.batch_secs {
+        let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+        // Uses eddyq_batches_finalized partial index.
+        let res = sqlx::query(
+            r#"
+            DELETE FROM eddyq_batches
+             WHERE state = 'complete'
+               AND finalized_at IS NOT NULL
+               AND finalized_at < NOW() - make_interval(secs => $1)
+            "#,
+        )
+        .bind(secs)
+        .execute(pool)
+        .await?;
+        batches = res.rows_affected();
+    }
+
+    Ok((completed, failed, cancelled, batches))
 }
 
 pub async fn mark_completed(

@@ -568,6 +568,7 @@ async fn cleanup_loop(
     if config.completed_retention.is_none()
         && config.failed_retention.is_none()
         && config.cancelled_retention.is_none()
+        && config.batch_retention.is_none()
     {
         debug!("cleanup disabled (all retentions None)");
         return;
@@ -577,6 +578,7 @@ async fn cleanup_loop(
         completed_secs: config.completed_retention.map(|d| d.as_secs()),
         failed_secs: config.failed_retention.map(|d| d.as_secs()),
         cancelled_secs: config.cancelled_retention.map(|d| d.as_secs()),
+        batch_secs: config.batch_retention.map(|d| d.as_secs()),
     };
     let mut interval = tokio::time::interval(config.cleanup_interval);
     interval.tick().await;
@@ -589,10 +591,10 @@ async fn cleanup_loop(
                     continue;
                 }
                 match crate::fetch::cleanup(&pool, retention).await {
-                    Ok((0, 0, 0)) => {}
-                    Ok((c, f, x)) => info!(
-                        completed = c, failed = f, cancelled = x,
-                        "cleanup deleted old finalized jobs"
+                    Ok((0, 0, 0, 0)) => {}
+                    Ok((c, f, x, b)) => info!(
+                        completed = c, failed = f, cancelled = x, batches = b,
+                        "cleanup deleted old finalized rows"
                     ),
                     Err(err) => warn!(?err, "cleanup failed"),
                 }

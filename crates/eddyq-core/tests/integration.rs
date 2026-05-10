@@ -107,6 +107,7 @@ fn fast_config() -> QueueConfig {
         completed_retention: None,
         failed_retention: None,
         cancelled_retention: None,
+        batch_retention: None,
         poll_only: false,
         leader_lease_secs: 30,
     }
@@ -1556,9 +1557,10 @@ async fn cleanup_deletes_old_finalized_jobs(pool: PgPool) {
         completed_secs: Some(3600),
         failed_secs: Some(3600),
         cancelled_secs: Some(3600),
+        batch_secs: None,
     };
 
-    let (c, f, x) = cleanup(&pool, retention).await.unwrap();
+    let (c, f, x, _) = cleanup(&pool, retention).await.unwrap();
     assert_eq!(c, 1, "one old completed should be deleted");
     assert_eq!(f, 1, "one old failed should be deleted");
     assert_eq!(x, 1, "one old cancelled should be deleted");
@@ -1586,17 +1588,18 @@ async fn cleanup_respects_none_retention(pool: PgPool) {
     .await
     .unwrap();
 
-    let (c, f, x) = cleanup(
+    let (c, f, x, b) = cleanup(
         &pool,
         Retention {
             completed_secs: None,
             failed_secs: None,
             cancelled_secs: None,
+            batch_secs: None,
         },
     )
     .await
     .unwrap();
-    assert_eq!((c, f, x), (0, 0, 0));
+    assert_eq!((c, f, x, b), (0, 0, 0, 0));
 
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs")
         .fetch_one(&pool)
@@ -1622,17 +1625,18 @@ async fn cleanup_does_not_touch_pending_or_running(pool: PgPool) {
     .await
     .unwrap();
 
-    let (c, f, x) = cleanup(
+    let (c, f, x, b) = cleanup(
         &pool,
         Retention {
             completed_secs: Some(1),
             failed_secs: Some(1),
             cancelled_secs: Some(1),
+            batch_secs: Some(1),
         },
     )
     .await
     .unwrap();
-    assert_eq!((c, f, x), (0, 0, 0));
+    assert_eq!((c, f, x, b), (0, 0, 0, 0));
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs")
         .fetch_one(&pool)
         .await
@@ -1641,6 +1645,258 @@ async fn cleanup_does_not_touch_pending_or_running(pool: PgPool) {
         remaining, 2,
         "pending and running must never be deleted by cleanup"
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_deletes_old_finalized_batches(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Three batches: an old complete, a young complete, an old pending.
+    // Only the old complete should be reaped.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_batches (state, total, completed, finalized_at)
+        VALUES
+            ('complete', 1, 1, NOW() - INTERVAL '2 hours'),
+            ('complete', 1, 1, NOW() - INTERVAL '30 seconds'),
+            ('pending',  1, 0, NULL)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, _, _, b) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: None,
+            failed_secs: None,
+            cancelled_secs: None,
+            batch_secs: Some(3600),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(b, 1, "one old complete batch should be deleted");
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_batches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_does_not_touch_pending_batches(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // A pending batch, however ancient, must never be reaped — its
+    // jobs may still be in flight or its callback claim may not have fired.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_batches (state, total, finalized_at)
+        VALUES ('pending', 5, NULL)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, _, _, b) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: None,
+            failed_secs: None,
+            cancelled_secs: None,
+            batch_secs: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(b, 0);
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_batches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_jobs_and_batches_in_one_call(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Jobs and batches both old enough to be reaped. Cleanup should report
+    // both counters in the same call.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('j_done', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 hours'),
+            ('j_fail', '{}'::jsonb, 'failed',    3, 3, NOW() - INTERVAL '2 hours')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_batches (state, total, completed, finalized_at)
+        VALUES ('complete', 1, 1, NOW() - INTERVAL '2 hours')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, f, x, b) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: Some(3600),
+            failed_secs: Some(3600),
+            cancelled_secs: Some(3600),
+            batch_secs: Some(3600),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((c, f, x, b), (1, 1, 0, 1));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_batch_only_does_not_touch_jobs(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Old job + old batch. Only batch retention is configured — the job
+    // should survive even though it's well past any reasonable threshold.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES ('j_done', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '365 days')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_batches (state, total, completed, finalized_at)
+        VALUES ('complete', 1, 1, NOW() - INTERVAL '365 days')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, f, x, b) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: None,
+            failed_secs: None,
+            cancelled_secs: None,
+            batch_secs: Some(3600),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((c, f, x, b), (0, 0, 0, 1));
+
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs, 1,
+        "jobs must not be reaped when only batch retention is set"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_batch_delete_nulls_surviving_job_batch_id(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Insert a batch whose job is not yet reapable (recent finalized_at) but
+    // the batch itself is past retention. The FK is `ON DELETE SET NULL`, so
+    // the surviving job's `batch_id` should be NULL after cleanup.
+    let batch_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO eddyq_batches (state, total, completed, finalized_at)
+        VALUES ('complete', 1, 1, NOW() - INTERVAL '2 hours')
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at, batch_id)
+        VALUES ('j_done', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '30 seconds', $1)
+        "#,
+    )
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, _, _, b) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: Some(86_400), // 24h — job is too young to reap
+            failed_secs: None,
+            cancelled_secs: None,
+            batch_secs: Some(3600), // 1h — batch is reapable
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(b, 1);
+
+    let surviving_batch_id: Option<i64> =
+        sqlx::query_scalar("SELECT batch_id FROM eddyq_jobs WHERE kind = 'j_done'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        surviving_batch_id, None,
+        "FK ON DELETE SET NULL should clear batch_id on surviving job"
+    );
+}
+
+#[test]
+fn default_config_has_seven_day_batch_retention() {
+    use eddyq_core::QueueConfig;
+    use std::time::Duration;
+
+    let cfg = QueueConfig::default();
+    assert_eq!(
+        cfg.batch_retention,
+        Some(Duration::from_secs(7 * 24 * 60 * 60))
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_batch_respects_none_retention(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_batches (state, total, completed, finalized_at)
+        VALUES ('complete', 1, 1, NOW() - INTERVAL '365 days')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, _, _, b) = cleanup(&pool, Retention::default()).await.unwrap();
+    assert_eq!(b, 0);
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_batches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 1);
 }
 
 #[test]

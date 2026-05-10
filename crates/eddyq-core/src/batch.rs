@@ -183,7 +183,8 @@ pub(crate) async fn settle_terminal(
     };
 
     let conn: &mut PgConnection = tx;
-    let row: Option<(i32, i32, i32, i32, Option<DateTime<Utc>>)> = sqlx::query_as(
+    type SettleRow = (i32, i32, i32, i32, Option<DateTime<Utc>>);
+    let row: Option<SettleRow> = sqlx::query_as(
         r#"
         UPDATE eddyq_batches
            SET completed = completed + $2,

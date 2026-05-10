@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# This hook was set by cargo-husky v1: https://github.com/rhysd/cargo-husky#readme
+# Edit .cargo-husky/hooks/pre-commit and run `cargo test` to update.
+set -euo pipefail
+
+# Auto-format first, then re-stage any already-staged files the formatter
+# touched. `git update-index --again` only refreshes paths that were already
+# in the index, so unstaged work isn't pulled into the commit.
+just fmt
+git update-index --again
+
+just lint

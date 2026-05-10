@@ -36,3 +36,9 @@ ALTER TABLE eddyq_jobs VALIDATE CONSTRAINT eddyq_jobs_batch_id_fkey;
 CREATE INDEX eddyq_jobs_batch
     ON eddyq_jobs (batch_id)
     WHERE batch_id IS NOT NULL;
+
+-- Partial index used by `fetch::cleanup` to reap finalized batches efficiently.
+-- Pending batches (callback hasn't fired) are excluded so the index stays small.
+CREATE INDEX eddyq_batches_finalized
+    ON eddyq_batches (finalized_at)
+    WHERE state = 'complete';

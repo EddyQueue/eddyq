@@ -248,6 +248,11 @@ pub struct StartOptions {
     /// Pass `-1` to keep forever.
     pub cancelled_retention_secs: Option<i64>,
 
+    /// Retention (seconds) for finalized batch rows (`eddyq_batches`).
+    /// Default 604_800 (7d). Pass `-1` to keep forever — the table will
+    /// grow unbounded for batch-heavy workloads.
+    pub batch_retention_secs: Option<i64>,
+
     /// Leader-election lease in seconds — the elected maintenance node
     /// (scheduler + cleanup) refreshes every `leaseSecs / 3` seconds.
     /// Default 30.
@@ -955,6 +960,9 @@ impl Queue {
             }
             if let Some(secs) = o.cancelled_retention_secs {
                 builder = builder.cancelled_retention(retention_from_secs(secs));
+            }
+            if let Some(secs) = o.batch_retention_secs {
+                builder = builder.batch_retention(retention_from_secs(secs));
             }
             if let Some(s) = o.leader_lease_secs {
                 builder = builder.leader_lease_secs(u64::from(s));
