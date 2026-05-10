@@ -2,7 +2,7 @@
 
 > A Rust + Postgres job queue for the Node ecosystem.
 
-**Status:** Pre-alpha. Under active development. APIs are unstable and the schema is not yet frozen.
+**Status:** Beta. Running in production. APIs may change before 1.0 — pin exact versions.
 
 ## Why eddyq?
 
@@ -28,9 +28,9 @@ const { batchId } = await eddyq.enqueueBatch({
 eddyq owns its own schema and ships migrations, but **they do not run
 automatically at app boot**. Apply them via `eddyq migrate run` or a Node
 one-shot script **before** starting workers. `eddyq.start()` refuses to boot
-against a stale schema and tells you how to fix it. See
-[ADR 011](docs/decisions/011-migrations-deploy-step.md) and
-[`@eddyq/queue` README](packages/queue/README.md#migrations--deploy-step-not-auto-apply).
+against a stale schema and tells you how to fix it. See the
+[`@eddyq/queue` README](packages/queue/README.md#migrations--deploy-step-not-auto-apply)
+for the rationale.
 
 ## Workspace layout
 
@@ -44,8 +44,7 @@ packages/
   queue/           # @eddyq/queue — TS wrapper
   nestjs/          # @eddyq/nestjs — NestJS module + decorators
   wakeboard/       # @eddyq/wakeboard — web UI (Svelte SPA + NestJS module)
-docs/decisions/    # ADRs
-benches/           # benchmark harness vs sqlxmq, graphile-worker, BullMQ
+benches/           # Criterion benchmarks for the queue engine
 ```
 
 ## License
