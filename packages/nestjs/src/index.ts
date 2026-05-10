@@ -30,7 +30,11 @@ export type {
 
 export { CancelError, Eddyq, RetryError } from "@eddyq/queue";
 export type {
+  BatchEnqueueOutcome,
+  BulkEnqueueOutcome,
   ConnectOptions,
+  EnqueueBatchInput,
+  EnqueueManyItem,
   EnqueueOptions,
   EnqueueOutcome,
   Group,

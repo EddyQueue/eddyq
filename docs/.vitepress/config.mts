@@ -47,6 +47,7 @@ const nestjsSidebar = [
       { text: 'Defining workers', link: '/nestjs/workers' },
       { text: 'Injecting the queue', link: '/nestjs/injecting' },
       { text: 'Schedules', link: '/nestjs/schedules' },
+      { text: 'Batches', link: '/nestjs/batch' },
       { text: 'Lifecycle & shutdown', link: '/nestjs/lifecycle' },
       { text: 'Example app', link: '/nestjs/example' },
     ],
