@@ -43,6 +43,7 @@ async fn insert_job<J: Job>(
         .or_else(|| job.metadata())
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
     let queue = opts.queue.unwrap_or_else(|| job.queue().to_owned());
+    crate::named_queue::validate_queue_name(&queue)?;
     let scheduled_at = opts.scheduled_at.unwrap_or_else(Utc::now);
     let due_now = scheduled_at <= Utc::now();
 
@@ -199,7 +200,9 @@ async fn insert_many<J: Job>(
             job.metadata()
                 .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
         );
-        queues.push(job.queue().to_owned());
+        let q = job.queue();
+        crate::named_queue::validate_queue_name(q)?;
+        queues.push(q.to_owned());
     }
 
     let rows_inserted: (i64,) = sqlx::query_as(
@@ -295,6 +298,7 @@ impl DynEnqueue {
 }
 
 async fn insert_dyn(conn: &mut PgConnection, req: DynEnqueue) -> Result<(EnqueueResult, bool)> {
+    crate::named_queue::validate_queue_name(&req.queue)?;
     let scheduled_at = req.scheduled_at.unwrap_or_else(Utc::now);
     let due_now = scheduled_at <= Utc::now();
 
@@ -408,6 +412,7 @@ async fn insert_many_dyn(
                 .collect(),
         ));
         metadatas.push(req.metadata);
+        crate::named_queue::validate_queue_name(&req.queue)?;
         queues.push(req.queue);
         batch_ids.push(req.batch_id);
     }

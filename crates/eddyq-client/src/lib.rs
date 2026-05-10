@@ -14,9 +14,9 @@ use std::time::Duration;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 pub use eddyq_core::{
-    BatchEnqueueResult, BatchOptions, BulkEnqueueResult, Directive, DynEnqueue, EnqueueResult,
-    Error, HandlerFailure, JobContext, JobId, JobResult, JobState, Queue as CoreQueue,
-    QueueBuilder as CoreQueueBuilder, QueueConfig, Result,
+    BatchEnqueueResult, BatchOptions, BulkEnqueueResult, DEFAULT_QUEUE, Directive, DynEnqueue,
+    EnqueueResult, Error, HandlerFailure, JobContext, JobId, JobResult, JobState,
+    Queue as CoreQueue, QueueBuilder as CoreQueueBuilder, QueueConfig, Result, ShutdownMode,
     group::{Group, GroupRule, StoredRule},
     migrate::{Direction, MigrateReport, MigrationStatus},
     named_queue::NamedQueue,
@@ -221,7 +221,12 @@ impl Client {
     }
 
     /// Upsert a cron schedule. Passing the same `name` updates the existing
-    /// schedule's cron/payload/priority and resets `next_run_at` accordingly.
+    /// schedule's cron/payload/priority/queue and resets `next_run_at`
+    /// accordingly. Pass `eddyq_core::DEFAULT_QUEUE` for `queue` if the
+    /// caller has no preference.
+    // Mirrors core::upsert_schedule_raw 1:1; bundling into a struct here would
+    // not change the napi-binding signature it backs. Allowed locally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_schedule(
         &self,
         name: &str,
@@ -230,6 +235,7 @@ impl Client {
         payload: serde_json::Value,
         priority: i16,
         max_attempts: i32,
+        queue: &str,
     ) -> Result<()> {
         eddyq_core::schedule::upsert_schedule_raw(
             &self.pool,
@@ -239,6 +245,7 @@ impl Client {
             payload,
             priority,
             max_attempts,
+            queue,
         )
         .await
     }

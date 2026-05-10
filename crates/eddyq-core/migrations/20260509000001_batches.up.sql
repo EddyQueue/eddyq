@@ -42,3 +42,10 @@ CREATE INDEX eddyq_jobs_batch
 CREATE INDEX eddyq_batches_finalized
     ON eddyq_batches (finalized_at)
     WHERE state = 'complete';
+
+-- ─── Schedules: per-schedule queue ──────────────────────────────────────────
+-- Schedule fires now route to a named queue, matching jobs and `enqueue`.
+-- Without this, scheduled jobs always landed on `default`, so a worker pod
+-- subscribed to a non-default queue would silently miss its scheduled work.
+ALTER TABLE eddyq_schedules
+    ADD COLUMN queue TEXT NOT NULL DEFAULT 'default';

@@ -11,7 +11,42 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+/// Maximum length of a queue name. Bounded so an admin UI doesn't have to
+/// truncate, and so accidental dumps of long strings into a queue field
+/// (e.g. an entire URL) fail loudly at the boundary.
+pub const MAX_QUEUE_NAME_LEN: usize = 64;
+
+/// Validate a queue name. Allowed characters: ASCII letters, digits, `.`,
+/// `_`, `-`. Length 1..=MAX_QUEUE_NAME_LEN. Empty / whitespace / invalid
+/// characters return `Error::InvalidArgument`.
+///
+/// Called from every code path that writes a queue name (enqueue, schedule
+/// upsert, sync_schedules) so a single rule covers the surface.
+pub fn validate_queue_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidArgument(
+            "queue name must not be empty".into(),
+        ));
+    }
+    if name.len() > MAX_QUEUE_NAME_LEN {
+        return Err(Error::InvalidArgument(format!(
+            "queue name {:?} exceeds {} chars",
+            name, MAX_QUEUE_NAME_LEN
+        )));
+    }
+    for c in name.chars() {
+        let ok = c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-';
+        if !ok {
+            return Err(Error::InvalidArgument(format!(
+                "queue name {:?} contains invalid character {:?} (allowed: a-z A-Z 0-9 . _ -)",
+                name, c
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct NamedQueue {

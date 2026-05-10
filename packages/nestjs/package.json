@@ -18,7 +18,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "echo \"no tests yet\" && exit 0",
+    "smoke": "node smoke-register-queue.mjs",
+    "test": "node smoke-register-queue.mjs",
     "lint": "echo \"no lint yet\" && exit 0",
     "docs": "typedoc"
   },

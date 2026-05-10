@@ -486,6 +486,7 @@ async fn sync_schedules_reconciles(pool: PgPool) {
             payload: serde_json::json!({ "n": 1 }),
             priority: 0,
             max_attempts: 3,
+            queue: "default".to_string(),
         },
         ScheduleDeclaration {
             name: "beta".into(),
@@ -494,6 +495,7 @@ async fn sync_schedules_reconciles(pool: PgPool) {
             payload: serde_json::json!({ "n": 2 }),
             priority: 0,
             max_attempts: 3,
+            queue: "default".to_string(),
         },
     ];
     let report = queue.sync_schedules(&declared_v1).await.unwrap();
@@ -527,6 +529,7 @@ async fn sync_schedules_reconciles(pool: PgPool) {
         payload: serde_json::json!({ "n": 1 }),
         priority: 0,
         max_attempts: 3,
+        queue: "default".to_string(),
     }];
     let report = queue.sync_schedules(&declared_v2).await.unwrap();
     assert_eq!(report.upserted, 1);
@@ -550,6 +553,277 @@ async fn sync_schedules_reconciles(pool: PgPool) {
     assert_eq!(report.upserted, 0);
     assert_eq!(report.deleted, vec!["alpha".to_string()]);
     assert_eq!(queue.list_schedules().await.unwrap().len(), 0);
+}
+
+/// Schedule fires must land on the schedule's named queue (not always
+/// `default`). A worker subscribed only to that queue should pick the job up;
+/// the row's `queue` column must reflect the schedule's queue.
+#[sqlx::test(migrations = "./migrations")]
+async fn schedule_fires_route_to_named_queue(pool: PgPool) {
+    use eddyq_core::schedule::ScheduleDeclaration;
+
+    let queue = Queue::builder(pool.clone()).config(fast_config()).build();
+
+    let declared = vec![ScheduleDeclaration {
+        name: "reports-tick".into(),
+        cron_expr: "* * * * * * *".into(), // every second
+        kind: Count::KIND.into(),
+        payload: serde_json::json!({ "n": 0 }),
+        priority: 0,
+        max_attempts: 3,
+        queue: "reports".to_string(),
+    }];
+    queue.sync_schedules(&declared).await.unwrap();
+
+    queue.start().unwrap();
+
+    // Wait for the scheduler to fire at least one job onto the reports queue.
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM eddyq_jobs WHERE queue = 'reports' AND kind = 'count'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if n >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("schedule fire should land a row on queue=reports within 4s");
+
+    // No fires should have leaked to the default queue.
+    let on_default: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM eddyq_jobs WHERE queue = 'default' AND kind = 'count'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        on_default, 0,
+        "schedule with queue=reports must not fire onto default"
+    );
+
+    queue.shutdown().await.unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn schedule_rejects_invalid_queue_name(pool: PgPool) {
+    use eddyq_core::schedule::ScheduleDeclaration;
+
+    let queue = Queue::builder(pool.clone()).build();
+
+    // Empty queue name -> InvalidArgument.
+    let bad = vec![ScheduleDeclaration {
+        name: "x".into(),
+        cron_expr: "0 0 0 * * *".into(),
+        kind: Count::KIND.into(),
+        payload: serde_json::json!({ "n": 0 }),
+        priority: 0,
+        max_attempts: 3,
+        queue: "".to_string(),
+    }];
+    let err = queue.sync_schedules(&bad).await.unwrap_err();
+    assert!(
+        matches!(err, eddyq_core::Error::InvalidArgument(_)),
+        "empty queue name should be rejected: {err:?}"
+    );
+
+    // Whitespace / disallowed chars.
+    let bad = vec![ScheduleDeclaration {
+        name: "y".into(),
+        cron_expr: "0 0 0 * * *".into(),
+        kind: Count::KIND.into(),
+        payload: serde_json::json!({ "n": 0 }),
+        priority: 0,
+        max_attempts: 3,
+        queue: "has space".to_string(),
+    }];
+    let err = queue.sync_schedules(&bad).await.unwrap_err();
+    assert!(
+        matches!(err, eddyq_core::Error::InvalidArgument(_)),
+        "whitespace in queue name should be rejected: {err:?}"
+    );
+
+    // Sync was rejected before any DB write.
+    assert_eq!(queue.list_schedules().await.unwrap().len(), 0);
+}
+
+/// A worker that signals when it starts and holds the job for `hold` ms,
+/// optionally honoring the cancel signal it receives via JobContext (which
+/// flips on `shutdown.cancel()`). Used to drive shutdown-mode tests.
+#[derive(Clone)]
+struct SlowWorker {
+    started: Arc<tokio::sync::Notify>,
+    hold: Duration,
+}
+
+#[async_trait]
+impl Worker<Count> for SlowWorker {
+    async fn perform(&self, _job: Count, _ctx: JobContext) -> JobResult {
+        self.started.notify_waiters();
+        tokio::time::sleep(self.hold).await;
+        Ok(())
+    }
+}
+
+/// `Drain` mode: handler runs to completion, queue.shutdown returns after
+/// it does, job ends `completed`.
+#[sqlx::test(migrations = "./migrations")]
+async fn shutdown_drain_awaits_in_flight(pool: PgPool) {
+    use eddyq_core::ShutdownMode;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(SlowWorker {
+            started: started.clone(),
+            hold: Duration::from_millis(300),
+        })
+        .config(fast_config())
+        .build();
+
+    queue.enqueue(&Count { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+
+    // Wait for the handler to actually start.
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("worker should start within 2s");
+
+    let t = std::time::Instant::now();
+    queue.shutdown_with(ShutdownMode::Drain).await.unwrap();
+    let elapsed = t.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "Drain should wait for the in-flight handler (held 300ms); shutdown returned in {:?}",
+        elapsed
+    );
+
+    let state: String = sqlx::query_scalar("SELECT state FROM eddyq_jobs WHERE kind = 'count'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "completed", "Drain mode should let the job finish");
+}
+
+/// `Force` mode: handler is held in flight indefinitely, shutdown returns
+/// fast and reclaims the row to `pending` immediately (attempt incremented).
+#[sqlx::test(migrations = "./migrations")]
+async fn shutdown_force_reclaims_in_flight(pool: PgPool) {
+    use eddyq_core::ShutdownMode;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(SlowWorker {
+            started: started.clone(),
+            hold: Duration::from_secs(30), // far longer than the test
+        })
+        .config(fast_config())
+        .build();
+
+    queue.enqueue(&Count { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("worker should start within 2s");
+
+    let t = std::time::Instant::now();
+    queue.shutdown_with(ShutdownMode::Force).await.unwrap();
+    let elapsed = t.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Force should NOT wait for the in-flight handler; took {:?}",
+        elapsed
+    );
+
+    let (state, attempt): (String, i32) =
+        sqlx::query_as("SELECT state, attempt FROM eddyq_jobs WHERE kind = 'count'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "pending",
+        "Force should reclaim the in-flight row to pending immediately"
+    );
+    assert!(
+        attempt >= 1,
+        "reclaim should bump attempt count (got {attempt})"
+    );
+
+    // Group/queue running counter should be back to 0.
+    let running: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(running_count), 0) FROM eddyq_queues")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(running, 0, "queue running_count should be decremented");
+}
+
+/// `Abandon` mode: shutdown returns fast and DOES NOT touch the row.
+/// The row stays in `running` state (heartbeat sweep on another pod
+/// would recover it after `stale_after`, but we don't wait for that
+/// here — just assert the row is left alone).
+#[sqlx::test(migrations = "./migrations")]
+async fn shutdown_abandon_leaves_row_running(pool: PgPool) {
+    use eddyq_core::ShutdownMode;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(SlowWorker {
+            started: started.clone(),
+            hold: Duration::from_secs(30),
+        })
+        .config(fast_config())
+        .build();
+
+    queue.enqueue(&Count { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("worker should start within 2s");
+
+    let t = std::time::Instant::now();
+    queue.shutdown_with(ShutdownMode::Abandon).await.unwrap();
+    let elapsed = t.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "Abandon should return immediately; took {:?}",
+        elapsed
+    );
+
+    let state: String = sqlx::query_scalar("SELECT state FROM eddyq_jobs WHERE kind = 'count'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        state, "running",
+        "Abandon must NOT touch the row — heartbeat sweep recovers later"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn enqueue_rejects_invalid_queue_name(pool: PgPool) {
+    use eddyq_core::EnqueueOptions;
+
+    let queue = Queue::builder(pool.clone()).build();
+
+    let err = queue
+        .enqueue_with(
+            &Count { n: 1 },
+            EnqueueOptions {
+                queue: Some("bad name!".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, eddyq_core::Error::InvalidArgument(_)),
+        "invalid queue name should be rejected by enqueue: {err:?}"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

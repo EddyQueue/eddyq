@@ -4,7 +4,11 @@ use chrono::{DateTime, Utc};
 use cron::Schedule as CronSchedule;
 use sqlx::PgPool;
 
-use crate::{error::Result, job::Job};
+use crate::{
+    error::Result,
+    job::{DEFAULT_QUEUE, Job},
+    named_queue::validate_queue_name,
+};
 
 /// Advisory lock key used by the scheduler for leader election.
 /// Derived from ASCII "eddyqsch" (big-endian) so each eddyq subsystem has its own.
@@ -21,10 +25,14 @@ pub struct Schedule {
     pub enabled: bool,
     pub priority: i16,
     pub max_attempts: i32,
+    /// Named queue the fired job lands on. Defaults to `"default"` for back-compat
+    /// with schedules created before the column existed.
+    pub queue: String,
 }
 
 /// Upsert a recurring schedule. Re-calling with the same `name` updates the
-/// payload / cron / priority fields but preserves `last_run_at`.
+/// payload / cron / priority / queue fields but preserves `last_run_at`. The
+/// fired job lands on `J::queue()`.
 pub async fn upsert_schedule<J: Job>(
     pool: &PgPool,
     name: &str,
@@ -40,13 +48,20 @@ pub async fn upsert_schedule<J: Job>(
         payload,
         job.priority(),
         job.max_attempts(),
+        job.queue(),
     )
     .await
 }
 
 /// JSON-payload variant of `upsert_schedule` — used by language bindings and
 /// dynamic callers that don't have a typed `Job` at hand. Validates the cron
-/// expression and computes the first `next_run_at` before inserting.
+/// expression and computes the first `next_run_at` before inserting. Pass
+/// `DEFAULT_QUEUE` for `queue` if the caller has no preference.
+//
+// 8 positional args (1 over clippy's default cap). The shape mirrors
+// `addSchedule(...)` 1:1 in the Node bindings — bundling into a struct here
+// would force every language binding to construct it. Allowed locally.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_schedule_raw(
     pool: &PgPool,
     name: &str,
@@ -55,7 +70,9 @@ pub async fn upsert_schedule_raw(
     payload: serde_json::Value,
     priority: i16,
     max_attempts: i32,
+    queue: &str,
 ) -> Result<()> {
+    validate_queue_name(queue)?;
     let schedule =
         CronSchedule::from_str(cron_expr).map_err(|e| crate::error::Error::Cron(e.to_string()))?;
     let next = schedule
@@ -68,8 +85,8 @@ pub async fn upsert_schedule_raw(
     sqlx::query(
         r#"
         INSERT INTO eddyq_schedules
-            (name, kind, payload, cron_expr, next_run_at, priority, max_attempts)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (name, kind, payload, cron_expr, next_run_at, priority, max_attempts, queue)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (name) DO UPDATE
             SET kind         = EXCLUDED.kind,
                 payload      = EXCLUDED.payload,
@@ -81,6 +98,7 @@ pub async fn upsert_schedule_raw(
                                END,
                 priority     = EXCLUDED.priority,
                 max_attempts = EXCLUDED.max_attempts,
+                queue        = EXCLUDED.queue,
                 updated_at   = NOW()
         "#,
     )
@@ -91,6 +109,7 @@ pub async fn upsert_schedule_raw(
     .bind(next)
     .bind(priority)
     .bind(max_attempts)
+    .bind(queue)
     .execute(pool)
     .await?;
 
@@ -106,6 +125,15 @@ pub struct ScheduleDeclaration {
     pub payload: serde_json::Value,
     pub priority: i16,
     pub max_attempts: i32,
+    /// Named queue the fired job lands on. Default `"default"`.
+    pub queue: String,
+}
+
+impl ScheduleDeclaration {
+    /// Default value used when a caller leaves `queue` unset on the language-binding side.
+    pub fn default_queue() -> String {
+        DEFAULT_QUEUE.to_string()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -118,10 +146,16 @@ pub struct SyncReport {
 /// list as authoritative: each entry is upserted, and any DB schedule whose
 /// name is NOT in the list is deleted. Idempotent — safe to run on every boot.
 pub async fn sync_schedules(pool: &PgPool, declared: &[ScheduleDeclaration]) -> Result<SyncReport> {
-    // Pre-validate every cron expression and compute next_run_at upfront so a
-    // bad entry fails the whole sync without partially mutating state.
+    // Pre-validate every cron expression and queue name and compute next_run_at
+    // upfront so a bad entry fails the whole sync without partially mutating state.
     let mut prepared = Vec::with_capacity(declared.len());
     for d in declared {
+        validate_queue_name(&d.queue).map_err(|e| match e {
+            crate::error::Error::InvalidArgument(msg) => {
+                crate::error::Error::InvalidArgument(format!("{}: {}", d.name, msg))
+            }
+            other => other,
+        })?;
         let schedule = CronSchedule::from_str(&d.cron_expr)
             .map_err(|e| crate::error::Error::Cron(format!("{}: {}", d.name, e)))?;
         let next = schedule
@@ -137,8 +171,8 @@ pub async fn sync_schedules(pool: &PgPool, declared: &[ScheduleDeclaration]) -> 
         sqlx::query(
             r#"
             INSERT INTO eddyq_schedules
-                (name, kind, payload, cron_expr, next_run_at, priority, max_attempts)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+                (name, kind, payload, cron_expr, next_run_at, priority, max_attempts, queue)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (name) DO UPDATE
                 SET kind         = EXCLUDED.kind,
                     payload      = EXCLUDED.payload,
@@ -150,6 +184,7 @@ pub async fn sync_schedules(pool: &PgPool, declared: &[ScheduleDeclaration]) -> 
                                    END,
                     priority     = EXCLUDED.priority,
                     max_attempts = EXCLUDED.max_attempts,
+                    queue        = EXCLUDED.queue,
                     updated_at   = NOW()
             "#,
         )
@@ -160,6 +195,7 @@ pub async fn sync_schedules(pool: &PgPool, declared: &[ScheduleDeclaration]) -> 
         .bind(next)
         .bind(d.priority)
         .bind(d.max_attempts)
+        .bind(&d.queue)
         .execute(&mut *tx)
         .await?;
     }
@@ -199,7 +235,7 @@ pub async fn set_enabled(pool: &PgPool, name: &str, enabled: bool) -> Result<boo
 
 pub async fn list_schedules(pool: &PgPool) -> Result<Vec<Schedule>> {
     let rows = sqlx::query_as::<_, Schedule>(
-        "SELECT name, kind, payload, cron_expr, next_run_at, last_run_at, enabled, priority, max_attempts
+        "SELECT name, kind, payload, cron_expr, next_run_at, last_run_at, enabled, priority, max_attempts, queue
          FROM eddyq_schedules
          ORDER BY name",
     )
@@ -224,7 +260,7 @@ pub(crate) async fn tick(pool: &PgPool) -> Result<usize> {
     }
 
     let due: Vec<Schedule> = sqlx::query_as::<_, Schedule>(
-        "SELECT name, kind, payload, cron_expr, next_run_at, last_run_at, enabled, priority, max_attempts
+        "SELECT name, kind, payload, cron_expr, next_run_at, last_run_at, enabled, priority, max_attempts, queue
          FROM eddyq_schedules
          WHERE enabled AND next_run_at <= NOW()
          FOR UPDATE",
@@ -237,14 +273,15 @@ pub(crate) async fn tick(pool: &PgPool) -> Result<usize> {
     for s in due {
         sqlx::query(
             r#"
-            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at)
-            VALUES ($1, $2, 'pending', $3, $4, NOW())
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, queue)
+            VALUES ($1, $2, 'pending', $3, $4, NOW(), $5)
             "#,
         )
         .bind(&s.kind)
         .bind(&s.payload)
         .bind(s.priority)
         .bind(s.max_attempts)
+        .bind(&s.queue)
         .execute(&mut *tx)
         .await?;
         enqueued += 1;

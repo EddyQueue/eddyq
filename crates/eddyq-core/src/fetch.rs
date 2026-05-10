@@ -678,6 +678,104 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
     Ok(u64::try_from(recovered).unwrap_or(0))
 }
 
+/// Proactively reclaim a known list of in-flight jobs — used by force-mode
+/// shutdown so jobs this pod has claimed but won't get to finish are made
+/// re-eligible for other pods *immediately*, instead of waiting one
+/// `stale_after` cycle for the heartbeat sweeper.
+///
+/// Filtered by `state = 'running'`, so this is race-safe: if a worker on
+/// this pod already finalized a row to `completed`/`failed`/`cancelled`
+/// before we reclaim, that row is left alone. Returns the count actually
+/// reclaimed.
+///
+/// Mirrors `sweep_stale` exactly — same counter decrements, same batch-fail
+/// bumps, same callback claim + fire. Only the WHERE clause differs.
+pub async fn reclaim_in_flight(pool: &PgPool, ids: &[JobId]) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let error_entry = serde_json::json!({
+        "at": chrono::Utc::now(),
+        "message": "worker shutting down — job recovered",
+    });
+
+    let mut tx = pool.begin().await?;
+
+    let (recovered, bumped_batches): (i64, Vec<i64>) = sqlx::query_as(
+        r#"
+        WITH swept AS (
+            UPDATE eddyq_jobs
+               SET state        = CASE WHEN attempt >= max_attempts THEN 'failed' ELSE 'pending' END,
+                   heartbeat_at = NULL,
+                   worker_id    = NULL,
+                   errors       = errors || $2::jsonb,
+                   finalized_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
+             WHERE state = 'running'
+               AND id = ANY($1)
+         RETURNING group_key, queue, batch_id, state
+        ),
+        group_decrements AS (
+            SELECT group_key AS key, COUNT(*)::int AS delta
+              FROM swept
+             WHERE group_key IS NOT NULL
+          GROUP BY group_key
+        ),
+        queue_decrements AS (
+            SELECT queue AS name, COUNT(*)::int AS delta
+              FROM swept
+          GROUP BY queue
+        ),
+        batch_failures AS (
+            SELECT batch_id, COUNT(*)::int AS delta
+              FROM swept
+             WHERE batch_id IS NOT NULL
+               AND state = 'failed'
+          GROUP BY batch_id
+        ),
+        _drop_groups AS (
+            UPDATE eddyq_groups g
+               SET running_count = GREATEST(g.running_count - d.delta, 0),
+                   updated_at    = NOW()
+              FROM group_decrements d
+             WHERE g.key = d.key
+            RETURNING g.key
+        ),
+        _drop_queues AS (
+            UPDATE eddyq_queues q
+               SET running_count = GREATEST(q.running_count - d.delta, 0),
+                   updated_at    = NOW()
+              FROM queue_decrements d
+             WHERE q.name = d.name
+            RETURNING q.name
+        ),
+        _bump_batches AS (
+            UPDATE eddyq_batches b
+               SET failed = b.failed + bf.delta
+              FROM batch_failures bf
+             WHERE b.id = bf.batch_id
+            RETURNING b.id
+        )
+        SELECT
+            (SELECT COUNT(*) FROM swept)::bigint,
+            COALESCE(
+                (SELECT ARRAY_AGG(id ORDER BY id) FROM _bump_batches),
+                ARRAY[]::bigint[]
+            )
+        "#,
+    )
+    .bind(ids)
+    .bind(error_entry)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    for batch_id in bumped_batches {
+        crate::batch::try_claim_and_fire(&mut tx, batch_id).await?;
+    }
+
+    tx.commit().await?;
+    Ok(u64::try_from(recovered).unwrap_or(0))
+}
+
 /// Mark a job as failed permanently (no more retries) or schedule it for a retry
 /// at `retry_at`. When `retry_at` is `Some`, the job goes back to `pending` with
 /// `scheduled_at = retry_at`, so the fetcher skips it until that time. In both
