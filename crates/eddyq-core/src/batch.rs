@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 use crate::{
-    enqueue::{enqueue_dyn_in_tx, enqueue_many_dyn_in_tx, DynEnqueue},
+    enqueue::{DynEnqueue, enqueue_dyn_in_tx, enqueue_many_dyn_in_tx},
     error::Result,
 };
 

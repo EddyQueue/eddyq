@@ -437,12 +437,8 @@ pub async fn cancel(pool: &PgPool, id: JobId) -> Result<bool> {
 
     let cancelled = row.is_some();
     if let Some((Some(batch_id),)) = row {
-        crate::batch::settle_terminal(
-            &mut tx,
-            batch_id,
-            crate::batch::TerminalOutcome::Cancelled,
-        )
-        .await?;
+        crate::batch::settle_terminal(&mut tx, batch_id, crate::batch::TerminalOutcome::Cancelled)
+            .await?;
     }
     tx.commit().await?;
     Ok(cancelled)

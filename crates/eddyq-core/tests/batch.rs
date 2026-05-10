@@ -16,12 +16,12 @@ use std::{
 
 use eddyq_core::{
     DynEnqueue, Job, JobContext, JobResult, Queue, QueueConfig, Worker, async_trait,
-    batch::{enqueue_batch, enqueue_batch_in_tx, BatchOptions},
+    batch::{BatchOptions, enqueue_batch, enqueue_batch_in_tx},
     fetch::{mark_completed, sweep_stale},
 };
-use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 fn item(kind: &str, n: u64) -> DynEnqueue {
     DynEnqueue::new(kind, serde_json::json!({ "n": n }))
@@ -145,13 +145,12 @@ async fn batch_basic_enqueue_lands(pool: PgPool) {
     assert_eq!(result.inserted, 3);
     assert_eq!(result.skipped, 0);
 
-    let (total, state, on_complete): (i32, String, Option<serde_json::Value>) = sqlx::query_as(
-        "SELECT total, state, on_complete FROM eddyq_batches WHERE id = $1",
-    )
-    .bind(result.batch_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (total, state, on_complete): (i32, String, Option<serde_json::Value>) =
+        sqlx::query_as("SELECT total, state, on_complete FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(total, 3);
     assert_eq!(state, "pending");
     assert!(on_complete.is_none());
@@ -205,29 +204,29 @@ async fn batch_empty_fires_immediately(pool: PgPool) {
     assert_eq!(result.skipped, 0);
 
     let (total, state, finalized_at): (i32, String, Option<chrono::DateTime<chrono::Utc>>) =
-        sqlx::query_as(
-            "SELECT total, state, finalized_at FROM eddyq_batches WHERE id = $1",
-        )
-        .bind(result.batch_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        sqlx::query_as("SELECT total, state, finalized_at FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(total, 0);
     assert_eq!(state, "complete");
     assert!(finalized_at.is_some());
 
-    let (callback_kind, payload): (String, serde_json::Value) = sqlx::query_as(
-        "SELECT kind, payload FROM eddyq_jobs WHERE unique_key = $1",
-    )
-    .bind(format!("eddyq.batch.{}.callback", result.batch_id))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (callback_kind, payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT kind, payload FROM eddyq_jobs WHERE unique_key = $1")
+            .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(callback_kind, "batch.done");
     let envelope = payload.get("_eddyq_batch").unwrap();
     assert_eq!(envelope.get("total").unwrap(), &serde_json::json!(0));
     assert_eq!(envelope.get("completed").unwrap(), &serde_json::json!(0));
-    assert_eq!(envelope.get("batchId").unwrap(), &serde_json::json!(result.batch_id));
+    assert_eq!(
+        envelope.get("batchId").unwrap(),
+        &serde_json::json!(result.batch_id)
+    );
     assert_eq!(payload.get("by").unwrap(), &serde_json::json!("test"));
 }
 
@@ -269,13 +268,12 @@ async fn batch_all_skipped_unique_key_fires(pool: PgPool) {
     assert_eq!(total, 0);
     assert_eq!(state, "complete");
 
-    let (callback_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1",
-    )
-    .bind(format!("eddyq.batch.{}.callback", result.batch_id))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (callback_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1")
+            .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(callback_count, 1);
 }
 
@@ -315,7 +313,11 @@ async fn batch_all_complete_fires_on_complete(pool: PgPool) {
     .await;
     queue.shutdown().await.unwrap();
 
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "callback fires exactly once");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "callback fires exactly once"
+    );
 
     let (state, completed, failed, cancelled): (String, i32, i32, i32) = sqlx::query_as(
         "SELECT state, completed, failed, cancelled FROM eddyq_batches WHERE id = $1",
@@ -350,13 +352,12 @@ async fn batch_callback_idempotent_under_concurrent_settle(pool: PgPool) {
     .unwrap();
     assert_eq!(result.inserted, 2);
 
-    let job_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM eddyq_jobs WHERE batch_id = $1 ORDER BY id ASC",
-    )
-    .bind(result.batch_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let job_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM eddyq_jobs WHERE batch_id = $1 ORDER BY id ASC")
+            .bind(result.batch_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(job_ids.len(), 2);
     let worker_a = Uuid::new_v4();
     let worker_b = Uuid::new_v4();
@@ -397,14 +398,16 @@ async fn batch_callback_idempotent_under_concurrent_settle(pool: PgPool) {
     assert_eq!(state, "complete");
     assert_eq!(completed, 2);
 
-    let (callback_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1",
-    )
-    .bind(format!("eddyq.batch.{}.callback", result.batch_id))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(callback_count, 1, "exactly one callback under concurrent settle");
+    let (callback_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1")
+            .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        callback_count, 1,
+        "exactly one callback under concurrent settle"
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -462,13 +465,12 @@ async fn batch_sweep_stale_settles(pool: PgPool) {
     assert_eq!(failed, 2);
     assert_eq!(cancelled, 0);
 
-    let (callback_count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1",
-    )
-    .bind(format!("eddyq.batch.{}.callback", result.batch_id))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (callback_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1")
+            .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(callback_count, 1);
 }
 
@@ -502,13 +504,12 @@ async fn batch_cancelled_counts_as_terminal(pool: PgPool) {
     .unwrap();
     assert_eq!(result.inserted, 4);
 
-    let job_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM eddyq_jobs WHERE batch_id = $1 ORDER BY id ASC",
-    )
-    .bind(result.batch_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let job_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM eddyq_jobs WHERE batch_id = $1 ORDER BY id ASC")
+            .bind(result.batch_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
     assert_eq!(job_ids.len(), 4);
     for id in &job_ids[..2] {
         assert!(queue.cancel(*id).await.unwrap());
@@ -588,7 +589,11 @@ async fn batch_mixed_success_failure_still_fires_on_complete(pool: PgPool) {
     assert_eq!(state, "complete");
     assert_eq!(completed, 4);
     assert_eq!(failed, 1);
-    assert_eq!(fired.load(Ordering::SeqCst), 1, "callback fires exactly once");
+    assert_eq!(
+        fired.load(Ordering::SeqCst),
+        1,
+        "callback fires exactly once"
+    );
 
     // Verify the envelope reports the failed count.
     let (payload,): (serde_json::Value,) =
@@ -617,7 +622,10 @@ async fn batch_retry_does_not_increment(pool: PgPool) {
         .build();
 
     // One job, max_attempts=3, fails twice then succeeds.
-    let mut d = DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 3 }));
+    let mut d = DynEnqueue::new(
+        "batch.flaky",
+        serde_json::json!({ "fail_until_attempt": 3 }),
+    );
     d.max_attempts = 3;
     let on_complete = DynEnqueue::new("batch.done", serde_json::json!({}));
     let result = enqueue_batch(
@@ -765,13 +773,12 @@ async fn batch_callback_payload_envelope_complete(pool: PgPool) {
     .await;
     queue.shutdown().await.unwrap();
 
-    let (payload,): (serde_json::Value,) = sqlx::query_as(
-        "SELECT payload FROM eddyq_jobs WHERE unique_key = $1",
-    )
-    .bind(format!("eddyq.batch.{}.callback", result.batch_id))
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (payload,): (serde_json::Value,) =
+        sqlx::query_as("SELECT payload FROM eddyq_jobs WHERE unique_key = $1")
+            .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     let env = payload.get("_eddyq_batch").expect("envelope present");
     for k in [
@@ -784,7 +791,10 @@ async fn batch_callback_payload_envelope_complete(pool: PgPool) {
     ] {
         assert!(env.get(k).is_some(), "envelope missing field {k}");
     }
-    assert_eq!(env.get("batchId").unwrap(), &serde_json::json!(result.batch_id));
+    assert_eq!(
+        env.get("batchId").unwrap(),
+        &serde_json::json!(result.batch_id)
+    );
     assert_eq!(env.get("total").unwrap(), &serde_json::json!(2));
     assert_eq!(env.get("completed").unwrap(), &serde_json::json!(2));
     assert_eq!(env.get("failed").unwrap(), &serde_json::json!(0));
@@ -869,8 +879,14 @@ async fn batch_mixed_kinds_in_one_batch(pool: PgPool) {
     let items: Vec<DynEnqueue> = vec![
         item("batch.item", 0),
         item("batch.item", 1),
-        DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 1 })),
-        DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 1 })),
+        DynEnqueue::new(
+            "batch.flaky",
+            serde_json::json!({ "fail_until_attempt": 1 }),
+        ),
+        DynEnqueue::new(
+            "batch.flaky",
+            serde_json::json!({ "fail_until_attempt": 1 }),
+        ),
     ];
     let on_complete = DynEnqueue::new("batch.done", serde_json::json!({}));
     let result = enqueue_batch(
@@ -963,13 +979,12 @@ async fn batch_concurrent_independent_batches(pool: PgPool) {
                 .unwrap();
         assert_eq!(state, "complete");
         assert_eq!(completed, 3);
-        let (cb_count,): (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1",
-        )
-        .bind(format!("eddyq.batch.{}.callback", bid))
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (cb_count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1")
+                .bind(format!("eddyq.batch.{}.callback", bid))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(cb_count, 1);
     }
     assert_eq!(fired.load(Ordering::SeqCst), 2);
@@ -994,8 +1009,10 @@ async fn batch_all_failures_fires_with_completed_zero(pool: PgPool) {
     // on first run (attempt < 999, so worker bails; no more retries available).
     let items: Vec<DynEnqueue> = (0..3u64)
         .map(|_| {
-            let mut d =
-                DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 999 }));
+            let mut d = DynEnqueue::new(
+                "batch.flaky",
+                serde_json::json!({ "fail_until_attempt": 999 }),
+            );
             d.max_attempts = 1;
             d
         })
