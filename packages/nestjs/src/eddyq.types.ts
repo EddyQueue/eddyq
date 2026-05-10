@@ -45,6 +45,20 @@ export interface EddyqModuleOptions {
   gracefulShutdownMs?: number;
 
   /**
+   * How `onApplicationShutdown` releases the worker pool.
+   *   - `"drain"` (default) — wait up to `gracefulShutdownMs` for in-flight
+   *     handlers to finish. Best for routine deploys.
+   *   - `"force"` — abort the runtime immediately and proactively reclaim
+   *     any in-flight DB rows (set `running` → `pending`) so other pods
+   *     pick them up without waiting for heartbeat sweep. Use when SIGKILL
+   *     is imminent.
+   *   - `"abandon"` — drop the runtime without touching DB rows. The next
+   *     pod's heartbeat sweep recovers them after `staleAfter`. Use only
+   *     on panic exits.
+   */
+  shutdownMode?: "drain" | "force" | "abandon";
+
+  /**
    * Call `eddyq.start()` automatically during `onApplicationBootstrap`. Default `true`.
    * Set `false` if you want to register handlers dynamically before starting.
    */

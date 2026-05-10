@@ -232,7 +232,10 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     if (this.started) {
       EddyqModule.logger.log(`stopping worker runtime (${reason})`);
       try {
-        await this.queue.shutdown(this.options.gracefulShutdownMs ?? 30_000);
+        await this.queue.shutdown({
+          mode: this.options.shutdownMode ?? "drain",
+          gracefulTimeoutMs: this.options.gracefulShutdownMs ?? 30_000,
+        });
       } catch (e) {
         EddyqModule.logger.error(
           `worker shutdown failed: ${(e as Error).message}`,
