@@ -35,6 +35,10 @@ pub struct QueueConfig {
     /// Delete cancelled jobs older than this. `None` = keep forever.
     /// Default: 7 days.
     pub cancelled_retention: Option<Duration>,
+    /// Delete finalized batch rows (`eddyq_batches`) older than this. `None`
+    /// keeps them forever (table grows unbounded for batch-heavy workloads).
+    /// Default: 7 days.
+    pub batch_retention: Option<Duration>,
     /// When `true`, do not spawn a LISTEN/NOTIFY listener. Use this when connected
     /// through PgBouncer in transaction-pooling mode (LISTEN is incompatible).
     pub poll_only: bool,
@@ -60,6 +64,7 @@ impl Default for QueueConfig {
             completed_retention: Some(Duration::from_secs(24 * 60 * 60)), // 24h
             failed_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             cancelled_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
+            batch_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             poll_only: false,
             leader_lease_secs: 30,
         }
@@ -186,6 +191,13 @@ impl QueueBuilder {
     /// Retention for cancelled jobs. `None` keeps them forever.
     pub fn cancelled_retention(mut self, d: Option<Duration>) -> Self {
         self.config.cancelled_retention = d;
+        self
+    }
+
+    /// Retention for finalized batch rows. `None` keeps them forever — the
+    /// `eddyq_batches` table grows unbounded for batch-heavy workloads.
+    pub fn batch_retention(mut self, d: Option<Duration>) -> Self {
+        self.config.batch_retention = d;
         self
     }
 
@@ -487,7 +499,17 @@ impl Queue {
         Ok(())
     }
 
+    /// Graceful shutdown: stop claiming new jobs, fire `AbortSignal` to
+    /// in-flight handlers, await runtime tasks. Equivalent to
+    /// `shutdown_with(ShutdownMode::Drain)`. Kept for back-compat.
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_with(ShutdownMode::Drain).await
+    }
+
+    /// Stop the runtime in one of three modes — see [`ShutdownMode`] for the
+    /// tradeoffs. The state transitions to `Idle` regardless of mode (you
+    /// cannot resume a stopped Queue; build a new one).
+    pub async fn shutdown_with(&self, mode: ShutdownMode) -> Result<()> {
         let (shutdown, handles) = {
             let mut state = self.state.lock().expect("queue state lock poisoned");
             match std::mem::replace(&mut *state, QueueState::Idle) {
@@ -496,10 +518,78 @@ impl Queue {
             }
         };
 
+        // Always fire the cancellation token first — runtime tasks (fetcher,
+        // workers, sweeper, etc.) all check this and exit on next loop iter.
+        // Handlers that captured the AbortSignal also see this fire.
         shutdown.cancel();
-        crate::runtime::await_all(handles).await;
 
-        info!("eddyq queue stopped");
+        match mode {
+            ShutdownMode::Drain => {
+                crate::runtime::await_all(handles).await;
+                info!("eddyq queue stopped (drain)");
+            }
+            ShutdownMode::Force => {
+                // Snapshot the in-flight set BEFORE we abort the workers, so
+                // we don't miss jobs the worker was about to mark done.
+                // Reclaim is filtered by `state = 'running'` so any rows the
+                // workers manage to finalize between snapshot and reclaim are
+                // safely skipped.
+                let ids: Vec<crate::JobId> = handles
+                    .in_flight
+                    .lock()
+                    .expect("in_flight lock poisoned")
+                    .iter()
+                    .copied()
+                    .collect();
+                handles.abort_all();
+                let reclaimed = match crate::fetch::reclaim_in_flight(&self.pool, &ids).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        // Best-effort. We've already aborted the runtime; if
+                        // reclaim fails the heartbeat sweep on another pod
+                        // will recover the rows after `stale_after`. Log and
+                        // move on — don't fail the shutdown.
+                        tracing::warn!(?e, "reclaim_in_flight failed during force shutdown");
+                        0
+                    }
+                };
+                drop(handles);
+                info!(
+                    snapshotted = ids.len(),
+                    reclaimed, "eddyq queue stopped (force)"
+                );
+            }
+            ShutdownMode::Abandon => {
+                handles.abort_all();
+                drop(handles);
+                info!("eddyq queue stopped (abandon)");
+            }
+        }
+
         Ok(())
     }
+}
+
+/// How `Queue::shutdown_with` releases an in-flight worker pool. The right
+/// choice depends on what's about to happen to the process:
+///
+/// * `Drain` — graceful. Stop claiming new jobs, fire `AbortSignal` to
+///   in-flight handlers, then wait for them. Modeled on BullMQ's default
+///   `worker.close()`. Use for routine deploys.
+///
+/// * `Force` — fast. Stop claiming, fire `AbortSignal`, abort runtime
+///   tasks, then **proactively reclaim** rows this pod claimed (set
+///   `running` → `pending`, attempt++) so other pods can pick them up
+///   immediately. Modeled on BullMQ's `worker.close({ force: true })`
+///   plus River's `StopAndCancel`. Use when the pod is about to be killed.
+///
+/// * `Abandon` — last-resort. Drop the runtime without reclaiming. Rows
+///   stay in `running` until another pod's heartbeat sweep finds them
+///   stale (one `stale_after` cycle later). Use only on panic exits where
+///   you don't trust the pool/connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownMode {
+    Drain,
+    Force,
+    Abandon,
 }

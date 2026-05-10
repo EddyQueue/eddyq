@@ -28,6 +28,11 @@ test:
 test-integration:
     cargo test --workspace --features integration -- --test-threads=1
 
+# run Node smoke tests against the local dev DB (just db-up first)
+smoke:
+    pnpm --filter @eddyq/queue smoke
+    pnpm --filter @eddyq/nestjs smoke
+
 # run benchmark harness (Phase 0 deliverable)
 bench:
     cargo bench --workspace

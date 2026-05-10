@@ -41,3 +41,24 @@ export const EDDYQ_INSTANCE = "EDDYQ_INSTANCE";
 
 export const EDDYQ_PROCESSOR_META = "eddyq:processor";
 export const EDDYQ_JOB_HANDLER_META = "eddyq:job_handler";
+
+/**
+ * Token-prefix for {@link QueueRegistration} value providers emitted by
+ * `EddyqModule.registerQueue`. The aggregator at bootstrap iterates every
+ * provider whose token starts with this prefix to collect per-queue config.
+ *
+ * Use {@link getQueueRegistrationToken} to build a concrete token; the prefix
+ * is exported only so the aggregator can scan for it.
+ */
+export const EDDYQ_QUEUE_REGISTRATION_PREFIX = "EDDYQ_QUEUE_REGISTRATION:";
+
+/** Build the token under which a queue registration is provided. */
+export const getQueueRegistrationToken = (name: string): string =>
+  `${EDDYQ_QUEUE_REGISTRATION_PREFIX}${name}`;
+
+/**
+ * DI token for a per-queue {@link QueueHandle}. Use {@link InjectQueue}
+ * (e.g. `@InjectQueue('klaviyo')`) instead of constructing the token name
+ * manually.
+ */
+export const getQueueToken = (name: string): string => `EDDYQ_QUEUE:${name}`;

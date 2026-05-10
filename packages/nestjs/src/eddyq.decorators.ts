@@ -4,6 +4,7 @@ import {
   EDDYQ_INSTANCE,
   EDDYQ_JOB_HANDLER_META,
   EDDYQ_PROCESSOR_META,
+  getQueueToken,
 } from "./eddyq.constants.js";
 
 /**
@@ -40,3 +41,16 @@ export const Processor = (): ClassDecorator => (target) => {
  */
 export const JobHandler = (kind: string): MethodDecorator =>
   SetMetadata(EDDYQ_JOB_HANDLER_META, kind);
+
+/**
+ * Inject a per-queue {@link QueueHandle} produced by
+ * `EddyqModule.registerQueue({ name })`. The handle pre-binds the queue
+ * name + per-queue defaults; call sites don't need to restate them.
+ *
+ * ```ts
+ * constructor(@InjectQueue('klaviyo') private readonly q: QueueHandle) {}
+ * await this.q.enqueue('events.periodic', { ... }, { uniqueKey: '...' });
+ * ```
+ */
+export const InjectQueue = (name: string): ReturnType<typeof Inject> =>
+  Inject(getQueueToken(name));

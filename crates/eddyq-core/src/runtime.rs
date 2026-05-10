@@ -26,8 +26,10 @@ use crate::{
 
 pub(crate) const NOTIFY_CHANNEL: &str = "eddyq_job";
 
-/// Shared set of in-flight job IDs for the batch heartbeat task.
-type InFlightJobs = Arc<std::sync::Mutex<HashSet<i64>>>;
+/// Shared set of in-flight job IDs for the batch heartbeat task. Also read
+/// by `Queue::shutdown_with(ShutdownMode::Force)` so we can proactively
+/// reclaim jobs this pod has claimed but won't get to finish.
+pub(crate) type InFlightJobs = Arc<std::sync::Mutex<HashSet<i64>>>;
 
 pub(crate) struct RuntimeHandles {
     pub fetcher: JoinHandle<()>,
@@ -38,6 +40,28 @@ pub(crate) struct RuntimeHandles {
     pub listener: Option<JoinHandle<()>>,
     pub heartbeat: JoinHandle<()>,
     pub leader: JoinHandle<()>,
+    /// Snapshot read-source for force-shutdown reclaim. Owned here so it
+    /// stays alive as long as the runtime is running.
+    pub in_flight: InFlightJobs,
+}
+
+impl RuntimeHandles {
+    /// Abort every spawned task without awaiting. Used by force/abandon
+    /// shutdown — Tokio drops the futures on next yield.
+    pub fn abort_all(&self) {
+        self.fetcher.abort();
+        for h in &self.workers {
+            h.abort();
+        }
+        self.sweeper.abort();
+        self.scheduler.abort();
+        self.cleanup.abort();
+        if let Some(h) = self.listener.as_ref() {
+            h.abort();
+        }
+        self.heartbeat.abort();
+        self.leader.abort();
+    }
 }
 
 pub(crate) fn start(
@@ -84,7 +108,7 @@ pub(crate) fn start(
 
     let heartbeat = tokio::spawn(heartbeat_loop(
         pool.clone(),
-        in_flight,
+        in_flight.clone(),
         config.clone(),
         shutdown.clone(),
     ));
@@ -137,6 +161,7 @@ pub(crate) fn start(
         listener,
         heartbeat,
         leader,
+        in_flight,
     }
 }
 
@@ -568,6 +593,7 @@ async fn cleanup_loop(
     if config.completed_retention.is_none()
         && config.failed_retention.is_none()
         && config.cancelled_retention.is_none()
+        && config.batch_retention.is_none()
     {
         debug!("cleanup disabled (all retentions None)");
         return;
@@ -577,6 +603,7 @@ async fn cleanup_loop(
         completed_secs: config.completed_retention.map(|d| d.as_secs()),
         failed_secs: config.failed_retention.map(|d| d.as_secs()),
         cancelled_secs: config.cancelled_retention.map(|d| d.as_secs()),
+        batch_secs: config.batch_retention.map(|d| d.as_secs()),
     };
     let mut interval = tokio::time::interval(config.cleanup_interval);
     interval.tick().await;
@@ -589,10 +616,10 @@ async fn cleanup_loop(
                     continue;
                 }
                 match crate::fetch::cleanup(&pool, retention).await {
-                    Ok((0, 0, 0)) => {}
-                    Ok((c, f, x)) => info!(
-                        completed = c, failed = f, cancelled = x,
-                        "cleanup deleted old finalized jobs"
+                    Ok((0, 0, 0, 0)) => {}
+                    Ok((c, f, x, b)) => info!(
+                        completed = c, failed = f, cancelled = x, batches = b,
+                        "cleanup deleted old finalized rows"
                     ),
                     Err(err) => warn!(?err, "cleanup failed"),
                 }

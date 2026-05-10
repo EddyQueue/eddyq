@@ -27,13 +27,16 @@ Finalized jobs (`completed`, `failed`, `cancelled`) accumulate forever unless yo
 
 Defaults:
 
-| State | Default retention |
+| Row | Default retention |
 |---|---|
-| `completed` | 24 hours |
-| `failed` | 7 days |
-| `cancelled` | 7 days |
+| `completed` job | 24 hours |
+| `failed` job | 7 days |
+| `cancelled` job | 7 days |
+| finalized batch (`eddyq_batches`) | 7 days |
 
 Failed and cancelled jobs are kept longer because that's where you go to debug. Completed jobs go fast — most apps don't need a permanent log of every successful background task. If you do, set retention to `null` to keep forever, or copy rows to your own audit table from a job handler before they're cleaned up.
+
+Batch rows are reaped only once their callback has fired (`state = 'complete'`). Pending batches with in-flight jobs are never deleted.
 
 ## Leader election
 
@@ -58,6 +61,7 @@ await q.start({
   completedRetentionSecs: 24 * 3600,
   failedRetentionSecs:    7 * 86400,
   cancelledRetentionSecs: 7 * 86400, // pass -1 to keep forever
+  batchRetentionSecs:     7 * 86400, // finalized eddyq_batches rows
   leaderLeaseSecs:        30,
   fetchPollIntervalMs:    1_000,     // ignored unless poll-only
 });

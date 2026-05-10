@@ -65,4 +65,5 @@ export interface Schedule {
   enabled: boolean;
   priority: number;
   maxAttempts: number;
+  queue: string;
 }

@@ -1,6 +1,12 @@
 import type {
+  BatchEnqueueOutcome,
+  BulkEnqueueOutcome,
   ConnectOptions,
   Eddyq,
+  EnqueueBatchInput,
+  EnqueueManyItem,
+  EnqueueOptions,
+  EnqueueOutcome,
   JobCall,
   ScheduleDeclaration,
   StartOptions,
@@ -37,6 +43,20 @@ export interface EddyqModuleOptions {
 
   /** Millisecond budget for graceful shutdown before force-cancelling. Default 30_000. */
   gracefulShutdownMs?: number;
+
+  /**
+   * How `onApplicationShutdown` releases the worker pool.
+   *   - `"drain"` (default) — wait up to `gracefulShutdownMs` for in-flight
+   *     handlers to finish. Best for routine deploys.
+   *   - `"force"` — abort the runtime immediately and proactively reclaim
+   *     any in-flight DB rows (set `running` → `pending`) so other pods
+   *     pick them up without waiting for heartbeat sweep. Use when SIGKILL
+   *     is imminent.
+   *   - `"abandon"` — drop the runtime without touching DB rows. The next
+   *     pod's heartbeat sweep recovers them after `staleAfter`. Use only
+   *     on panic exits.
+   */
+  shutdownMode?: "drain" | "force" | "abandon";
 
   /**
    * Call `eddyq.start()` automatically during `onApplicationBootstrap`. Default `true`.
@@ -80,4 +100,129 @@ export interface EddyqModuleAsyncOptions
     ...args: unknown[]
   ) => Promise<EddyqModuleOptions> | EddyqModuleOptions;
   inject?: Array<string | symbol | Type<unknown>>;
+}
+
+/** Token-bucket rate limit applied to a group. Same shape as `setGroupRate`. */
+export interface GroupRate {
+  count: number;
+  periodMs: number;
+}
+
+/**
+ * Group profile — a (concurrency, rate) pair that can be applied to one or
+ * more group keys. Profiles passed under `groups` on `registerQueue` are
+ * configured idempotently at bootstrap. Profiles passed to `queue.group(key, profile)`
+ * are configured lazily on first use and memoized per process.
+ */
+export interface GroupProfile {
+  concurrency?: number;
+  rate?: GroupRate;
+}
+
+/**
+ * Per-enqueue defaults applied by a {@link QueueHandle} unless overridden by
+ * the caller. Every field is optional — the queue handle merges these on top
+ * of the eddyq defaults, then the caller's `EnqueueOptions` wins.
+ */
+export type QueueDefaults = Pick<
+  EnqueueOptions,
+  "maxAttempts" | "priority" | "tags"
+>;
+
+/** Per-enqueue overrides accepted by `QueueHandle.enqueue`. The `queue` field is bound by the handle and not accepted. */
+export type QueueEnqueueOptions = Omit<EnqueueOptions, "queue">;
+
+/** Per-item input for `QueueHandle.enqueueMany`. The `queue` field is bound by the handle and not accepted. */
+export type QueueEnqueueManyItem = Omit<EnqueueManyItem, "queue">;
+
+/** Input for `QueueHandle.enqueueBatch`. `queue` on items/onComplete is bound by the handle. */
+export interface QueueEnqueueBatchInput {
+  items: QueueEnqueueManyItem[];
+  onComplete?: QueueEnqueueManyItem;
+  metadata?: EnqueueBatchInput["metadata"];
+}
+
+/**
+ * Per-queue handle returned by `@InjectQueue(name)`. Wraps the global Eddyq
+ * client and pre-binds the queue name + per-queue defaults so call sites
+ * don't need to repeat them.
+ */
+export interface QueueHandle {
+  /** The queue name this handle is bound to. */
+  readonly name: string;
+
+  /** Enqueue one job onto this queue. */
+  enqueue(
+    kind: string,
+    payload: unknown,
+    options?: QueueEnqueueOptions,
+  ): Promise<EnqueueOutcome>;
+
+  /** Bulk-enqueue onto this queue. One Postgres round-trip for the batch. */
+  enqueueMany(items: QueueEnqueueManyItem[]): Promise<BulkEnqueueOutcome>;
+
+  /** Fan-in batch: items + optional onComplete callback. See `Eddyq.enqueueBatch`. */
+  enqueueBatch(input: QueueEnqueueBatchInput): Promise<BatchEnqueueOutcome>;
+
+  /**
+   * Return a sub-handle pre-bound to a group key. The first call for a
+   * given (groupKey, profile) configures the group via `setGroupConcurrency`
+   * / `setGroupRate` and memoizes the result for the life of the process.
+   *
+   * `profile` may be a profile name registered on this queue (under
+   * `registerQueue({ groups })`) or an inline {@link GroupProfile}.
+   */
+  group(
+    groupKey: string,
+    profile: string | GroupProfile,
+  ): GroupedQueueHandle;
+}
+
+/** Sub-handle returned by `QueueHandle.group` — same enqueue surface, group key pre-bound. */
+export interface GroupedQueueHandle {
+  readonly name: string;
+  readonly groupKey: string;
+  enqueue(
+    kind: string,
+    payload: unknown,
+    options?: Omit<QueueEnqueueOptions, "groupKey">,
+  ): Promise<EnqueueOutcome>;
+  enqueueMany(
+    items: Array<Omit<QueueEnqueueManyItem, "groupKey">>,
+  ): Promise<BulkEnqueueOutcome>;
+}
+
+/**
+ * Argument to `EddyqModule.registerQueue` — declarative per-queue config that
+ * the module aggregates at bootstrap.
+ */
+export interface QueueRegistration {
+  /** Queue name. Must be unique across `registerQueue` calls in a single app. */
+  name: string;
+
+  /**
+   * Defaults merged into every enqueue from this queue's handle. Caller's
+   * options win on conflict.
+   */
+  defaults?: QueueDefaults;
+
+  /**
+   * Named group profiles. Configured idempotently at bootstrap (each profile
+   * is treated as a static group whose key equals the profile name) AND
+   * available by name via `queue.group(key, 'profile-name')`.
+   */
+  groups?: Record<string, GroupProfile>;
+
+  /**
+   * Cron schedules owned by this queue. Unioned with `forRoot.schedules` and
+   * reconciled together — entries not present in the union are deleted.
+   */
+  schedules?: ScheduleDeclaration[];
+
+  /**
+   * Whether worker pods should subscribe to this queue when `subscribeTo` is
+   * not explicitly set on `forRoot`. Default `true`. Set `false` for queues
+   * that exist only for enqueueing in this process (rare).
+   */
+  subscribe?: boolean;
 }

@@ -53,3 +53,14 @@ jobs:
       - run: pnpm install --frozen-lockfile=false
       - run: pnpm --filter @eddyq/queue build:debug
       - run: pnpm -r build
+      # Minimal Node-level wires-up checks against the postgres service.
+      # Each script connects with EDDYQ_DATABASE_URL, runs migrate()
+      # idempotently, exercises the public surface, and exits non-zero on
+      # failure. The fuller `pnpm smoke` suite stays as a local/pre-publish
+      # check (run via `just smoke`); CI runs only the fast subset.
+      - run: pnpm --filter @eddyq/queue test
+        env:
+          EDDYQ_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - run: pnpm --filter @eddyq/nestjs test
+        env:
+          EDDYQ_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres

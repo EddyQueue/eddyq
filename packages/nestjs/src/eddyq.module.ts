@@ -14,11 +14,16 @@ import { DiscoveryModule } from "@nestjs/core";
 import {
   EDDYQ_INSTANCE,
   EDDYQ_OPTIONS,
+  getQueueRegistrationToken,
+  getQueueToken,
 } from "./eddyq.constants.js";
 import { EddyqExplorer } from "./eddyq.explorer.js";
+import { QueueHandleImpl } from "./eddyq-queue.handle.js";
+import { EddyqQueueAggregator } from "./eddyq-queue.aggregator.js";
 import type {
   EddyqModuleAsyncOptions,
   EddyqModuleOptions,
+  QueueRegistration,
 } from "./eddyq.types.js";
 
 /**
@@ -41,6 +46,7 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     @Inject(EDDYQ_OPTIONS) private readonly options: EddyqModuleOptions,
     @Inject(EDDYQ_INSTANCE) private readonly queue: Eddyq,
     private readonly explorer: EddyqExplorer,
+    private readonly aggregator: EddyqQueueAggregator,
   ) {}
 
   static forRoot(options: EddyqModuleOptions): DynamicModule {
@@ -51,6 +57,7 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
         { provide: EDDYQ_OPTIONS, useValue: options },
         eddyqInstanceProvider(),
         EddyqExplorer,
+        EddyqQueueAggregator,
       ],
       exports: [EDDYQ_INSTANCE, EDDYQ_OPTIONS],
     };
@@ -68,8 +75,51 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
         },
         eddyqInstanceProvider(),
         EddyqExplorer,
+        EddyqQueueAggregator,
       ],
       exports: [EDDYQ_INSTANCE, EDDYQ_OPTIONS],
+    };
+  }
+
+  /**
+   * Register a queue's per-queue config + producer handle. Call from any
+   * feature module — `EddyqModule.forRoot` (or `forRootAsync`) must be
+   * imported once at the app root for the connection + worker runtime.
+   *
+   * Each call adds two providers to DI:
+   *   - the {@link QueueRegistration} value (under a namespaced token), so
+   *     the aggregator can collect it at bootstrap.
+   *   - a {@link QueueHandle} (under `getQueueToken(name)`), injectable via
+   *     `@InjectQueue(name)`.
+   *
+   * The module exports the queue-handle token so consumers in this feature
+   * module can inject it without re-importing.
+   */
+  static registerQueue(registration: QueueRegistration): DynamicModule {
+    validateQueueName(registration.name, "registerQueue.name");
+    const regToken = getQueueRegistrationToken(registration.name);
+    const handleToken = getQueueToken(registration.name);
+    // Fresh anonymous class per call. Nest cannot reuse the same module class
+    // across multiple dynamic-module factories when those factories don't all
+    // satisfy that class's constructor deps — `EddyqModule` itself requires
+    // `EddyqExplorer` / `EddyqQueueAggregator`, which only `forRoot` provides.
+    // Same trick `BullModule.forFeature` uses.
+    class EddyqRegisteredQueueModule {}
+    Object.defineProperty(EddyqRegisteredQueueModule, "name", {
+      value: `EddyqQueueModule:${registration.name}`,
+    });
+    return {
+      module: EddyqRegisteredQueueModule,
+      providers: [
+        { provide: regToken, useValue: registration },
+        {
+          provide: handleToken,
+          useFactory: (eddyq: Eddyq, reg: QueueRegistration) =>
+            new QueueHandleImpl(eddyq, reg),
+          inject: [EDDYQ_INSTANCE, regToken],
+        },
+      ],
+      exports: [handleToken],
     };
   }
 
@@ -86,9 +136,26 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
       }
     }
 
-    if (this.options.schedules !== undefined) {
-      const declared = this.options.schedules;
-      const report = await this.queue.syncSchedules(declared);
+    const aggregated = this.aggregator.collect();
+
+    // Static groups declared on registerQueue — idempotent setGroup* calls.
+    for (const { handle } of aggregated) {
+      await handle.configureStaticGroups();
+    }
+
+    // Schedule reconciliation: union of forRoot.schedules + every
+    // registerQueue's schedules. A per-queue schedule defaults its `queue`
+    // to the enclosing queue's name — callers can override per entry.
+    const perQueueSchedules = aggregated.flatMap(({ registration }) =>
+      (registration.schedules ?? []).map((s) => ({
+        ...s,
+        queue: s.queue ?? registration.name,
+      })),
+    );
+    const rootSchedules = this.options.schedules;
+    if (rootSchedules !== undefined || perQueueSchedules.length > 0) {
+      const combined = [...(rootSchedules ?? []), ...perQueueSchedules];
+      const report = await this.queue.syncSchedules(combined);
       EddyqModule.logger.log(
         `synced schedules: upserted ${report.upserted}` +
           (report.deleted.length > 0
@@ -105,8 +172,22 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     if (this.options.workerConcurrency !== undefined) {
       this.queue.setWorkerConcurrency(this.options.workerConcurrency);
     }
-    if (this.options.subscribeTo !== undefined) {
-      this.queue.subscribeTo(this.options.subscribeTo);
+
+    // Subscription set: explicit `forRoot.subscribeTo` always wins. Otherwise
+    // derive from registered queues (those without `subscribe: false`). If
+    // nothing is registered, fall back to the core's "default" queue.
+    const subscribeTo =
+      this.options.subscribeTo ??
+      (aggregated.length > 0
+        ? aggregated
+            .filter(({ registration }) => registration.subscribe !== false)
+            .map(({ registration }) => registration.name)
+        : undefined);
+    if (subscribeTo !== undefined) {
+      this.queue.subscribeTo(subscribeTo);
+      EddyqModule.logger.log(
+        `subscribeTo: [${subscribeTo.map((q) => `"${q}"`).join(", ")}]`,
+      );
     }
 
     const autoStart = this.options.autoStart ?? true;
@@ -151,7 +232,10 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     if (this.started) {
       EddyqModule.logger.log(`stopping worker runtime (${reason})`);
       try {
-        await this.queue.shutdown(this.options.gracefulShutdownMs ?? 30_000);
+        await this.queue.shutdown({
+          mode: this.options.shutdownMode ?? "drain",
+          gracefulTimeoutMs: this.options.gracefulShutdownMs ?? 30_000,
+        });
       } catch (e) {
         EddyqModule.logger.error(
           `worker shutdown failed: ${(e as Error).message}`,
@@ -176,4 +260,29 @@ function eddyqInstanceProvider(): Provider {
       Eddyq.connect(options.databaseUrl, options.connectOptions ?? undefined),
     inject: [EDDYQ_OPTIONS],
   };
+}
+
+const MAX_QUEUE_NAME_LEN = 64;
+const QUEUE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
+
+/**
+ * Mirror of the Rust `validate_queue_name` rule. Kept in sync by hand —
+ * the core's check still runs server-side, this fail-fast catches bad
+ * inputs at module-construction time so the error surfaces during boot.
+ */
+function validateQueueName(name: unknown, label: string): asserts name is string {
+  if (typeof name !== "string" || name.length === 0) {
+    throw new Error(`@eddyq/nestjs: ${label} must be a non-empty string`);
+  }
+  if (name.length > MAX_QUEUE_NAME_LEN) {
+    throw new Error(
+      `@eddyq/nestjs: ${label} ${JSON.stringify(name)} exceeds ${MAX_QUEUE_NAME_LEN} chars`,
+    );
+  }
+  if (!QUEUE_NAME_RE.test(name)) {
+    throw new Error(
+      `@eddyq/nestjs: ${label} ${JSON.stringify(name)} contains invalid characters ` +
+        `(allowed: a-z A-Z 0-9 . _ -)`,
+    );
+  }
 }

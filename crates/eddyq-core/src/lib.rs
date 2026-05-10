@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+pub mod batch;
 pub mod enqueue;
 pub mod error;
 pub mod fetch;
@@ -19,8 +20,9 @@ pub mod stats;
 pub mod worker;
 
 pub use async_trait::async_trait;
+pub use batch::{BatchEnqueueResult, BatchOptions};
 pub use enqueue::{BulkEnqueueResult, DynEnqueue, EnqueueOptions, EnqueueResult};
 pub use error::{Directive, Error, HandlerFailure, JobResult, Result};
-pub use job::{Job, JobContext, JobId, JobState};
-pub use queue::{Queue, QueueBuilder, QueueConfig};
+pub use job::{DEFAULT_QUEUE, Job, JobContext, JobId, JobState};
+pub use queue::{Queue, QueueBuilder, QueueConfig, ShutdownMode};
 pub use worker::{Worker, WorkerRegistry};

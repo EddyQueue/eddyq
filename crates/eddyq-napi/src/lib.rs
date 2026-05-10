@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use eddyq_client::{
     Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DynEnqueue, HandlerFailure,
-    JobContext, JobResult, JobState, ScheduleDeclaration as CoreScheduleDeclaration,
+    JobContext, JobResult, JobState, ScheduleDeclaration as CoreScheduleDeclaration, ShutdownMode,
 };
 use napi::{
     bindgen_prelude::*,
@@ -92,6 +92,18 @@ pub struct ConnectOptions {
     pub poll_only: Option<bool>,
 }
 
+/// Options for `Eddyq.shutdown`. All fields optional.
+#[napi(object)]
+pub struct ShutdownOptions {
+    /// Shutdown mode — `"drain"` (default), `"force"`, or `"abandon"`. See
+    /// `Eddyq.shutdown` docs for the tradeoffs.
+    pub mode: Option<String>,
+    /// For `mode="drain"`, max time to wait for in-flight handlers (ms).
+    /// Ignored by `force` / `abandon` (which don't await handlers). Default
+    /// 30_000.
+    pub graceful_timeout_ms: Option<u32>,
+}
+
 /// Per-enqueue overrides. All fields optional.
 #[napi(object)]
 pub struct EnqueueOptions {
@@ -158,6 +170,33 @@ pub struct BulkEnqueueOutcome {
     pub skipped: i64,
 }
 
+/// Input to `enqueueBatch`. `items` is the work; `onComplete` (optional) fires
+/// exactly once when every item reaches a terminal state. The handler receives
+/// counts under `_eddyq_batch` in its payload: `{ batchId, total, completed,
+/// failed, cancelled, durationMs }`.
+#[napi(object)]
+pub struct EnqueueBatchInput {
+    /// Items to enqueue. Mixed `kind` across items is supported. Same 5,000
+    /// per-call cap as `enqueueMany`.
+    pub items: Vec<EnqueueManyItem>,
+    /// Optional callback to enqueue when every item reaches terminal state.
+    /// Fires regardless of mix of success / terminal-failure / cancellation;
+    /// branch on the counts in the payload's `_eddyq_batch` envelope.
+    pub on_complete: Option<EnqueueManyItem>,
+    /// Free-form metadata stored on the batch row (admin / dashboard).
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Result of `enqueueBatch`. `inserted` is the actual count that became jobs;
+/// `skipped` is items that conflicted on `unique_key` (they don't count toward
+/// the batch — the batch's `total` is `inserted`).
+#[napi(object)]
+pub struct BatchEnqueueOutcome {
+    pub batch_id: i64,
+    pub inserted: i64,
+    pub skipped: i64,
+}
+
 /// A pending or applied migration.
 #[napi(object)]
 pub struct MigrationStatus {
@@ -220,6 +259,11 @@ pub struct StartOptions {
     /// Retention (seconds) for cancelled jobs. Default 604_800 (7d).
     /// Pass `-1` to keep forever.
     pub cancelled_retention_secs: Option<i64>,
+
+    /// Retention (seconds) for finalized batch rows (`eddyq_batches`).
+    /// Default 604_800 (7d). Pass `-1` to keep forever — the table will
+    /// grow unbounded for batch-heavy workloads.
+    pub batch_retention_secs: Option<i64>,
 
     /// Leader-election lease in seconds — the elected maintenance node
     /// (scheduler + cleanup) refreshes every `leaseSecs / 3` seconds.
@@ -339,6 +383,8 @@ pub struct Schedule {
     pub enabled: bool,
     pub priority: i16,
     pub max_attempts: i32,
+    /// Named queue the fired job lands on.
+    pub queue: String,
 }
 
 /// Options for `addSchedule`. All optional — defaults match `enqueue`.
@@ -348,6 +394,8 @@ pub struct ScheduleOptions {
     pub priority: Option<i16>,
     /// Max total attempts before the job is marked failed. Default 3.
     pub max_attempts: Option<i32>,
+    /// Named queue the fired job lands on. Default `"default"`.
+    pub queue: Option<String>,
 }
 
 /// A single declared schedule in `syncSchedules`. Same shape as `addSchedule`'s
@@ -361,6 +409,8 @@ pub struct ScheduleDeclaration {
     pub payload: serde_json::Value,
     pub priority: Option<i16>,
     pub max_attempts: Option<i32>,
+    /// Named queue the fired job lands on. Default `"default"`.
+    pub queue: Option<String>,
 }
 
 /// Result of `syncSchedules`: the names that were upserted (count) and any
@@ -510,6 +560,24 @@ impl Queue {
     pub async fn enqueue_many(&self, items: Vec<EnqueueManyItem>) -> Result<BulkEnqueueOutcome> {
         let client = self.client.clone();
         run(move || do_enqueue_many(client, items)).await
+    }
+
+    /// Enqueue a batch of jobs and (optionally) a callback that fires when
+    /// every item reaches terminal state. Native fan-in primitive — replaces
+    /// the per-app counter table workaround for "run X after these N jobs."
+    ///
+    /// The callback's payload gets a namespaced envelope:
+    /// `{ _eddyq_batch: { batchId, total, completed, failed, cancelled,
+    /// durationMs }, ...userPayload }`. Handler branches on `failed` / `cancelled`
+    /// counts to decide what success vs partial-failure means in its domain.
+    ///
+    /// Items skipped via `uniqueKey` dedup do not count toward the batch's
+    /// `total` — they belong to the batch that originally enqueued them. The
+    /// returned `skipped` reports the count for the caller's logging.
+    #[napi]
+    pub async fn enqueue_batch(&self, input: EnqueueBatchInput) -> Result<BatchEnqueueOutcome> {
+        let client = self.client.clone();
+        run(move || do_enqueue_batch(client, input)).await
     }
 
     /// Cancel a pending job. Returns `true` if cancelled, `false` if the job
@@ -680,9 +748,20 @@ impl Queue {
         let client = self.client.clone();
         let priority = options.as_ref().and_then(|o| o.priority).unwrap_or(0);
         let max_attempts = options.as_ref().and_then(|o| o.max_attempts).unwrap_or(3);
+        let queue = options
+            .and_then(|o| o.queue)
+            .unwrap_or_else(|| eddyq_client::DEFAULT_QUEUE.to_string());
         run(move || async move {
             client
-                .add_schedule(&name, &cron_expr, &kind, payload, priority, max_attempts)
+                .add_schedule(
+                    &name,
+                    &cron_expr,
+                    &kind,
+                    payload,
+                    priority,
+                    max_attempts,
+                    &queue,
+                )
                 .await
                 .map_err(err)
         })
@@ -715,6 +794,9 @@ impl Queue {
                 payload: d.payload,
                 priority: d.priority.unwrap_or(0),
                 max_attempts: d.max_attempts.unwrap_or(3),
+                queue: d
+                    .queue
+                    .unwrap_or_else(|| eddyq_client::DEFAULT_QUEUE.to_string()),
             })
             .collect();
         run(move || async move {
@@ -911,6 +993,9 @@ impl Queue {
             if let Some(secs) = o.cancelled_retention_secs {
                 builder = builder.cancelled_retention(retention_from_secs(secs));
             }
+            if let Some(secs) = o.batch_retention_secs {
+                builder = builder.batch_retention(retention_from_secs(secs));
+            }
             if let Some(s) = o.leader_lease_secs {
                 builder = builder.leader_lease_secs(u64::from(s));
             }
@@ -951,8 +1036,28 @@ impl Queue {
     /// jobs to finish before forcibly cancelling the runtime tasks. Admin
     /// methods remain usable after shutdown — call `close()` to release the
     /// DB pool entirely.
+    ///
+    /// On return, all NAPI `ThreadsafeFunction` references this binding holds
+    /// are dropped (handler TSFNs via the worker registry, plus the abort
+    /// TSFN). That releases their libuv ref counts so Node's event loop can
+    /// drain naturally — without that drop, a Nest `app.close()` on SIGTERM
+    /// would call this method but the process would still hang until the
+    /// orchestrator force-killed it.
+    ///
+    /// `options.mode`:
+    ///   - `"drain"` (default) — graceful: stop claiming new jobs, fire
+    ///     `AbortSignal` to in-flight handlers, await up to
+    ///     `gracefulTimeoutMs`. Use for routine deploys.
+    ///   - `"force"` — fast: abort runtime tasks immediately and proactively
+    ///     reclaim rows this pod was processing (set running→pending) so
+    ///     other pods pick them up without waiting for heartbeat sweep.
+    ///     Use when SIGKILL is imminent (Kubernetes grace period almost
+    ///     up). Modeled on BullMQ's `worker.close({ force: true })`.
+    ///   - `"abandon"` — last-resort: drop runtime, leave rows alone. The
+    ///     heartbeat sweep on another pod will recover after `staleAfter`.
+    ///     Use only on panic exits.
     #[napi]
-    pub async fn shutdown(&self, graceful_timeout_ms: Option<u32>) -> Result<()> {
+    pub async fn shutdown(&self, options: Option<ShutdownOptions>) -> Result<()> {
         let queue = {
             let mut state = self.state.lock().expect("worker state lock poisoned");
             match std::mem::replace(&mut *state, WorkerState::Stopped) {
@@ -963,9 +1068,37 @@ impl Queue {
             }
         };
 
-        // Fire abort to JS so any in-flight handler's AbortSignal flips.
-        // Held across `.call()` but it's NonBlocking — no await.
-        {
+        let mode = options
+            .as_ref()
+            .and_then(|o| o.mode.as_deref())
+            .unwrap_or("drain");
+        let core_mode = match mode {
+            "drain" => ShutdownMode::Drain,
+            "force" => ShutdownMode::Force,
+            "abandon" => ShutdownMode::Abandon,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "shutdown: invalid mode {other:?} (expected \"drain\" | \"force\" | \"abandon\")"
+                )));
+            }
+        };
+
+        // Drain: fire abort *first* so handlers receive `signal.aborted`
+        // during the graceful-wait window and can wind down cooperatively.
+        //
+        // Force/Abandon: fire abort *after* core shutdown. The Force path
+        // needs to snapshot the `in_flight` set before any handler resolves,
+        // and the abort-callback path can race with that snapshot through
+        // the spawn_blocking yield (JS resolves handler → mark_completed →
+        // in_flight.remove → snapshot finds an empty set). Firing abort
+        // after shutdown_with returns is correct because:
+        //   - Force: runtime tasks are already aborted; JS handlers
+        //     resolving has nowhere to go on the Rust side, but JS still
+        //     gets `signal.aborted` so its event loop drains.
+        //   - Abandon: same — handlers wake up, resolve, JS exits cleanly.
+        //
+        // The TSFN is left on `self.abort_handler` for `close()` to drop.
+        let fire_abort_now = || {
             let guard = self
                 .abort_handler
                 .lock()
@@ -976,24 +1109,82 @@ impl Queue {
                     ThreadsafeFunctionCallMode::NonBlocking,
                 );
             }
-        }
+        };
 
-        let grace = Duration::from_millis(u64::from(graceful_timeout_ms.unwrap_or(30_000)));
-        let shutdown_fut = run(move || async move { queue.shutdown().await.map_err(err) });
-        match tokio::time::timeout(grace, shutdown_fut).await {
-            Ok(res) => res,
-            Err(_) => Err(napi::Error::from_reason(format!(
-                "shutdown exceeded graceful timeout ({:?}) — runtime tasks still in flight",
-                grace
-            ))),
+        if core_mode == ShutdownMode::Drain {
+            fire_abort_now();
+            let grace = Duration::from_millis(u64::from(
+                options
+                    .as_ref()
+                    .and_then(|o| o.graceful_timeout_ms)
+                    .unwrap_or(30_000),
+            ));
+            let fut = run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) });
+            match tokio::time::timeout(grace, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(napi::Error::from_reason(format!(
+                    "shutdown exceeded graceful timeout ({grace:?}) — runtime tasks still in flight. \
+                     Re-run with mode=\"force\" if jobs need to be made re-eligible immediately."
+                ))),
+            }
+        } else {
+            // Force / Abandon both bound their own work and don't honor a
+            // user-supplied timeout — they're already fast paths.
+            let result =
+                run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) }).await;
+            fire_abort_now();
+            result
         }
     }
 
     // --- Lifecycle --------------------------------------------------------
 
-    /// Close the underlying Postgres pool. Call on shutdown.
+    /// Close the underlying Postgres pool and release any retained NAPI
+    /// `ThreadsafeFunction`s. Call on shutdown.
+    ///
+    /// Defensive in two ways:
+    ///   - If `shutdown()` was never called and the queue is `Running`, we
+    ///     run an internal `Abandon` shutdown (drops runtime without
+    ///     awaiting handlers, leaves DB rows for heartbeat-sweep recovery).
+    ///     This isn't graceful — callers should `await queue.shutdown()`
+    ///     first — but it guarantees `close()` can't hang the process.
+    ///   - The abort TSFN is dropped if `shutdown()` didn't already.
+    ///
+    /// After `close()`, no further calls on this `Eddyq` instance are valid.
     #[napi]
     pub async fn close(&self) -> Result<()> {
+        // If the runtime is still running, abandon it so we don't strand
+        // the process. Take the queue out of WorkerState and abandon-shutdown
+        // it before swapping to Stopped — this also drops the handler TSFNs
+        // (held inside the runtime's worker registry) deterministically.
+        let to_abandon = {
+            let mut state = self.state.lock().expect("worker state lock poisoned");
+            match std::mem::replace(&mut *state, WorkerState::Stopped) {
+                WorkerState::Running { queue } => Some(queue),
+                WorkerState::Building { .. } | WorkerState::Stopped => None,
+            }
+        };
+        if let Some(queue) = to_abandon {
+            // Best-effort. If it errors (e.g. NotRunning race), nothing left
+            // to do — we've already swapped state to Stopped.
+            let _ = run(move || async move {
+                queue
+                    .shutdown_with(ShutdownMode::Abandon)
+                    .await
+                    .map_err(err)
+            })
+            .await;
+        }
+
+        // And the abort TSFN if shutdown() didn't already drop it.
+        {
+            let mut guard = self
+                .abort_handler
+                .lock()
+                .expect("abort handler lock poisoned");
+            let _ = guard.take();
+        }
+
         let client = self.client.clone();
         run(move || async move {
             client.close().await;
@@ -1237,6 +1428,72 @@ async fn do_cancel(client: Client, id: i64) -> Result<bool> {
     client.cancel(id).await.map_err(err)
 }
 
+fn item_to_dyn(item: EnqueueManyItem) -> Result<eddyq_client::DynEnqueue> {
+    if item.scheduled_at_ms.is_some() && item.delay_ms.is_some() {
+        return Err(napi::Error::from_reason(
+            "each item must set either scheduledAtMs or delayMs, not both",
+        ));
+    }
+    let mut req = eddyq_client::DynEnqueue::new(item.kind, item.payload);
+    if let Some(n) = item.max_attempts {
+        req.max_attempts = n;
+    }
+    if let Some(p) = item.priority {
+        req.priority = p;
+    }
+    if let Some(q) = item.queue {
+        req.queue = q;
+    }
+    if let Some(ms) = item.scheduled_at_ms {
+        req.scheduled_at = Some(ms_to_utc(ms));
+    }
+    if let Some(ms) = item.delay_ms {
+        req.scheduled_at = Some(Utc::now() + chrono::Duration::milliseconds(ms));
+    }
+    if let Some(k) = item.unique_key {
+        req.unique_key = Some(k);
+    }
+    if let Some(g) = item.group_key {
+        req.group_key = Some(g);
+    }
+    if let Some(t) = item.tags {
+        req.tags = t;
+    }
+    if let Some(m) = item.metadata {
+        req.metadata = m;
+    }
+    Ok(req)
+}
+
+async fn do_enqueue_batch(client: Client, input: EnqueueBatchInput) -> Result<BatchEnqueueOutcome> {
+    if input.items.len() > ENQUEUE_MANY_MAX {
+        return Err(napi::Error::from_reason(format!(
+            "enqueueBatch: batch of {} exceeds max of {}; split client-side",
+            input.items.len(),
+            ENQUEUE_MANY_MAX,
+        )));
+    }
+    let mut reqs: Vec<eddyq_client::DynEnqueue> = Vec::with_capacity(input.items.len());
+    for item in input.items {
+        reqs.push(item_to_dyn(item)?);
+    }
+    let on_complete = match input.on_complete {
+        Some(item) => Some(item_to_dyn(item)?),
+        None => None,
+    };
+    let metadata = input.metadata.unwrap_or(serde_json::Value::Null);
+    let opts = eddyq_client::BatchOptions {
+        on_complete,
+        metadata,
+    };
+    let result = client.enqueue_batch(reqs, opts).await.map_err(err)?;
+    Ok(BatchEnqueueOutcome {
+        batch_id: result.batch_id,
+        inserted: result.inserted as i64,
+        skipped: result.skipped as i64,
+    })
+}
+
 async fn do_get_stats(client: Client) -> Result<JobStats> {
     let stats = client.get_stats().await.map_err(err)?;
     let by_queue_state = stats
@@ -1374,6 +1631,7 @@ async fn do_list_schedules(client: Client) -> Result<Vec<Schedule>> {
             enabled: s.enabled,
             priority: s.priority,
             max_attempts: s.max_attempts,
+            queue: s.queue,
         })
         .collect())
 }

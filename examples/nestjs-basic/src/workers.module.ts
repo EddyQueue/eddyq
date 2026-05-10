@@ -1,22 +1,9 @@
 import { Module } from "@nestjs/common";
 
-import { EddyqModule, type ScheduleDeclaration } from "@eddyq/nestjs";
+import { EddyqModule } from "@eddyq/nestjs";
 
 import { EmailModule } from "./email/email.module.js";
 import { ReportsModule } from "./reports/reports.module.js";
-
-// Cron schedules declared in code. Reconciled against the DB at boot:
-// new entries are inserted, removed entries are deleted. The list is the
-// source of truth — no out-of-band drift via the wakeboard UI.
-const SCHEDULES: ScheduleDeclaration[] = [
-  {
-    name: "daily-report",
-    cronExpr: "0 0 8 * * *", // every day at 08:00:00 UTC (sec min hour dom month dow)
-    kind: "report.generate",
-    payload: { scope: "daily" },
-    priority: 5,
-  },
-];
 
 const DEFAULT_DATABASE_URL =
   "postgres://eddyq:eddyq@localhost:5433/eddyq_dev?options=-c%20search_path%3Dv01";
@@ -28,21 +15,23 @@ const DEFAULT_DATABASE_URL =
  * (email lives entirely under `src/email/`), which matters more as the app
  * grows.
  *
- * `EDDYQ_SUBSCRIBE_TO` lets you deploy differently-shaped worker fleets from
- * the same image.
+ * Schedules and `subscribeTo` are derived automatically from each feature's
+ * `EddyqModule.registerQueue(...)` — this composition root only owns the
+ * connection + worker tuning. Set `EDDYQ_SUBSCRIBE_TO` (CSV) to override and
+ * deploy differently-shaped fleets from the same image.
  */
-const SUBSCRIBE_TO = (process.env.EDDYQ_SUBSCRIBE_TO ?? "default")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const SUBSCRIBE_OVERRIDE = process.env.EDDYQ_SUBSCRIBE_TO
+  ? process.env.EDDYQ_SUBSCRIBE_TO.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  : undefined;
 
 @Module({
   imports: [
     EddyqModule.forRoot({
       databaseUrl: process.env.EDDYQ_DATABASE_URL ?? DEFAULT_DATABASE_URL,
       workerConcurrency: Number(process.env.EDDYQ_WORKER_CONCURRENCY ?? 10),
-      subscribeTo: SUBSCRIBE_TO,
-      schedules: SCHEDULES,
+      ...(SUBSCRIBE_OVERRIDE ? { subscribeTo: SUBSCRIBE_OVERRIDE } : {}),
       // Local-dev convenience — in production, run migrations as a deploy step.
       runMigrations: process.env.EDDYQ_RUN_MIGRATIONS === "true",
     }),

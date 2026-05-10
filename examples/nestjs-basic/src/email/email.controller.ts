@@ -1,6 +1,6 @@
 import { Body, Controller, Post } from "@nestjs/common";
 
-import { InjectEddyq, type Eddyq } from "@eddyq/nestjs";
+import { InjectQueue, type QueueHandle } from "@eddyq/nestjs";
 
 interface SendEmailBody {
   to: string;
@@ -13,7 +13,7 @@ interface SendBulkBody {
 
 @Controller("email")
 export class EmailController {
-  constructor(@InjectEddyq() private readonly queue: Eddyq) {}
+  constructor(@InjectQueue("email") private readonly queue: QueueHandle) {}
 
   @Post("send")
   async send(@Body() body: SendEmailBody): Promise<{ jobId: number | undefined }> {
