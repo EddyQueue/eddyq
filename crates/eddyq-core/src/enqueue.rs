@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 use crate::{
@@ -258,7 +259,7 @@ async fn insert_many<J: Job>(
 /// that don't have a compile-time `Job` trait implementation. All fields are
 /// explicit — the caller provides the defaults a `Job` impl would normally
 /// supply.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynEnqueue {
     pub kind: String,
     pub payload: serde_json::Value,
@@ -270,6 +271,7 @@ pub struct DynEnqueue {
     pub group_key: Option<String>,
     pub tags: Vec<String>,
     pub metadata: serde_json::Value,
+    pub batch_id: Option<i64>,
 }
 
 impl DynEnqueue {
@@ -287,6 +289,7 @@ impl DynEnqueue {
             group_key: None,
             tags: Vec::new(),
             metadata: serde_json::Value::Object(serde_json::Map::new()),
+            batch_id: None,
         }
     }
 }
@@ -297,8 +300,8 @@ async fn insert_dyn(conn: &mut PgConnection, req: DynEnqueue) -> Result<(Enqueue
 
     let row: Option<(JobId,)> = sqlx::query_as(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
-        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
+        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT DO NOTHING
         RETURNING id
         "#,
@@ -313,6 +316,7 @@ async fn insert_dyn(conn: &mut PgConnection, req: DynEnqueue) -> Result<(Enqueue
     .bind(&req.tags)
     .bind(&req.metadata)
     .bind(&req.queue)
+    .bind(req.batch_id)
     .fetch_optional(&mut *conn)
     .await?;
 
@@ -382,6 +386,7 @@ async fn insert_many_dyn(
     let mut tags: Vec<serde_json::Value> = Vec::with_capacity(n);
     let mut metadatas: Vec<serde_json::Value> = Vec::with_capacity(n);
     let mut queues: Vec<String> = Vec::with_capacity(n);
+    let mut batch_ids: Vec<Option<i64>> = Vec::with_capacity(n);
 
     let mut any_due_now = false;
     for req in reqs {
@@ -404,12 +409,13 @@ async fn insert_many_dyn(
         ));
         metadatas.push(req.metadata);
         queues.push(req.queue);
+        batch_ids.push(req.batch_id);
     }
 
     let rows_inserted: (i64,) = sqlx::query_as(
         r#"
         WITH inserted AS (
-            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
             SELECT t.kind,
                    t.payload,
                    'pending',
@@ -420,11 +426,12 @@ async fn insert_many_dyn(
                    t.group_key,
                    COALESCE(ARRAY(SELECT jsonb_array_elements_text(t.tags)), ARRAY[]::text[]),
                    t.metadata,
-                   t.queue
+                   t.queue,
+                   t.batch_id
               FROM UNNEST(
                   $1::text[], $2::jsonb[], $3::smallint[], $4::int[],
-                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[]
-              ) AS t(kind, payload, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
+                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[], $11::bigint[]
+              ) AS t(kind, payload, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
             ON CONFLICT DO NOTHING
          RETURNING id
         )
@@ -441,6 +448,7 @@ async fn insert_many_dyn(
     .bind(&tags)
     .bind(&metadatas)
     .bind(&queues)
+    .bind(&batch_ids)
     .fetch_one(&mut *conn)
     .await?;
 

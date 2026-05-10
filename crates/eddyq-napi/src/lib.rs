@@ -158,6 +158,33 @@ pub struct BulkEnqueueOutcome {
     pub skipped: i64,
 }
 
+/// Input to `enqueueBatch`. `items` is the work; `onComplete` (optional) fires
+/// exactly once when every item reaches a terminal state. The handler receives
+/// counts under `_eddyq_batch` in its payload: `{ batchId, total, completed,
+/// failed, cancelled, durationMs }`.
+#[napi(object)]
+pub struct EnqueueBatchInput {
+    /// Items to enqueue. Mixed `kind` across items is supported. Same 5,000
+    /// per-call cap as `enqueueMany`.
+    pub items: Vec<EnqueueManyItem>,
+    /// Optional callback to enqueue when every item reaches terminal state.
+    /// Fires regardless of mix of success / terminal-failure / cancellation;
+    /// branch on the counts in the payload's `_eddyq_batch` envelope.
+    pub on_complete: Option<EnqueueManyItem>,
+    /// Free-form metadata stored on the batch row (admin / dashboard).
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Result of `enqueueBatch`. `inserted` is the actual count that became jobs;
+/// `skipped` is items that conflicted on `unique_key` (they don't count toward
+/// the batch — the batch's `total` is `inserted`).
+#[napi(object)]
+pub struct BatchEnqueueOutcome {
+    pub batch_id: i64,
+    pub inserted: i64,
+    pub skipped: i64,
+}
+
 /// A pending or applied migration.
 #[napi(object)]
 pub struct MigrationStatus {
@@ -510,6 +537,24 @@ impl Queue {
     pub async fn enqueue_many(&self, items: Vec<EnqueueManyItem>) -> Result<BulkEnqueueOutcome> {
         let client = self.client.clone();
         run(move || do_enqueue_many(client, items)).await
+    }
+
+    /// Enqueue a batch of jobs and (optionally) a callback that fires when
+    /// every item reaches terminal state. Native fan-in primitive — replaces
+    /// the per-app counter table workaround for "run X after these N jobs."
+    ///
+    /// The callback's payload gets a namespaced envelope:
+    /// `{ _eddyq_batch: { batchId, total, completed, failed, cancelled,
+    /// durationMs }, ...userPayload }`. Handler branches on `failed` / `cancelled`
+    /// counts to decide what success vs partial-failure means in its domain.
+    ///
+    /// Items skipped via `uniqueKey` dedup do not count toward the batch's
+    /// `total` — they belong to the batch that originally enqueued them. The
+    /// returned `skipped` reports the count for the caller's logging.
+    #[napi]
+    pub async fn enqueue_batch(&self, input: EnqueueBatchInput) -> Result<BatchEnqueueOutcome> {
+        let client = self.client.clone();
+        run(move || do_enqueue_batch(client, input)).await
     }
 
     /// Cancel a pending job. Returns `true` if cancelled, `false` if the job
@@ -1235,6 +1280,72 @@ async fn do_enqueue_many(
 
 async fn do_cancel(client: Client, id: i64) -> Result<bool> {
     client.cancel(id).await.map_err(err)
+}
+
+fn item_to_dyn(item: EnqueueManyItem) -> Result<eddyq_client::DynEnqueue> {
+    if item.scheduled_at_ms.is_some() && item.delay_ms.is_some() {
+        return Err(napi::Error::from_reason(
+            "each item must set either scheduledAtMs or delayMs, not both",
+        ));
+    }
+    let mut req = eddyq_client::DynEnqueue::new(item.kind, item.payload);
+    if let Some(n) = item.max_attempts {
+        req.max_attempts = n;
+    }
+    if let Some(p) = item.priority {
+        req.priority = p;
+    }
+    if let Some(q) = item.queue {
+        req.queue = q;
+    }
+    if let Some(ms) = item.scheduled_at_ms {
+        req.scheduled_at = Some(ms_to_utc(ms));
+    }
+    if let Some(ms) = item.delay_ms {
+        req.scheduled_at = Some(Utc::now() + chrono::Duration::milliseconds(ms));
+    }
+    if let Some(k) = item.unique_key {
+        req.unique_key = Some(k);
+    }
+    if let Some(g) = item.group_key {
+        req.group_key = Some(g);
+    }
+    if let Some(t) = item.tags {
+        req.tags = t;
+    }
+    if let Some(m) = item.metadata {
+        req.metadata = m;
+    }
+    Ok(req)
+}
+
+async fn do_enqueue_batch(client: Client, input: EnqueueBatchInput) -> Result<BatchEnqueueOutcome> {
+    if input.items.len() > ENQUEUE_MANY_MAX {
+        return Err(napi::Error::from_reason(format!(
+            "enqueueBatch: batch of {} exceeds max of {}; split client-side",
+            input.items.len(),
+            ENQUEUE_MANY_MAX,
+        )));
+    }
+    let mut reqs: Vec<eddyq_client::DynEnqueue> = Vec::with_capacity(input.items.len());
+    for item in input.items {
+        reqs.push(item_to_dyn(item)?);
+    }
+    let on_complete = match input.on_complete {
+        Some(item) => Some(item_to_dyn(item)?),
+        None => None,
+    };
+    let metadata = input.metadata.unwrap_or(serde_json::Value::Null);
+    let opts = eddyq_client::BatchOptions {
+        on_complete,
+        metadata,
+    };
+    let result = client.enqueue_batch(reqs, opts).await.map_err(err)?;
+    Ok(BatchEnqueueOutcome {
+        batch_id: result.batch_id,
+        inserted: result.inserted as i64,
+        skipped: result.skipped as i64,
+    })
 }
 
 async fn do_get_stats(client: Client) -> Result<JobStats> {

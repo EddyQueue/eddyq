@@ -419,19 +419,33 @@ pub async fn cancel(pool: &PgPool, id: JobId) -> Result<bool> {
     // contribute to running_count). So we just transition state + finalized_at.
     // NB: `finalized_at` is our unified name for "entered a terminal state" —
     // it's set on completed, failed (no-more-retries), and cancelled jobs.
-    let res = sqlx::query(
+    // If the job belongs to a batch, settle the batch counter in the same tx.
+    let mut tx = pool.begin().await?;
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
         r#"
         UPDATE eddyq_jobs
            SET state        = 'cancelled',
                finalized_at = NOW()
          WHERE id = $1
            AND state = 'pending'
+     RETURNING batch_id
         "#,
     )
     .bind(id)
-    .execute(pool)
+    .fetch_optional(&mut *tx)
     .await?;
-    Ok(res.rows_affected() > 0)
+
+    let cancelled = row.is_some();
+    if let Some((Some(batch_id),)) = row {
+        crate::batch::settle_terminal(
+            &mut tx,
+            batch_id,
+            crate::batch::TerminalOutcome::Cancelled,
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(cancelled)
 }
 
 /// Per-state retention policy (seconds). `None` = keep forever.
@@ -484,9 +498,10 @@ pub async fn mark_completed(
     // Gate on (state='running' AND worker_id = our uuid) so a worker whose
     // heartbeat was swept can't clobber the job state after another worker
     // picked it up. Decrements both the group counter (if any) AND the queue
-    // counter.
+    // counter, and (if the job belongs to a batch) settles the batch counter
+    // — all in one transaction.
     let mut tx = pool.begin().await?;
-    let row: Option<(Option<String>, String)> = sqlx::query_as(
+    let row: Option<(Option<String>, String, Option<i64>)> = sqlx::query_as(
         r#"
         UPDATE eddyq_jobs
            SET state        = 'completed',
@@ -497,7 +512,7 @@ pub async fn mark_completed(
          WHERE id = $1
            AND state = 'running'
            AND worker_id = $2
-     RETURNING group_key, queue
+     RETURNING group_key, queue, batch_id
         "#,
     )
     .bind(id)
@@ -505,7 +520,7 @@ pub async fn mark_completed(
     .bind(result)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some((group_key, queue)) = row {
+    if let Some((group_key, queue, batch_id)) = row {
         if let Some(g) = group_key {
             sqlx::query(
                 "UPDATE eddyq_groups SET running_count = GREATEST(running_count - 1, 0), updated_at = NOW() WHERE key = $1",
@@ -520,6 +535,10 @@ pub async fn mark_completed(
         .bind(&queue)
         .execute(&mut *tx)
         .await?;
+        if let Some(b) = batch_id {
+            crate::batch::settle_terminal(&mut tx, b, crate::batch::TerminalOutcome::Completed)
+                .await?;
+        }
     }
     tx.commit().await?;
     Ok(())
@@ -546,7 +565,10 @@ pub async fn update_heartbeat_batch(pool: &PgPool, ids: &[i64]) -> Result<u64> {
 
 /// Sweep running jobs whose heartbeat is older than `stale_after`. Jobs that have
 /// hit `max_attempts` are marked failed; the rest are returned to `pending` for
-/// another worker to pick up. In both cases the group counter is decremented.
+/// another worker to pick up. In both cases the group counter is decremented;
+/// jobs that went terminal-failed also bump their batch's failed counter and
+/// the batch's `on_complete` callback may fire (in this same transaction) if
+/// the sweep was the last terminal transition needed.
 /// Returns the number of rows touched.
 pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Result<u64> {
     let secs = i64::try_from(stale_after.as_secs()).unwrap_or(i64::MAX);
@@ -555,8 +577,12 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
         "message": "worker lost contact — job recovered",
     });
 
-    // Sweep + decrement both group and queue counters in one statement.
-    let (recovered,): (i64,) = sqlx::query_as(
+    let mut tx = pool.begin().await?;
+
+    // Sweep + decrement group/queue counters + bump batch failed counters,
+    // all in one statement. Returns (recovered, distinct batch_ids that had
+    // a terminal-fail bump).
+    let (recovered, bumped_batches): (i64, Vec<i64>) = sqlx::query_as(
         r#"
         WITH swept AS (
             UPDATE eddyq_jobs
@@ -567,7 +593,7 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
                    finalized_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
              WHERE state = 'running'
                AND heartbeat_at < NOW() - make_interval(secs => $1)
-         RETURNING group_key, queue
+         RETURNING group_key, queue, batch_id, state
         ),
         group_decrements AS (
             SELECT group_key AS key, COUNT(*)::int AS delta
@@ -579,6 +605,13 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
             SELECT queue AS name, COUNT(*)::int AS delta
               FROM swept
           GROUP BY queue
+        ),
+        batch_failures AS (
+            SELECT batch_id, COUNT(*)::int AS delta
+              FROM swept
+             WHERE batch_id IS NOT NULL
+               AND state = 'failed'
+          GROUP BY batch_id
         ),
         _drop_groups AS (
             UPDATE eddyq_groups g
@@ -595,15 +628,34 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
               FROM queue_decrements d
              WHERE q.name = d.name
             RETURNING q.name
+        ),
+        _bump_batches AS (
+            UPDATE eddyq_batches b
+               SET failed = b.failed + bf.delta
+              FROM batch_failures bf
+             WHERE b.id = bf.batch_id
+            RETURNING b.id
         )
-        SELECT COUNT(*) FROM swept
+        SELECT
+            (SELECT COUNT(*) FROM swept)::bigint,
+            COALESCE(
+                (SELECT ARRAY_AGG(id ORDER BY id) FROM _bump_batches),
+                ARRAY[]::bigint[]
+            )
         "#,
     )
     .bind(secs)
     .bind(error_entry)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
 
+    // For each batch whose counter we just bumped, attempt to claim and fire
+    // the callback. Idempotent under concurrent settlers.
+    for batch_id in bumped_batches {
+        crate::batch::try_claim_and_fire(&mut tx, batch_id).await?;
+    }
+
+    tx.commit().await?;
     Ok(u64::try_from(recovered).unwrap_or(0))
 }
 
@@ -619,6 +671,11 @@ pub async fn mark_failed(
     retry_at: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
+
+    // We only want to settle the batch counter on the *terminal* branch (no
+    // more retries). The retry branch returns the job to 'pending'; we record
+    // batch_id only in the else branch via `terminal_batch_id`.
+    let mut terminal_batch_id: Option<i64> = None;
 
     let row: Option<(Option<String>, String)> = if let Some(at) = retry_at {
         sqlx::query_as(
@@ -642,7 +699,7 @@ pub async fn mark_failed(
         .fetch_optional(&mut *tx)
         .await?
     } else {
-        sqlx::query_as(
+        let r: Option<(Option<String>, String, Option<i64>)> = sqlx::query_as(
             r#"
             UPDATE eddyq_jobs
                SET state        = 'failed',
@@ -653,14 +710,18 @@ pub async fn mark_failed(
              WHERE id = $1
                AND state = 'running'
                AND worker_id = $3
-         RETURNING group_key, queue
+         RETURNING group_key, queue, batch_id
             "#,
         )
         .bind(id)
         .bind(error_entry)
         .bind(worker_id)
         .fetch_optional(&mut *tx)
-        .await?
+        .await?;
+        r.map(|(g, q, b)| {
+            terminal_batch_id = b;
+            (g, q)
+        })
     };
 
     if let Some((group_key, queue)) = row {
@@ -678,6 +739,10 @@ pub async fn mark_failed(
         .bind(&queue)
         .execute(&mut *tx)
         .await?;
+        if let Some(b) = terminal_batch_id {
+            crate::batch::settle_terminal(&mut tx, b, crate::batch::TerminalOutcome::Failed)
+                .await?;
+        }
     }
     tx.commit().await?;
     Ok(())

@@ -14,9 +14,9 @@ use std::time::Duration;
 use sqlx::{PgPool, postgres::PgPoolOptions};
 
 pub use eddyq_core::{
-    BulkEnqueueResult, Directive, DynEnqueue, EnqueueResult, Error, HandlerFailure, JobContext,
-    JobId, JobResult, JobState, Queue as CoreQueue, QueueBuilder as CoreQueueBuilder, QueueConfig,
-    Result,
+    BatchEnqueueResult, BatchOptions, BulkEnqueueResult, Directive, DynEnqueue, EnqueueResult,
+    Error, HandlerFailure, JobContext, JobId, JobResult, JobState, Queue as CoreQueue,
+    QueueBuilder as CoreQueueBuilder, QueueConfig, Result,
     group::{Group, GroupRule, StoredRule},
     migrate::{Direction, MigrateReport, MigrationStatus},
     named_queue::NamedQueue,
@@ -119,6 +119,17 @@ impl Client {
     /// `enqueue` N times. Supports mixed `kind` across the batch.
     pub async fn enqueue_many(&self, reqs: Vec<DynEnqueue>) -> Result<BulkEnqueueResult> {
         eddyq_core::enqueue::enqueue_many_dyn(&self.pool, reqs).await
+    }
+
+    /// Native batch enqueue. Groups N jobs and an optional `on_complete`
+    /// callback that fires exactly once when every job in the batch reaches
+    /// terminal state.
+    pub async fn enqueue_batch(
+        &self,
+        items: Vec<DynEnqueue>,
+        opts: BatchOptions,
+    ) -> Result<BatchEnqueueResult> {
+        eddyq_core::batch::enqueue_batch(&self.pool, items, opts).await
     }
 
     pub async fn enqueue_in_tx(

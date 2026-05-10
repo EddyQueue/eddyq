@@ -10,6 +10,18 @@
 - **Transactional enqueue.** Enqueue a job in the same transaction as your business write. No more "the job ran before the row committed" bugs.
 - **First-class Node bindings.** `pnpm add @eddyq/queue` and ship from NestJS, Next.js, or any Node app.
 - **Group concurrency.** Limit concurrent jobs per tenant, per provider, per anything.
+- **Native batches.** Fan out N jobs and run a callback exactly once when they all settle — no per-app counter table.
+
+## Batches
+
+```ts
+const { batchId } = await eddyq.enqueueBatch({
+  items: shards.map((s) => ({ kind: "klaviyo.shard", payload: s })),
+  onComplete: { kind: "klaviyo.attribution.recompute", payload: { integrationId } },
+});
+```
+
+`onComplete` fires once when every item reaches a terminal state (success, terminal failure, or cancellation). The handler's payload gets a `_eddyq_batch` envelope with `{ batchId, total, completed, failed, cancelled, durationMs }` — branch on the counts to decide what success vs partial-failure means in your domain. End-to-end example: [`packages/queue/smoke-batch.mjs`](packages/queue/smoke-batch.mjs).
 
 ## Migrations are a deploy step
 
