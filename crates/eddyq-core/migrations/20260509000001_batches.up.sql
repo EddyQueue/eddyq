@@ -1,9 +1,5 @@
--- eddyq batches: native fan-in primitive.
---
--- A batch groups N jobs and tracks their collective terminal-state count, so
--- that an `on_complete` callback fires exactly once when every job in the batch
--- has reached a terminal state (completed, failed, or cancelled). This avoids
--- the per-app counter table workaround (e.g. nexmail's klaviyo_events_backfill_runs).
+-- eddyq batches: groups N jobs and fires `on_complete` exactly once when every
+-- job in the batch reaches a terminal state.
 
 CREATE TABLE eddyq_batches (
     id                   BIGSERIAL   PRIMARY KEY,
@@ -25,12 +21,18 @@ CREATE TABLE eddyq_batches (
         CHECK (completed + failed + cancelled <= total)
 );
 
-ALTER TABLE eddyq_jobs
-    ADD COLUMN batch_id BIGINT REFERENCES eddyq_batches(id) ON DELETE SET NULL;
+-- FK added in three steps so VALIDATE can be split into its own migration
+-- later for zero-downtime upgrades on populated eddyq_jobs tables.
+ALTER TABLE eddyq_jobs ADD COLUMN batch_id BIGINT;
 
--- Serves: terminal-transition lookup of "still-running jobs in batch X" and
--- the maintenance fallback sweep that scans for batches whose counters reached
--- total but whose callback never fired (should be empty in steady state).
+ALTER TABLE eddyq_jobs
+    ADD CONSTRAINT eddyq_jobs_batch_id_fkey
+    FOREIGN KEY (batch_id) REFERENCES eddyq_batches(id)
+    ON DELETE SET NULL
+    NOT VALID;
+
+ALTER TABLE eddyq_jobs VALIDATE CONSTRAINT eddyq_jobs_batch_id_fkey;
+
 CREATE INDEX eddyq_jobs_batch
     ON eddyq_jobs (batch_id)
     WHERE batch_id IS NOT NULL;

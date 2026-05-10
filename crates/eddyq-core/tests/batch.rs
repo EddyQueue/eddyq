@@ -652,3 +652,463 @@ async fn batch_retry_does_not_increment(pool: PgPool) {
     assert_eq!(completed, 1);
     assert_eq!(succeed_counter.load(Ordering::SeqCst), 1);
 }
+
+// ─── Extended coverage: metadata, return values, isolation, scale ──────────
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_metadata_persists(pool: PgPool) {
+    let metadata = serde_json::json!({ "tenant": "acme", "purpose": "backfill" });
+    let result = enqueue_batch(
+        &pool,
+        vec![item("batch.item", 0)],
+        BatchOptions {
+            on_complete: None,
+            metadata: metadata.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.inserted, 1);
+
+    let (stored,): (serde_json::Value,) =
+        sqlx::query_as("SELECT metadata FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, metadata);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_no_callback_state_still_complete(pool: PgPool) {
+    // No on_complete configured. The batch should still progress to
+    // state='complete' once all items terminate, and no callback row should
+    // be inserted.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchItem, _>(BatchItemWorker {
+            counter: counter.clone(),
+            fail_n: None,
+        })
+        .config(fast_config())
+        .build();
+
+    let items: Vec<DynEnqueue> = (0..3u64).map(|n| item("batch.item", n)).collect();
+    let result = enqueue_batch(&pool, items, BatchOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(result.inserted, 3);
+
+    queue.start().unwrap();
+    poll_until("3 items complete", || async {
+        counter.load(Ordering::SeqCst) >= 3
+    })
+    .await;
+    poll_until("batch row reaches state='complete'", || async {
+        let s: String = sqlx::query_scalar("SELECT state FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        s == "complete"
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    let (callback_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM eddyq_jobs WHERE kind = 'batch.done'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        callback_count, 0,
+        "no callback configured → no callback job inserted"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_callback_payload_envelope_complete(pool: PgPool) {
+    // Verify all six envelope fields are present + the user payload survives.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let fired = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchItem, _>(BatchItemWorker {
+            counter: counter.clone(),
+            fail_n: None,
+        })
+        .register::<BatchDone, _>(BatchDoneWorker {
+            fired: fired.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    let on_complete = DynEnqueue::new(
+        "batch.done",
+        serde_json::json!({ "tenant": "acme", "ix": 7 }),
+    );
+    let result = enqueue_batch(
+        &pool,
+        (0..2u64).map(|n| item("batch.item", n)).collect(),
+        BatchOptions {
+            on_complete: Some(on_complete),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.inserted, 2);
+
+    queue.start().unwrap();
+    poll_until("callback fires", || async {
+        fired.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    let (payload,): (serde_json::Value,) = sqlx::query_as(
+        "SELECT payload FROM eddyq_jobs WHERE unique_key = $1",
+    )
+    .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let env = payload.get("_eddyq_batch").expect("envelope present");
+    for k in [
+        "batchId",
+        "total",
+        "completed",
+        "failed",
+        "cancelled",
+        "durationMs",
+    ] {
+        assert!(env.get(k).is_some(), "envelope missing field {k}");
+    }
+    assert_eq!(env.get("batchId").unwrap(), &serde_json::json!(result.batch_id));
+    assert_eq!(env.get("total").unwrap(), &serde_json::json!(2));
+    assert_eq!(env.get("completed").unwrap(), &serde_json::json!(2));
+    assert_eq!(env.get("failed").unwrap(), &serde_json::json!(0));
+    assert_eq!(env.get("cancelled").unwrap(), &serde_json::json!(0));
+    assert!(env.get("durationMs").unwrap().as_i64().unwrap() >= 0);
+    assert_eq!(payload.get("tenant").unwrap(), &serde_json::json!("acme"));
+    assert_eq!(payload.get("ix").unwrap(), &serde_json::json!(7));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_large_settles_25_items(pool: PgPool) {
+    // 25 items isn't huge but it's enough to exercise the bulk INSERT path,
+    // multiple workers, and the counter under sustained throughput.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let fired = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchItem, _>(BatchItemWorker {
+            counter: counter.clone(),
+            fail_n: None,
+        })
+        .register::<BatchDone, _>(BatchDoneWorker {
+            fired: fired.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    let items: Vec<DynEnqueue> = (0..25u64).map(|n| item("batch.item", n)).collect();
+    let on_complete = DynEnqueue::new("batch.done", serde_json::json!({}));
+    let result = enqueue_batch(
+        &pool,
+        items,
+        BatchOptions {
+            on_complete: Some(on_complete),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.inserted, 25);
+    assert_eq!(result.skipped, 0);
+
+    queue.start().unwrap();
+    poll_until("25 items + callback fire", || async {
+        counter.load(Ordering::SeqCst) >= 25 && fired.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    let (state, completed): (String, i32) =
+        sqlx::query_as("SELECT state, completed FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "complete");
+    assert_eq!(completed, 25);
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_mixed_kinds_in_one_batch(pool: PgPool) {
+    // Items with two distinct `kind` strings in one batch — both must count
+    // toward the same batch's counters, and the callback fires when both
+    // complete.
+    let item_counter = Arc::new(AtomicUsize::new(0));
+    let flaky_counter = Arc::new(AtomicUsize::new(0));
+    let fired = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchItem, _>(BatchItemWorker {
+            counter: item_counter.clone(),
+            fail_n: None,
+        })
+        .register::<BatchFlaky, _>(BatchFlakyWorker {
+            counter: flaky_counter.clone(),
+        })
+        .register::<BatchDone, _>(BatchDoneWorker {
+            fired: fired.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    let items: Vec<DynEnqueue> = vec![
+        item("batch.item", 0),
+        item("batch.item", 1),
+        DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 1 })),
+        DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 1 })),
+    ];
+    let on_complete = DynEnqueue::new("batch.done", serde_json::json!({}));
+    let result = enqueue_batch(
+        &pool,
+        items,
+        BatchOptions {
+            on_complete: Some(on_complete),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.inserted, 4);
+
+    queue.start().unwrap();
+    poll_until("all 4 items + callback fire", || async {
+        item_counter.load(Ordering::SeqCst) >= 2
+            && flaky_counter.load(Ordering::SeqCst) >= 2
+            && fired.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    let (state, completed): (String, i32) =
+        sqlx::query_as("SELECT state, completed FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "complete");
+    assert_eq!(completed, 4);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_concurrent_independent_batches(pool: PgPool) {
+    // Two batches running side-by-side. Each must settle on its own counters,
+    // fire its own callback exactly once, and not interfere with the other.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let fired = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchItem, _>(BatchItemWorker {
+            counter: counter.clone(),
+            fail_n: None,
+        })
+        .register::<BatchDone, _>(BatchDoneWorker {
+            fired: fired.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    let on_complete_a = DynEnqueue::new("batch.done", serde_json::json!({ "which": "A" }));
+    let on_complete_b = DynEnqueue::new("batch.done", serde_json::json!({ "which": "B" }));
+    let a = enqueue_batch(
+        &pool,
+        (0..3u64).map(|n| item("batch.item", n)).collect(),
+        BatchOptions {
+            on_complete: Some(on_complete_a),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    let b = enqueue_batch(
+        &pool,
+        (10..13u64).map(|n| item("batch.item", n)).collect(),
+        BatchOptions {
+            on_complete: Some(on_complete_b),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(a.batch_id, b.batch_id);
+    assert_eq!(a.inserted, 3);
+    assert_eq!(b.inserted, 3);
+
+    queue.start().unwrap();
+    poll_until("6 items + 2 callbacks fire", || async {
+        counter.load(Ordering::SeqCst) >= 6 && fired.load(Ordering::SeqCst) >= 2
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    for bid in [a.batch_id, b.batch_id] {
+        let (state, completed): (String, i32) =
+            sqlx::query_as("SELECT state, completed FROM eddyq_batches WHERE id = $1")
+                .bind(bid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "complete");
+        assert_eq!(completed, 3);
+        let (cb_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM eddyq_jobs WHERE unique_key = $1",
+        )
+        .bind(format!("eddyq.batch.{}.callback", bid))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cb_count, 1);
+    }
+    assert_eq!(fired.load(Ordering::SeqCst), 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_all_failures_fires_with_completed_zero(pool: PgPool) {
+    // Every item terminal-fails. The single-callback policy means on_complete
+    // still fires, with completed=0 and failed=N. Caller branches in the handler.
+    let fired = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchFlaky, _>(BatchFlakyWorker {
+            counter: Arc::new(AtomicUsize::new(0)),
+        })
+        .register::<BatchDone, _>(BatchDoneWorker {
+            fired: fired.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    // fail_until_attempt=999 with max_attempts=1 ⇒ guaranteed terminal-fail
+    // on first run (attempt < 999, so worker bails; no more retries available).
+    let items: Vec<DynEnqueue> = (0..3u64)
+        .map(|_| {
+            let mut d =
+                DynEnqueue::new("batch.flaky", serde_json::json!({ "fail_until_attempt": 999 }));
+            d.max_attempts = 1;
+            d
+        })
+        .collect();
+    let on_complete = DynEnqueue::new("batch.done", serde_json::json!({}));
+    let result = enqueue_batch(
+        &pool,
+        items,
+        BatchOptions {
+            on_complete: Some(on_complete),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.inserted, 3);
+
+    queue.start().unwrap();
+    poll_until("callback fires after all-failures", || async {
+        fired.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    let (state, completed, failed): (String, i32, i32) =
+        sqlx::query_as("SELECT state, completed, failed FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "complete");
+    assert_eq!(completed, 0);
+    assert_eq!(failed, 3);
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+
+    let (payload,): (serde_json::Value,) =
+        sqlx::query_as("SELECT payload FROM eddyq_jobs WHERE unique_key = $1")
+            .bind(format!("eddyq.batch.{}.callback", result.batch_id))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let env = payload.get("_eddyq_batch").unwrap();
+    assert_eq!(env.get("completed").unwrap(), &serde_json::json!(0));
+    assert_eq!(env.get("failed").unwrap(), &serde_json::json!(3));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn batch_unbatched_jobs_dont_affect_batches(pool: PgPool) {
+    // An unbatched job (enqueue_dyn) and a batched job in the same queue.
+    // The unbatched job's terminal transition must NOT touch any batch row.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let fired = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<BatchItem, _>(BatchItemWorker {
+            counter: counter.clone(),
+            fail_n: None,
+        })
+        .register::<BatchDone, _>(BatchDoneWorker {
+            fired: fired.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    eddyq_core::enqueue::enqueue_dyn(&pool, item("batch.item", 999))
+        .await
+        .unwrap();
+
+    let on_complete = DynEnqueue::new("batch.done", serde_json::json!({}));
+    let result = enqueue_batch(
+        &pool,
+        vec![item("batch.item", 0), item("batch.item", 1)],
+        BatchOptions {
+            on_complete: Some(on_complete),
+            metadata: serde_json::Value::Null,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.inserted, 2);
+
+    queue.start().unwrap();
+    poll_until("3 items run + callback fires", || async {
+        // 3 user items (1 unbatched + 2 batched), and callback fires.
+        counter.load(Ordering::SeqCst) >= 3 && fired.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    queue.shutdown().await.unwrap();
+
+    let (batch_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM eddyq_batches")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(batch_count, 1, "exactly one batch row exists");
+
+    let (state, completed): (String, i32) =
+        sqlx::query_as("SELECT state, completed FROM eddyq_batches WHERE id = $1")
+            .bind(result.batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "complete");
+    assert_eq!(
+        completed, 2,
+        "only the 2 batched items contribute; the unbatched job is invisible to the batch"
+    );
+
+    // Verify the unbatched job exists, completed, and has batch_id=NULL.
+    let (unbatched_state, batch_id): (String, Option<i64>) = sqlx::query_as(
+        "SELECT state, batch_id FROM eddyq_jobs WHERE kind = 'batch.item' AND payload->>'n' = '999'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unbatched_state, "completed");
+    assert!(batch_id.is_none());
+}
