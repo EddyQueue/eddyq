@@ -1101,19 +1101,20 @@ impl Queue {
             }
         };
 
-        // Drain: fire abort *first* so handlers receive `signal.aborted`
-        // during the graceful-wait window and can wind down cooperatively.
+        // Drain & Abandon: fire abort *first* so JS handlers receive
+        // `signal.aborted` and can clear their timers / resolve before the
+        // runtime tears down its TSFN refs. Without this, hostile-but-
+        // cooperative handlers can strand the Node event loop (their setTimeout
+        // never gets cleared because the abort callback was queued behind a
+        // close() that releases the TSFN).
         //
-        // Force/Abandon: fire abort *after* core shutdown. The Force path
-        // needs to snapshot the `in_flight` set before any handler resolves,
-        // and the abort-callback path can race with that snapshot through
-        // the spawn_blocking yield (JS resolves handler → mark_completed →
-        // in_flight.remove → snapshot finds an empty set). Firing abort
-        // after shutdown_with returns is correct because:
-        //   - Force: runtime tasks are already aborted; JS handlers
-        //     resolving has nowhere to go on the Rust side, but JS still
-        //     gets `signal.aborted` so its event loop drains.
-        //   - Abandon: same — handlers wake up, resolve, JS exits cleanly.
+        // Force: fire abort *after* core shutdown. The Force path needs to
+        // snapshot the `in_flight` set before any handler resolves, and the
+        // abort-callback path can race with that snapshot through the
+        // spawn_blocking yield (JS resolves handler → mark_completed →
+        // in_flight.remove → snapshot finds an empty set). Force's reclaim
+        // still calls `c.abort(reason)` from JS once shutdown_with returns,
+        // so handlers eventually drain.
         //
         // The TSFN is left on `self.abort_handler` for `close()` to drop.
         let fire_abort_now = || {
@@ -1129,29 +1130,36 @@ impl Queue {
             }
         };
 
-        if core_mode == ShutdownMode::Drain {
-            fire_abort_now();
-            let grace = Duration::from_millis(u64::from(
-                options
-                    .as_ref()
-                    .and_then(|o| o.graceful_timeout_ms)
-                    .unwrap_or(30_000),
-            ));
-            let fut = run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) });
-            match tokio::time::timeout(grace, fut).await {
-                Ok(res) => res,
-                Err(_) => Err(napi::Error::from_reason(format!(
-                    "shutdown exceeded graceful timeout ({grace:?}) — runtime tasks still in flight. \
-                     Re-run with mode=\"force\" if jobs need to be made re-eligible immediately."
-                ))),
+        match core_mode {
+            ShutdownMode::Drain => {
+                fire_abort_now();
+                let grace = Duration::from_millis(u64::from(
+                    options
+                        .as_ref()
+                        .and_then(|o| o.graceful_timeout_ms)
+                        .unwrap_or(30_000),
+                ));
+                let fut =
+                    run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) });
+                match tokio::time::timeout(grace, fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(napi::Error::from_reason(format!(
+                        "shutdown exceeded graceful timeout ({grace:?}) — runtime tasks still in flight. \
+                         Re-run with mode=\"force\" if jobs need to be made re-eligible immediately."
+                    ))),
+                }
             }
-        } else {
-            // Force / Abandon both bound their own work and don't honor a
-            // user-supplied timeout — they're already fast paths.
-            let result =
-                run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) }).await;
-            fire_abort_now();
-            result
+            ShutdownMode::Abandon => {
+                fire_abort_now();
+                run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) }).await
+            }
+            ShutdownMode::Force => {
+                let result =
+                    run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) })
+                        .await;
+                fire_abort_now();
+                result
+            }
         }
     }
 

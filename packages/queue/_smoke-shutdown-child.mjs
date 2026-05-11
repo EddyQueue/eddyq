@@ -141,8 +141,11 @@ async function abandonShutdown() {
   const elapsed = Date.now() - t;
   if (elapsed > 2000) throw new Error(`abandon shutdown took ${elapsed}ms`);
 
-  // Abandon must NOT touch the row — it stays `running` until the next
-  // pod's heartbeat sweep recovers it.
+  // Abandon contract: don't bother awaiting handlers, don't reclaim. The row
+  // typically stays `running` (heartbeat sweep recovers it later), but it's
+  // also fine if the handler happened to resolve cooperatively before tokio
+  // aborted the worker — `completed` is a benign outcome. What we DON'T want
+  // is `pending` (would imply an unexpected retry path was taken).
   const { default: pg } = await import("pg");
   const c = new pg.Client({ connectionString: DB_URL });
   await c.connect();
@@ -151,9 +154,9 @@ async function abandonShutdown() {
     [KIND],
   );
   await c.end();
-  if (rows[0].state !== "running") {
+  if (rows[0].state !== "running" && rows[0].state !== "completed") {
     throw new Error(
-      `abandon-shutdown: row state should be 'running' (untouched); got ${rows[0].state}`,
+      `abandon-shutdown: row state should be 'running' or 'completed'; got ${rows[0].state}`,
     );
   }
 
