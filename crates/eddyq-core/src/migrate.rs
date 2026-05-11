@@ -87,6 +87,12 @@ pub const MIGRATIONS: &[Migration] = &[
         up_sql: include_str!("../migrations/20260509000001_batches.up.sql"),
         down_sql: include_str!("../migrations/20260509000001_batches.down.sql"),
     },
+    Migration {
+        version: 20_260_511_000_001,
+        name: "schedule_intervals",
+        up_sql: include_str!("../migrations/20260511000001_schedule_intervals.up.sql"),
+        down_sql: include_str!("../migrations/20260511000001_schedule_intervals.down.sql"),
+    },
 ];
 
 /// Fresh-install DDL for the tracking table: composite PK `(line, version)`

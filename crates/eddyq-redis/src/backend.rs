@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use eddyq_core::backend::{Backend, BackendCaps};
+use eddyq_core::backend::{Backend, BackendCaps, CleanState};
 use eddyq_core::{
-    BulkEnqueueResult, DynEnqueue, EnqueueResult, JobId,
+    BulkEnqueueResult, DynEnqueue, EnqueueResult, JobId, RetentionRule,
     fetch::{ClaimedJob, Retention},
     group::{Group, GroupRule, StoredRule},
     named_queue::NamedQueue,
@@ -196,12 +196,13 @@ impl RedisBackend {
 
     /// Read just the cron string for a stored schedule. Used by
     /// `set_schedule_enabled` to recompute `next_run_at` on re-enable.
+    /// Returns `None` when the row is interval-driven (no cron to read).
     async fn lookup_cron(&self, name: &str) -> eddyq_core::Result<Option<String>> {
         let all = self.list_schedules().await?;
         Ok(all
             .into_iter()
             .find(|s| s.name == name)
-            .map(|s| s.cron_expr))
+            .and_then(|s| s.cron_expr))
     }
 
     async fn promote_delayed_call(&self, now_ms: i64) -> eddyq_core::Result<usize> {
@@ -268,11 +269,19 @@ impl RedisBackend {
                 continue;
             };
             // Interval > 0 → fixed-cadence schedule. Otherwise parse the
-            // stored cron expression to compute the next run.
+            // stored cron expression to compute the next run. Missing cron
+            // on a non-interval row means the stored entry is malformed —
+            // surface as a Cron error rather than panicking.
             let next_ms = if stored.interval_ms > 0 {
                 now_ms + stored.interval_ms
             } else {
-                next_run_ms_or_err(&stored.schedule.cron_expr)?
+                let expr = stored.schedule.cron_expr.as_deref().ok_or_else(|| {
+                    eddyq_core::Error::Cron(format!(
+                        "schedule {:?} has no cron_expr and no interval_ms (malformed)",
+                        stored.schedule.name
+                    ))
+                })?;
+                next_run_ms_or_err(expr)?
             };
             self.schedule_fire_call(&stored.schedule, now_ms, next_ms)
                 .await?;
@@ -580,12 +589,27 @@ fn decode_stored(name: &str, raw: &str) -> Option<StoredSchedule> {
     };
     let payload: serde_json::Value =
         serde_json::from_str(&stored.payload).unwrap_or(serde_json::Value::Null);
+    // Map back to the cross-backend `Schedule` shape: cron and interval are
+    // mutually exclusive triggers, so empty cron + positive interval_ms means
+    // interval-driven (cron_expr=None, interval_ms=Some(N)); else cron-driven.
+    let is_interval = stored.interval_ms > 0;
+    let cron_expr = if is_interval || stored.cron.is_empty() {
+        None
+    } else {
+        Some(stored.cron)
+    };
+    let core_interval = if is_interval {
+        Some(stored.interval_ms)
+    } else {
+        None
+    };
     Some(StoredSchedule {
         schedule: Schedule {
             name: name.to_owned(),
             kind: stored.kind,
             payload,
-            cron_expr: stored.cron,
+            cron_expr,
+            interval_ms: core_interval,
             next_run_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
                 stored.next_run_at_ms,
             )
@@ -626,12 +650,11 @@ fn dyn_to_argv(req: &DynEnqueue) -> [String; 12] {
         req.queue.clone(),
         serde_json::to_string(&req.tags).unwrap_or_else(|_| "[]".into()),
         req.metadata.to_string(),
-        // remove_on_complete + remove_on_fail aren't on `DynEnqueue` today.
-        // PR2 adds Redis-side retention; the API surface for setting these
-        // per-call is a follow-up. For now they're empty (= keep with the
-        // queue-default cleanup loop's retention).
-        String::new(),
-        String::new(),
+        // BullMQ-style per-job retention. Empty string = no rule; the
+        // Lua `apply_retention` helper falls back to ZADDing the job into
+        // the finalized ZSET so the queue-default `cleanup` tick can sweep it.
+        RetentionRule::to_arg(req.remove_on_complete.as_ref()),
+        RetentionRule::to_arg(req.remove_on_fail.as_ref()),
     ]
 }
 
@@ -1184,13 +1207,124 @@ impl Backend for RedisBackend {
         Ok(value_to_u64(value))
     }
 
-    async fn cleanup(&self, _retention: Retention) -> eddyq_core::Result<(u64, u64, u64, u64)> {
-        // Queue-default cleanup tick lands in PR3 (it's leader-driven, more
-        // logic than the per-job inline retention covers). Per-job retention
-        // ALREADY runs inline in complete/fail; the queue-default sweep
-        // exists for jobs whose owners didn't set per-job retention. Until
-        // PR3, this is a no-op.
-        Ok((0, 0, 0, 0))
+    async fn cleanup(&self, retention: Retention) -> eddyq_core::Result<(u64, u64, u64, u64)> {
+        // Bounded per call so a backlog can't block the Redis event loop —
+        // the leader cleanup_loop ticks again on the next interval and
+        // drains over many calls. Per-job retention already ran inline at
+        // complete/fail time; this is only for jobs whose owner set no
+        // per-job rule, or explicitly set `false`.
+        const PER_STATE_LIMIT: u32 = 500;
+        if retention.completed_secs.is_none()
+            && retention.failed_secs.is_none()
+            && retention.cancelled_secs.is_none()
+        {
+            return Ok((0, 0, 0, 0));
+        }
+        let mut conn = self.conn_clone();
+        let prefix = self.prefix.clone();
+        let now_ms = self.now_ms().to_string();
+        // -1 = skip this state; otherwise the configured age in seconds.
+        // The Lua side distinguishes `0` ("sweep everything past now") from
+        // `< 0` ("no rule configured for this state").
+        let age_to_arg = |o: Option<u64>| match o {
+            None => "-1".to_string(),
+            Some(s) => i64::try_from(s).unwrap_or(i64::MAX).to_string(),
+        };
+        let c = age_to_arg(retention.completed_secs);
+        let f = age_to_arg(retention.failed_secs);
+        let x = age_to_arg(retention.cancelled_secs);
+        let limit = PER_STATE_LIMIT.to_string();
+
+        let value: redis::Value = with_retry(&mut conn, |mut conn| {
+            let prefix = prefix.clone();
+            let now_ms = now_ms.clone();
+            let c = c.clone();
+            let f = f.clone();
+            let x = x.clone();
+            let limit = limit.clone();
+            async move {
+                redis::cmd("FCALL")
+                    .arg(FN_CLEANUP)
+                    .arg(1)
+                    .arg(&prefix)
+                    .arg(&now_ms)
+                    .arg(&c)
+                    .arg(&f)
+                    .arg(&x)
+                    .arg(&limit)
+                    .query_async(&mut conn)
+                    .await
+            }
+        })
+        .await?;
+
+        // Lua returns { n_completed, n_failed, n_cancelled, 0 } as bulk strings.
+        // Reuse value_to_u64 element-wise; tolerate short replies defensively.
+        let arr = match value {
+            redis::Value::Array(a) => a,
+            _ => return Ok((0, 0, 0, 0)),
+        };
+        let get = |i: usize| arr.get(i).cloned().map(value_to_u64).unwrap_or(0);
+        Ok((get(0), get(1), get(2), get(3)))
+    }
+
+    async fn clean(
+        &self,
+        grace: Duration,
+        limit: u32,
+        state: CleanState,
+    ) -> eddyq_core::Result<u64> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let mut conn = self.conn_clone();
+        let prefix = self.prefix.clone();
+        let now_ms = self.now_ms().to_string();
+        let grace_secs = grace.as_secs().to_string();
+        let limit_s = limit.to_string();
+        // -1 on the two states we're not targeting so fn_cleanup skips them
+        // (the targeted state gets the actual grace, which may be 0 meaning
+        // "sweep everything past now").
+        let skip = "-1".to_string();
+        let (c, f, x) = match state {
+            CleanState::Completed => (grace_secs.clone(), skip.clone(), skip),
+            CleanState::Failed => (skip.clone(), grace_secs.clone(), skip),
+            CleanState::Cancelled => (skip.clone(), skip, grace_secs.clone()),
+        };
+
+        let value: redis::Value = with_retry(&mut conn, |mut conn| {
+            let prefix = prefix.clone();
+            let now_ms = now_ms.clone();
+            let c = c.clone();
+            let f = f.clone();
+            let x = x.clone();
+            let limit_s = limit_s.clone();
+            async move {
+                redis::cmd("FCALL")
+                    .arg(FN_CLEANUP)
+                    .arg(1)
+                    .arg(&prefix)
+                    .arg(&now_ms)
+                    .arg(&c)
+                    .arg(&f)
+                    .arg(&x)
+                    .arg(&limit_s)
+                    .query_async(&mut conn)
+                    .await
+            }
+        })
+        .await?;
+
+        let arr = match value {
+            redis::Value::Array(a) => a,
+            _ => return Ok(0),
+        };
+        let pick = match state {
+            CleanState::Completed => 0,
+            CleanState::Failed => 1,
+            CleanState::Cancelled => 2,
+        };
+        Ok(arr.get(pick).cloned().map(value_to_u64).unwrap_or(0))
     }
 
     async fn reclaim_in_flight(&self, ids: &[JobId]) -> eddyq_core::Result<u64> {
@@ -1394,6 +1528,31 @@ impl Backend for RedisBackend {
             true,
             next_run,
             0, // interval_ms = 0 → cron-driven
+        )
+        .await
+    }
+
+    async fn upsert_interval_schedule_raw(
+        &self,
+        name: &str,
+        interval_ms: i64,
+        kind: &str,
+        payload: serde_json::Value,
+        priority: i16,
+        max_attempts: i32,
+        queue: &str,
+    ) -> eddyq_core::Result<()> {
+        // Delegate to the existing inherent method so there's one source
+        // of truth for the validation + Lua call shape.
+        RedisBackend::upsert_interval_schedule_raw(
+            self,
+            name,
+            interval_ms,
+            kind,
+            payload,
+            priority,
+            max_attempts,
+            queue,
         )
         .await
     }

@@ -191,7 +191,7 @@ export interface GroupProfile {
  */
 export type QueueDefaults = Pick<
   EnqueueOptions,
-  "maxAttempts" | "priority" | "tags"
+  "maxAttempts" | "priority" | "tags" | "removeOnComplete" | "removeOnFail"
 >;
 
 /** Per-enqueue overrides accepted by `QueueHandle.enqueue`. The `queue` field is bound by the handle and not accepted. */
@@ -228,6 +228,22 @@ export interface QueueHandle {
 
   /** Fan-in batch: items + optional onComplete callback. See `Eddyq.enqueueBatch`. */
   enqueueBatch(input: QueueEnqueueBatchInput): Promise<BatchEnqueueOutcome>;
+
+  /**
+   * Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+   * finalized jobs in `state` older than `graceMs` milliseconds. Useful for
+   * one-shot pruning from admin endpoints or maintenance scripts; routine
+   * retention should go through the configured cleanup tick instead.
+   *
+   * Note: this is a *global* sweep, not scoped to this handle's queue name —
+   * the underlying delete operates on `state + finalized_at`, not on queue.
+   * Run it from one designated handle if you need a single entry point.
+   */
+  clean(
+    graceMs: number,
+    limit: number,
+    state: "completed" | "failed" | "cancelled",
+  ): Promise<number>;
 
   /**
    * Return a sub-handle pre-bound to a group key. The first call for a

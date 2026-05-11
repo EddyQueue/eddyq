@@ -49,3 +49,4 @@ pub const FN_LIST_JOBS: &str = "eddyq_list_jobs";
 pub const FN_GROUP_SET_RULE: &str = "eddyq_group_set_rule";
 pub const FN_GROUP_REMOVE_RULE: &str = "eddyq_group_remove_rule";
 pub const FN_GROUP_LIST_RULES: &str = "eddyq_group_list_rules";
+pub const FN_CLEANUP: &str = "eddyq_cleanup";

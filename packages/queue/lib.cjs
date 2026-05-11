@@ -157,15 +157,21 @@ if (native.EddyqApp && native.EddyqApp.prototype.work) {
   };
 }
 
-if (native.EddyqRedis && native.EddyqRedis.prototype.work) {
-  // BullMQ-style sugar for addSchedule. Accepts either:
-  //   - cron string:     queue.addSchedule(name, "0 */5 * * * *", kind, payload, ...)
-  //   - object cron:     queue.addSchedule(name, { cron: "..." }, kind, payload, ...)
-  //   - interval object: queue.addSchedule(name, { every: 300000 }, kind, payload, ...)
-  // The interval form routes to addIntervalSchedule under the hood.
-  const origAddSchedule = native.EddyqRedis.prototype.addSchedule;
-  const origAddInterval = native.EddyqRedis.prototype.addIntervalSchedule;
-  native.EddyqRedis.prototype.addSchedule = function addSchedule(
+// BullMQ-style sugar for addSchedule. Accepts:
+//   - cron string:     queue.addSchedule(name, "0 */5 * * * *", kind, payload, ...)
+//   - object cron:     queue.addSchedule(name, { cron: "..." }, kind, payload, ...)
+//   - interval object: queue.addSchedule(name, { every: 300000 }, kind, payload, ...)
+// The interval form routes to addIntervalSchedule.
+//
+// Postgres (`Eddyq`) and Redis (`EddyqRedis`) expose slightly different
+// underlying signatures — PG uses an options object for priority/maxAttempts/
+// queue, Redis takes them positionally. `applyScheduleSugar` adapts via a
+// per-class `callAdd` shim so users see the same JS surface either way.
+function applyScheduleSugar(ctor, callAddSchedule, callAddInterval) {
+  if (!ctor || !ctor.prototype || !ctor.prototype.addSchedule) return;
+  const origAddSchedule = ctor.prototype.addSchedule;
+  const origAddInterval = ctor.prototype.addIntervalSchedule;
+  ctor.prototype.addSchedule = function addSchedule(
     name,
     when,
     kind,
@@ -175,26 +181,22 @@ if (native.EddyqRedis && native.EddyqRedis.prototype.work) {
     queue,
   ) {
     if (typeof when === "string") {
-      return origAddSchedule.call(this, name, when, kind, payload, priority, maxAttempts, queue);
+      return callAddSchedule(origAddSchedule, this, name, when, kind, payload, priority, maxAttempts, queue);
     }
     if (when && typeof when === "object") {
       if (typeof when.every === "number") {
         if (!Number.isFinite(when.every) || when.every <= 0) {
           throw new TypeError("addSchedule: { every } must be a positive number (milliseconds)");
         }
-        return origAddInterval.call(
-          this,
-          name,
-          when.every,
-          kind,
-          payload,
-          priority,
-          maxAttempts,
-          queue,
-        );
+        if (!origAddInterval) {
+          throw new TypeError(
+            "addSchedule: { every } requires addIntervalSchedule — backend doesn't expose it",
+          );
+        }
+        return callAddInterval(origAddInterval, this, name, when.every, kind, payload, priority, maxAttempts, queue);
       }
       if (typeof when.cron === "string") {
-        return origAddSchedule.call(this, name, when.cron, kind, payload, priority, maxAttempts, queue);
+        return callAddSchedule(origAddSchedule, this, name, when.cron, kind, payload, priority, maxAttempts, queue);
       }
     }
     throw new TypeError(
@@ -202,6 +204,29 @@ if (native.EddyqRedis && native.EddyqRedis.prototype.work) {
     );
   };
 }
+
+// Redis: positional priority/maxAttempts/queue on the underlying methods.
+applyScheduleSugar(
+  native.EddyqRedis,
+  (orig, self, name, cron, kind, payload, priority, maxAttempts, queue) =>
+    orig.call(self, name, cron, kind, payload, priority, maxAttempts, queue),
+  (orig, self, name, every, kind, payload, priority, maxAttempts, queue) =>
+    orig.call(self, name, every, kind, payload, priority, maxAttempts, queue),
+);
+
+// Postgres: priority/maxAttempts/queue are bundled into an options object.
+// Bundle on the way in so users still pass them positionally.
+function pgScheduleOptions(priority, maxAttempts, queue) {
+  if (priority == null && maxAttempts == null && queue == null) return undefined;
+  return { priority, maxAttempts, queue };
+}
+applyScheduleSugar(
+  native.Eddyq,
+  (orig, self, name, cron, kind, payload, priority, maxAttempts, queue) =>
+    orig.call(self, name, cron, kind, payload, pgScheduleOptions(priority, maxAttempts, queue)),
+  (orig, self, name, every, kind, payload, priority, maxAttempts, queue) =>
+    orig.call(self, name, every, kind, payload, pgScheduleOptions(priority, maxAttempts, queue)),
+);
 
 module.exports = {
   ...native,

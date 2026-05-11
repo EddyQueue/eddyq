@@ -559,7 +559,7 @@ async fn schedule_fires_recurring_job() {
     let list = admin.list_schedules().await.unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].name, "count-every-sec");
-    assert_eq!(list[0].cron_expr, "*/1 * * * * *");
+    assert_eq!(list[0].cron_expr.as_deref(), Some("*/1 * * * * *"));
 
     // Remove tears down the index.
     let removed = admin.remove_schedule("count-every-sec").await.unwrap();
@@ -917,6 +917,280 @@ async fn group_list_round_trips() {
     assert_eq!(listed[1].key, "beta");
     assert_eq!(listed[1].max_concurrency, 2);
     assert!(listed[1].paused);
+
+    flush_line(&url, &line).await;
+}
+
+// ====================================================================
+// Retention & cleanup
+// ====================================================================
+
+/// `ZCARD {prefix}:completed` — used by the retention tests to assert how
+/// many job IDs remain in the finalized index after a sweep.
+async fn zcard_completed(url: &str, line: &str) -> i64 {
+    use redis::AsyncCommands;
+    let client = redis::Client::open(url).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("{{{}}}:completed", line);
+    conn.zcard(&key).await.unwrap()
+}
+
+/// Drive the queue until `counter` reaches `target`, then shut down. Used by
+/// retention tests that need workers to finalize jobs before they assert on
+/// the resulting `completed` ZSET.
+async fn run_until(queue: &Queue<RedisBackend>, counter: &AtomicUsize, target: usize) {
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counter.load(Ordering::SeqCst) < target {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("jobs should finalize within 5s");
+    queue.shutdown().await.unwrap();
+}
+
+/// Per-job `removeOnComplete: { count: 3 }` keeps only the 3 most recently
+/// completed jobs in the finalized ZSET. Inline retention runs in
+/// `apply_retention` on each `complete` call — no queue-default sweep needed.
+#[tokio::test]
+async fn per_job_retention_keep_count_caps_completed_zset() {
+    use eddyq_core::{EnqueueOptions, RetentionRule};
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retc");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    for n in 0..5 {
+        let opts = EnqueueOptions {
+            remove_on_complete: Some(RetentionRule::keep_count(3)),
+            ..Default::default()
+        };
+        queue.enqueue_with(&Count { n }, opts).await.unwrap();
+    }
+
+    run_until(&queue, &counter, 5).await;
+
+    let remaining = zcard_completed(&url, &line).await;
+    assert_eq!(
+        remaining, 3,
+        "per-job count:3 retention should keep exactly 3 in completed ZSET"
+    );
+
+    flush_line(&url, &line).await;
+}
+
+/// `removeOnComplete: true` deletes the job HASH and removes it from every
+/// index on finalize. The completed ZSET ends up empty even though jobs
+/// were processed successfully.
+#[tokio::test]
+async fn per_job_retention_drop_removes_hash() {
+    use eddyq_core::{EnqueueOptions, RetentionRule};
+    use redis::AsyncCommands;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retd");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    let opts = EnqueueOptions {
+        remove_on_complete: Some(RetentionRule::drop()),
+        ..Default::default()
+    };
+    let eddyq_core::EnqueueResult::Inserted(id) =
+        queue.enqueue_with(&Count { n: 1 }, opts).await.unwrap()
+    else {
+        panic!("expected Inserted");
+    };
+
+    run_until(&queue, &counter, 1).await;
+
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let jobkey = format!("{{{}}}:job:{}", line, id);
+    let exists: i64 = conn.exists(&jobkey).await.unwrap();
+    assert_eq!(exists, 0, "drop retention must delete the job HASH");
+    let zcard = zcard_completed(&url, &line).await;
+    assert_eq!(
+        zcard, 0,
+        "drop retention must skip ZADD to the completed index"
+    );
+
+    flush_line(&url, &line).await;
+}
+
+/// Queue-default sweep via `Backend::cleanup` handles jobs that opted out of
+/// per-job retention (`false`) — `apply_retention` ZADDs them on finalize,
+/// then the leader-driven `cleanup` tick prunes by age. Drives `cleanup`
+/// directly here rather than spinning up the leader loop.
+#[tokio::test]
+async fn queue_default_cleanup_sweeps_completed_by_age() {
+    use eddyq_core::backend::Backend;
+    use eddyq_core::fetch::Retention;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retq");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    for n in 0..4 {
+        queue.enqueue(&Count { n }).await.unwrap();
+    }
+    run_until(&queue, &counter, 4).await;
+
+    assert_eq!(
+        zcard_completed(&url, &line).await,
+        4,
+        "no per-job rule => all 4 land in completed ZSET"
+    );
+
+    // Let the wall clock advance past the cutoff. `completed_secs = 0` means
+    // cutoff = now_ms; the ZRANGEBYSCORE is exclusive on the upper bound, so
+    // a finalized_at score equal to now would not be swept. The tiny sleep
+    // moves now past every score we just wrote.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let backend = queue.backend().as_ref();
+    let (c, _, _, _) = backend
+        .cleanup(Retention {
+            completed_secs: Some(0),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(c, 4, "cleanup should sweep all 4 from completed");
+    assert_eq!(zcard_completed(&url, &line).await, 0);
+
+    flush_line(&url, &line).await;
+}
+
+/// Proves the *full chain* fires on Redis: leader election picks a winner,
+/// `cleanup_loop` ticks on that node, and `FN_CLEANUP` drains the completed
+/// ZSET — none of which we drive by hand here. Defends against regressions
+/// where the loop is silently disabled on the Redis backend.
+#[tokio::test]
+async fn leader_cleanup_loop_drains_completed_zset() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retl");
+    flush_line(&url, &line).await;
+
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.clone(),
+        line: line.clone(),
+    })
+    .await
+    .unwrap();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    // Aggressive cadence + zero retention so the loop has work to do
+    // inside the test window.
+    let queue: Queue<RedisBackend> = QueueBuilder::with_backend(backend)
+        .register::<Count, _>(CountWorker {
+            counter: counter.clone(),
+        })
+        .line(line.clone())
+        .config(QueueConfig {
+            fetch_poll_interval: Duration::from_millis(50),
+            fetch_cooldown: Duration::from_millis(10),
+            fetch_batch_size: 16,
+            worker_concurrency: 4,
+            heartbeat_interval: Duration::from_millis(100),
+            sweep_interval: Duration::from_millis(500),
+            stale_after: Duration::from_secs(10),
+            scheduler_interval: Duration::from_millis(50),
+            cleanup_interval: Duration::from_millis(200),
+            completed_retention: Some(Duration::ZERO),
+            failed_retention: None,
+            cancelled_retention: None,
+            batch_retention: None,
+            leader_lease_secs: 5,
+            ..QueueConfig::default()
+        })
+        .build();
+
+    for n in 0..6 {
+        queue.enqueue(&Count { n }).await.unwrap();
+    }
+    queue.start().unwrap();
+
+    // First wait for the workers to finalize all 6 — they ZADD into the
+    // completed index but the cleanup_loop hasn't ticked yet on its first
+    // interval (the first `interval.tick()` consumes the immediate-fire).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counter.load(Ordering::SeqCst) < 6 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("6 jobs should finalize within 5s");
+
+    // Now wait for the leader cleanup_loop to drain the completed ZSET. We
+    // never call backend.cleanup or .clean ourselves — only the loop does.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while zcard_completed(&url, &line).await > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("leader cleanup_loop should drain completed ZSET within 5s");
+
+    queue.shutdown().await.unwrap();
+    flush_line(&url, &line).await;
+}
+
+/// `Backend::clean(grace, limit, Completed)` is the BullMQ `queue.clean()`
+/// surface. Verifies the per-call `limit` cap by draining a 10-job backlog
+/// in two calls of 5.
+#[tokio::test]
+async fn clean_caps_deletions_per_call() {
+    use eddyq_core::backend::{Backend, CleanState};
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retx");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    let jobs: Vec<Count> = (0..10).map(|n| Count { n }).collect();
+    queue.enqueue_many(&jobs).await.unwrap();
+    run_until(&queue, &counter, 10).await;
+
+    assert_eq!(zcard_completed(&url, &line).await, 10);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let backend = queue.backend().as_ref();
+    let n1 = backend
+        .clean(Duration::ZERO, 5, CleanState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(n1, 5, "first clean call should delete exactly 5");
+    assert_eq!(zcard_completed(&url, &line).await, 5);
+
+    let n2 = backend
+        .clean(Duration::ZERO, 5, CleanState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(n2, 5, "second clean call drains the rest");
+    assert_eq!(zcard_completed(&url, &line).await, 0);
 
     flush_line(&url, &line).await;
 }

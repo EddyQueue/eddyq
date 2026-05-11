@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use super::{Backend, BackendCaps};
+use super::{Backend, BackendCaps, CleanState};
 use crate::{
     enqueue::{self, BulkEnqueueResult, DynEnqueue, EnqueueResult},
     error::Result,
@@ -180,6 +180,10 @@ impl Backend for PgBackend {
         fetch::cleanup(&self.pool, retention).await
     }
 
+    async fn clean(&self, grace: Duration, limit: u32, state: CleanState) -> Result<u64> {
+        fetch::clean_jobs(&self.pool, state.as_str(), grace.as_secs(), limit).await
+    }
+
     async fn reclaim_in_flight(&self, ids: &[JobId]) -> Result<u64> {
         fetch::reclaim_in_flight(&self.pool, ids).await
     }
@@ -286,6 +290,29 @@ impl Backend for PgBackend {
             &self.pool,
             name,
             cron_expr,
+            kind,
+            payload,
+            priority,
+            max_attempts,
+            queue,
+        )
+        .await
+    }
+
+    async fn upsert_interval_schedule_raw(
+        &self,
+        name: &str,
+        interval_ms: i64,
+        kind: &str,
+        payload: serde_json::Value,
+        priority: i16,
+        max_attempts: i32,
+        queue: &str,
+    ) -> Result<()> {
+        schedule::upsert_interval_schedule_raw(
+            &self.pool,
+            name,
+            interval_ms,
             kind,
             payload,
             priority,
