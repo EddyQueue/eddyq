@@ -3,7 +3,7 @@ layout: home
 
 hero:
   name: eddyq
-  text: Postgres-backed job queue
+  text: Postgres or Redis job queue
   tagline: Rust core. First-class Node bindings. The reliability of your database, the ergonomics you expect.
   actions:
     - theme: brand

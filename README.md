@@ -10,7 +10,7 @@
 - **Transactional enqueue (Postgres).** Enqueue a job in the same transaction as your business write. No more "the job ran before the row committed" bugs.
 - **High throughput (Redis).** ~70k jobs/sec bulk ingest, ~19k jobs/sec end-to-end drain at 64 workers — matches or beats BullMQ on the same hardware. See [`benches/README.md`](benches/README.md).
 - **First-class Node bindings.** `pnpm add @eddyq/queue` and ship from NestJS, Next.js, or any Node app.
-- **BullMQ Pro features, free, on either backend.** Group concurrency caps, token-bucket rate limits, pattern-based group rules, cron + `{ every: ms }` schedules, named-queue concurrency, per-job retention.
+- **Rich scheduling and throttling on either backend.** Group concurrency caps, token-bucket rate limits, pattern-based group rules, cron + `{ every: ms }` schedules, named-queue concurrency, per-job retention.
 - **Native batches (Postgres).** Fan out N jobs and run a callback exactly once when they all settle — no per-app counter table.
 
 ## Pick a backend
