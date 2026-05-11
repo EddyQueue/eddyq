@@ -23,11 +23,13 @@ await q.start()
 
 ## How it works
 
-Schedules are durable — they live in `eddyq_schedules`, not in your worker process. On `start()`, eddyq reconciles your declared schedules against the table:
+Schedules are durable — they live in `eddyq_schedules`, not in your worker process. On `start()`, eddyq reconciles your declared `schedules:` config against the table:
 
 - New schedules are inserted
 - Removed schedules are tombstoned (no new runs, but in-flight runs finish)
 - Cron expression or payload changes update the row in place
+
+If you haven't passed a `schedules:` config, the table stays empty — that's expected. `registerQueue` / `q.work()` don't populate it; only declared schedules do.
 
 A single elected leader (the `MAINTENANCE_ROLE`) is responsible for inserting due jobs into the queue. After a deploy or leader handoff, missed runs are caught up automatically.
 

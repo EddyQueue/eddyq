@@ -64,6 +64,8 @@ await q.resumeQueue('batch')
 
 `setQueueTimeout(queue, null)` clears the default.
 
+The `eddyq_queues` table only stores these explicit overrides. A queue with no cap, pause, or timeout has no row — `subscribeTo` and `enqueue({ queue })` work either way. If the table looks empty, that just means you haven't set any per-queue admin yet.
+
 ## Inspecting queues
 
 ```ts
