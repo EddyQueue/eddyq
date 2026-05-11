@@ -61,6 +61,43 @@ importers:
         specifier: ^5.4.0
         version: 5.9.3
 
+  examples/nestjs-mixed:
+    dependencies:
+      '@eddyq/nestjs':
+        specifier: workspace:*
+        version: link:../../packages/nestjs
+      '@eddyq/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+      '@nestjs/common':
+        specifier: ^11.0.0
+        version: 11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/core':
+        specifier: ^11.0.0
+        version: 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/platform-express@11.1.19)(reflect-metadata@0.2.2)(rxjs@7.8.2)
+      '@nestjs/platform-express':
+        specifier: ^11.0.0
+        version: 11.1.19(@nestjs/common@11.1.19(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.19)
+      reflect-metadata:
+        specifier: ^0.2.0
+        version: 0.2.2
+      rxjs:
+        specifier: ^7.8.0
+        version: 7.8.2
+    devDependencies:
+      '@types/node':
+        specifier: ^20
+        version: 20.19.39
+      typescript:
+        specifier: ^5.4.0
+        version: 5.9.3
+
+  examples/redis-basic:
+    dependencies:
+      '@eddyq/queue':
+        specifier: workspace:*
+        version: link:../../packages/queue
+
   packages/nestjs:
     dependencies:
       '@eddyq/queue':

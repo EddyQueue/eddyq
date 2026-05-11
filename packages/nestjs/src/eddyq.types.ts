@@ -3,17 +3,49 @@ import type {
   BulkEnqueueOutcome,
   ConnectOptions,
   Eddyq,
+  EddyqApp,
+  EddyqRedis,
   EnqueueBatchInput,
   EnqueueManyItem,
   EnqueueOptions,
   EnqueueOutcome,
   JobCall,
+  RedisConnectOptions,
   ScheduleDeclaration,
   StartOptions,
 } from "@eddyq/queue";
 import type { ModuleMetadata, Type } from "@nestjs/common";
 
-export type { ConnectOptions, Eddyq, JobCall, ScheduleDeclaration, StartOptions };
+export type {
+  ConnectOptions,
+  Eddyq,
+  EddyqApp,
+  EddyqRedis,
+  JobCall,
+  RedisConnectOptions,
+  ScheduleDeclaration,
+  StartOptions,
+};
+
+/**
+ * The runtime client the module manages. Three shapes:
+ *   - `Eddyq`        — Postgres only (`databaseUrl` set on forRoot)
+ *   - `EddyqRedis`   — Redis only (`redis` set on forRoot)
+ *   - `EddyqApp`     — both backends + per-queue routing (`databaseUrl`,
+ *                      `redis`, and `queues` all set)
+ *
+ * The module guards PG-only call sites at runtime so all three shapes
+ * coexist in one module definition.
+ */
+export type EddyqInstance = Eddyq | EddyqRedis | EddyqApp;
+
+/** Redis backend config block for `EddyqModule.forRoot`. */
+export interface EddyqRedisOptions {
+  /** `redis://...` URL. */
+  url: string;
+  /** Hash-tag namespace ("line"). Default `"main"`. */
+  line?: string;
+}
 
 /** Tuning knobs for the worker runtime — `StartOptions` minus the fields the module manages itself. */
 export type EddyqTuningOptions = Omit<StartOptions, "skipMigrationCheck">;
@@ -27,12 +59,45 @@ export type JobHandlerFn = (
   call: JobCall & { signal: AbortSignal },
 ) => Promise<unknown> | unknown;
 
+/** Per-queue → provider binding for multi-backend setups. */
+export interface EddyqQueueRoute {
+  /** Queue name (must match what `@InjectQueue` / `enqueue({ queue })` uses). */
+  name: string;
+  /** Which backend this queue lives on. */
+  provider: "postgres" | "redis";
+}
+
 /** Options accepted by `EddyqModule.forRoot`. */
 export interface EddyqModuleOptions {
-  /** Postgres URL. Required. */
-  databaseUrl: string;
+  /**
+   * Postgres URL. Set this for a Postgres-only app, or alongside `redis`
+   * for a multi-backend app (route per-queue via `queues`).
+   */
+  databaseUrl?: string;
 
-  /** Pool / migration-line options forwarded to `Eddyq.connect`. */
+  /**
+   * Redis backend config. Set this for a Redis-only app, or alongside
+   * `databaseUrl` for a multi-backend app.
+   */
+  redis?: EddyqRedisOptions;
+
+  /**
+   * Per-queue → provider routing. Required when both `databaseUrl` and
+   * `redis` are set; otherwise ignored. Queues not listed here fall back
+   * to `defaultProvider`.
+   *
+   * Example: `queues: [{ name: "webhooks", provider: "redis" }, { name: "payments", provider: "postgres" }]`
+   */
+  queues?: EddyqQueueRoute[];
+
+  /**
+   * Default provider for queues not listed in `queues`. Required when both
+   * backends are configured (or there's no way to pick on enqueue).
+   * Ignored in single-backend setups.
+   */
+  defaultProvider?: "postgres" | "redis";
+
+  /** Pool / migration-line options forwarded to `Eddyq.connect`. (Postgres only.) */
   connectOptions?: ConnectOptions;
 
   /** Max in-flight jobs per Node process. Default from core: 10. */

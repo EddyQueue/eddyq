@@ -1,6 +1,14 @@
 # @eddyq/queue
 
-Node.js client for [eddyq](https://github.com/eddyqueue/eddyq) — a Rust + Postgres job queue.
+Node.js client for [eddyq](https://github.com/eddyqueue/eddyq) — a Rust job queue that runs on **Postgres**, **Redis**, or both.
+
+Three classes you can import:
+
+- **`Eddyq`** — Postgres backend. Transactional enqueue, durable batches, migrations.
+- **`EddyqRedis`** — Redis backend (via Redis Functions). ~70k jobs/sec bulk ingest, BullMQ-style `{ every: ms }` schedules, no migrations.
+- **`EddyqApp`** — multi-backend container. Route per-queue across both in one process (e.g. webhooks → Redis, payments → Postgres). See [`examples/redis-basic/multi.mjs`](https://github.com/eddyqueue/eddyq/blob/main/examples/redis-basic/multi.mjs).
+
+See the [main README](https://github.com/eddyqueue/eddyq#readme) for backend tradeoffs and benchmark numbers, or [`@eddyq/wakeboard`](https://github.com/eddyqueue/eddyq/tree/main/packages/wakeboard) for the dashboard UI.
 
 ## Install
 

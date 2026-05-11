@@ -13,15 +13,21 @@ workspace = true
 
 [dependencies]
 eddyq-core = { path = "../crates/eddyq-core" }
+eddyq-redis = { path = "../crates/eddyq-redis" }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+uuid = { workspace = true }
 
 [[bench]]
 name = "enqueue"
@@ -30,3 +36,7 @@ harness = false
 [[bench]]
 name = "claim"
 harness = false
+
+[[bin]]
+name = "throughput"
+path = "src/bin/throughput.rs"

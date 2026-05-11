@@ -8,7 +8,6 @@ use std::{
 };
 
 use rand::Rng;
-use sqlx::{PgPool, postgres::PgListener};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -16,11 +15,10 @@ use uuid::Uuid;
 
 use crate::{
     QueueConfig,
-    fetch::{
-        ClaimedJob, claim_batch, mark_completed, mark_failed, sweep_stale, update_heartbeat_batch,
-    },
+    backend::Backend,
+    fetch::ClaimedJob,
     job::{JobContext, JobId},
-    leader::{self, LEADER_RESIGN_CHANNEL, MAINTENANCE_ROLE},
+    leader::MAINTENANCE_ROLE,
     worker::WorkerRegistry,
 };
 
@@ -64,8 +62,8 @@ impl RuntimeHandles {
     }
 }
 
-pub(crate) fn start(
-    pool: PgPool,
+pub(crate) fn start<B: Backend>(
+    backend: Arc<B>,
     registry: Arc<WorkerRegistry>,
     config: QueueConfig,
     queues: Vec<String>,
@@ -83,7 +81,7 @@ pub(crate) fn start(
     let maintenance_id = Uuid::new_v4();
 
     let fetcher = tokio::spawn(fetch_loop(
-        pool.clone(),
+        backend.clone(),
         tx,
         config.clone(),
         registry.clone(),
@@ -96,7 +94,7 @@ pub(crate) fn start(
         .map(|n| {
             tokio::spawn(worker_loop(
                 n,
-                pool.clone(),
+                backend.clone(),
                 registry.clone(),
                 rx.clone(),
                 config.clone(),
@@ -107,14 +105,14 @@ pub(crate) fn start(
         .collect();
 
     let heartbeat = tokio::spawn(heartbeat_loop(
-        pool.clone(),
+        backend.clone(),
         in_flight.clone(),
         config.clone(),
         shutdown.clone(),
     ));
 
     let leader = tokio::spawn(leader_loop(
-        pool.clone(),
+        backend.clone(),
         maintenance_id,
         is_leader.clone(),
         config.clone(),
@@ -122,34 +120,35 @@ pub(crate) fn start(
     ));
 
     let sweeper = tokio::spawn(sweeper_loop(
-        pool.clone(),
+        backend.clone(),
         config.clone(),
         shutdown.clone(),
         is_leader.clone(),
     ));
 
     let scheduler = tokio::spawn(scheduler_loop(
-        pool.clone(),
+        backend.clone(),
         config.clone(),
         shutdown.clone(),
         is_leader.clone(),
     ));
 
     let cleanup = tokio::spawn(cleanup_loop(
-        pool.clone(),
+        backend.clone(),
         config.clone(),
         shutdown.clone(),
         is_leader.clone(),
     ));
 
+    // Wakeup listener (LISTEN/NOTIFY for PG, pubsub for Redis). The backend
+    // returns `None` when configured to skip (e.g. PgBouncer in transaction
+    // mode), in which case the fetcher relies on poll-interval only.
     let listener = if config.poll_only {
         None
     } else {
-        Some(tokio::spawn(listener_loop(
-            pool.clone(),
-            wakeup.clone(),
-            shutdown.clone(),
-        )))
+        backend
+            .clone()
+            .spawn_wakeup_listener(wakeup.clone(), shutdown.clone())
     };
 
     RuntimeHandles {
@@ -165,8 +164,8 @@ pub(crate) fn start(
     }
 }
 
-async fn fetch_loop(
-    pool: PgPool,
+async fn fetch_loop<B: Backend>(
+    backend: Arc<B>,
     tx: mpsc::Sender<ClaimedJob>,
     config: QueueConfig,
     registry: Arc<WorkerRegistry>,
@@ -195,7 +194,10 @@ async fn fetch_loop(
 
         let batch_size = config.fetch_batch_size.min(capacity);
         let kinds = registry.kinds();
-        let claimed = match claim_batch(&pool, worker_id, batch_size, &kinds, &queues).await {
+        let claimed = match backend
+            .claim_batch(worker_id, batch_size, &kinds, &queues)
+            .await
+        {
             Ok(rows) => rows,
             Err(err) => {
                 error!(?err, "fetch failed");
@@ -239,9 +241,9 @@ async fn fetch_loop(
     info!("eddyq fetcher stopped");
 }
 
-async fn worker_loop(
+async fn worker_loop<B: Backend>(
     n: usize,
-    pool: PgPool,
+    backend: Arc<B>,
     registry: Arc<WorkerRegistry>,
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ClaimedJob>>>,
     config: QueueConfig,
@@ -291,7 +293,10 @@ async fn worker_loop(
                     let mut set = in_flight.lock().expect("in_flight lock poisoned");
                     set.remove(&job.id);
                 }
-                if let Err(db_err) = mark_failed(&pool, job.id, job.worker_id, entry, None).await {
+                if let Err(db_err) = backend
+                    .mark_failed(job.id, job.worker_id, entry, None)
+                    .await
+                {
                     error!(?db_err, "failed to mark unknown-kind job as failed");
                 }
                 continue;
@@ -324,7 +329,7 @@ async fn worker_loop(
                     serde_json::Value::Null => None,
                     other => Some(other),
                 };
-                if let Err(err) = mark_completed(&pool, job.id, job.worker_id, stored).await {
+                if let Err(err) = backend.mark_completed(job.id, job.worker_id, stored).await {
                     error!(id = job.id, ?err, "failed to mark job completed");
                 }
             }
@@ -348,14 +353,9 @@ async fn worker_loop(
                     retry_at = ?retry_at, directive = ?failure.directive,
                     error = %failure, "job failed"
                 );
-                if let Err(db_err) = mark_failed(
-                    &pool,
-                    job.id,
-                    job.worker_id,
-                    failure.as_error_entry(),
-                    retry_at,
-                )
-                .await
+                if let Err(db_err) = backend
+                    .mark_failed(job.id, job.worker_id, failure.as_error_entry(), retry_at)
+                    .await
                 {
                     error!(id = job.id, ?db_err, "failed to record job failure");
                 }
@@ -370,8 +370,9 @@ async fn worker_loop(
                     ..Default::default()
                 }
                 .as_error_entry();
-                if let Err(db_err) =
-                    mark_failed(&pool, job.id, job.worker_id, entry, retry_at).await
+                if let Err(db_err) = backend
+                    .mark_failed(job.id, job.worker_id, entry, retry_at)
+                    .await
                 {
                     error!(id = job.id, ?db_err, "failed to record panic");
                 }
@@ -382,10 +383,10 @@ async fn worker_loop(
     info!(worker = n, "eddyq worker stopped");
 }
 
-/// Single shared heartbeat loop — one pool acquire every `heartbeat_interval`
+/// Single shared heartbeat loop — one round trip every `heartbeat_interval`
 /// regardless of concurrency. Replaces per-job heartbeat tasks.
-async fn heartbeat_loop(
-    pool: PgPool,
+async fn heartbeat_loop<B: Backend>(
+    backend: Arc<B>,
     in_flight: InFlightJobs,
     config: QueueConfig,
     shutdown: CancellationToken,
@@ -405,7 +406,7 @@ async fn heartbeat_loop(
                 if ids.is_empty() {
                     continue;
                 }
-                if let Err(err) = update_heartbeat_batch(&pool, &ids).await {
+                if let Err(err) = backend.update_heartbeat_batch(&ids).await {
                     warn!(?err, count = ids.len(), "batch heartbeat update failed");
                 }
             }
@@ -416,8 +417,8 @@ async fn heartbeat_loop(
 
 /// Leader election loop — runs try_elect on a regular cadence. Sets `is_leader`
 /// so other loops can gate maintenance work on leadership.
-async fn leader_loop(
-    pool: PgPool,
+async fn leader_loop<B: Backend>(
+    backend: Arc<B>,
     worker_id: Uuid,
     is_leader: Arc<AtomicBool>,
     config: QueueConfig,
@@ -428,34 +429,20 @@ async fn leader_loop(
         Duration::from_secs(config.leader_lease_secs / 3).max(Duration::from_secs(5));
     let mut interval = tokio::time::interval(refresh_interval);
 
-    // Subscribe to peer-resignation NOTIFYs so we can fire an immediate election
+    // Subscribe to peer-resignation pings so we can fire an immediate election
     // when the current leader gracefully shuts down. Optional — falls back to
-    // tick-driven elections if the LISTEN connection can't be established.
-    let mut resign_listener = match PgListener::connect_with(&pool).await {
-        Ok(mut l) => match l.listen(LEADER_RESIGN_CHANNEL).await {
-            Ok(()) => Some(l),
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "leader-resign LISTEN setup failed; relying on tick-driven elections"
-                );
-                None
-            }
-        },
-        Err(err) => {
-            warn!(
-                ?err,
-                "leader-resign LISTEN connection failed; relying on tick-driven elections"
-            );
-            None
-        }
-    };
+    // tick-driven elections if the backend can't (or won't) provide it.
+    let resign_notify = Arc::new(tokio::sync::Notify::new());
+    let _resign_listener = backend
+        .clone()
+        .spawn_leader_resign_listener(resign_notify.clone(), shutdown.clone());
 
     let try_elect_once = |reason: &'static str, was: &Arc<AtomicBool>| {
-        let pool = pool.clone();
+        let backend = backend.clone();
         let was = was.clone();
         async move {
-            match leader::try_elect(&pool, worker_id, MAINTENANCE_ROLE, config.leader_lease_secs)
+            match backend
+                .leader_try_elect(worker_id, MAINTENANCE_ROLE, config.leader_lease_secs)
                 .await
             {
                 Ok(won) => {
@@ -479,34 +466,13 @@ async fn leader_loop(
     interval.tick().await; // consume the first tick (already ran above)
 
     loop {
-        // Build the recv future inline; if no listener we await a never-ready
-        // future so the tokio::select! still has a valid arm.
-        let recv: std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = sqlx::Result<sqlx::postgres::PgNotification>>
-                    + Send,
-            >,
-        > = match resign_listener.as_mut() {
-            Some(l) => Box::pin(l.recv()),
-            None => Box::pin(std::future::pending()),
-        };
-
         tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
-            ev = recv => {
-                match ev {
-                    Ok(_) => {
-                        // A peer resigned — if we're not the leader, race for the lease.
-                        if !is_leader.load(Ordering::Relaxed) {
-                            try_elect_once("peer_resigned", &is_leader).await;
-                        }
-                    }
-                    Err(err) => {
-                        warn!(?err, "leader-resign listener error");
-                        // Drop the listener; subsequent loop iterations fall back to ticks.
-                        resign_listener = None;
-                    }
+            () = resign_notify.notified() => {
+                // A peer resigned — if we're not the leader, race for the lease.
+                if !is_leader.load(Ordering::Relaxed) {
+                    try_elect_once("peer_resigned", &is_leader).await;
                 }
             }
             _ = interval.tick() => {
@@ -517,7 +483,7 @@ async fn leader_loop(
 
     // On shutdown, resign if we were leader so another pod can take over immediately.
     if is_leader.load(Ordering::Relaxed) {
-        if let Err(err) = leader::resign(&pool, worker_id, MAINTENANCE_ROLE).await {
+        if let Err(err) = backend.leader_resign(worker_id, MAINTENANCE_ROLE).await {
             warn!(?err, "leader resign failed on shutdown");
         } else {
             info!(%worker_id, "resigned maintenance leadership on shutdown");
@@ -527,8 +493,8 @@ async fn leader_loop(
     info!("eddyq leader loop stopped");
 }
 
-async fn sweeper_loop(
-    pool: PgPool,
+async fn sweeper_loop<B: Backend>(
+    backend: Arc<B>,
     config: QueueConfig,
     shutdown: CancellationToken,
     is_leader: Arc<AtomicBool>,
@@ -544,7 +510,7 @@ async fn sweeper_loop(
                 if !is_leader.load(Ordering::Relaxed) {
                     continue;
                 }
-                match sweep_stale(&pool, config.stale_after).await {
+                match backend.sweep_stale(config.stale_after).await {
                     Ok(0) => {}
                     Ok(n) => info!(recovered = n, "sweeper recovered stale jobs"),
                     Err(err) => error!(?err, "sweeper failed"),
@@ -555,8 +521,8 @@ async fn sweeper_loop(
     info!("eddyq sweeper stopped");
 }
 
-async fn scheduler_loop(
-    pool: PgPool,
+async fn scheduler_loop<B: Backend>(
+    backend: Arc<B>,
     config: QueueConfig,
     shutdown: CancellationToken,
     is_leader: Arc<AtomicBool>,
@@ -572,7 +538,7 @@ async fn scheduler_loop(
                 if !is_leader.load(Ordering::Relaxed) {
                     continue;
                 }
-                match crate::schedule::tick(&pool).await {
+                match backend.schedule_tick().await {
                     Ok(0) => {}
                     Ok(n) => info!(enqueued = n, "scheduler enqueued due jobs"),
                     Err(err) => warn!(?err, "scheduler tick failed"),
@@ -583,8 +549,8 @@ async fn scheduler_loop(
     info!("eddyq scheduler stopped");
 }
 
-async fn cleanup_loop(
-    pool: PgPool,
+async fn cleanup_loop<B: Backend>(
+    backend: Arc<B>,
     config: QueueConfig,
     shutdown: CancellationToken,
     is_leader: Arc<AtomicBool>,
@@ -615,7 +581,7 @@ async fn cleanup_loop(
                 if !is_leader.load(Ordering::Relaxed) {
                     continue;
                 }
-                match crate::fetch::cleanup(&pool, retention).await {
+                match backend.cleanup(retention).await {
                     Ok((0, 0, 0, 0)) => {}
                     Ok((c, f, x, b)) => info!(
                         completed = c, failed = f, cancelled = x, batches = b,
@@ -627,49 +593,6 @@ async fn cleanup_loop(
         }
     }
     info!("eddyq cleanup stopped");
-}
-
-async fn listener_loop(
-    pool: PgPool,
-    wakeup: Arc<tokio::sync::Notify>,
-    shutdown: CancellationToken,
-) {
-    // Dedicated connection — PgListener owns it outside the pool.
-    let mut listener = match PgListener::connect_with(&pool).await {
-        Ok(l) => l,
-        Err(err) => {
-            warn!(
-                ?err,
-                "LISTEN connection failed, falling back to polling only"
-            );
-            return;
-        }
-    };
-
-    if let Err(err) = listener.listen(NOTIFY_CHANNEL).await {
-        warn!(?err, "LISTEN setup failed, falling back to polling only");
-        return;
-    }
-
-    info!(channel = NOTIFY_CHANNEL, "eddyq listener started");
-
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.cancelled() => break,
-            ev = listener.recv() => {
-                match ev {
-                    Ok(_) => wakeup.notify_one(),
-                    Err(err) => {
-                        warn!(?err, "listener error, will attempt to continue");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
-        }
-    }
-
-    info!("eddyq listener stopped");
 }
 
 fn jitter(base: Duration) -> Duration {

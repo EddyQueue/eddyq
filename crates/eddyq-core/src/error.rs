@@ -25,6 +25,18 @@ pub enum Error {
 
     #[error("queue not running")]
     NotRunning,
+
+    /// The current backend doesn't support this operation. Returned by
+    /// non-Postgres backends for Postgres-only methods (e.g. transactional
+    /// enqueue) and by the Redis backend before its differentiator phase
+    /// lands (groups, schedules, list_jobs).
+    #[error("operation not supported by this backend: {0}")]
+    Unsupported(String),
+
+    /// Generic backend-side failure (Redis I/O, protocol, function-load
+    /// errors). Postgres errors land in `Database` via the sqlx From impl.
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

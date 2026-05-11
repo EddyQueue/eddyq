@@ -1,4 +1,4 @@
-import { Eddyq } from "@eddyq/queue";
+import { Eddyq, EddyqApp, EddyqRedis } from "@eddyq/queue";
 import {
   type DynamicModule,
   Global,
@@ -21,10 +21,25 @@ import { EddyqExplorer } from "./eddyq.explorer.js";
 import { QueueHandleImpl } from "./eddyq-queue.handle.js";
 import { EddyqQueueAggregator } from "./eddyq-queue.aggregator.js";
 import type {
+  EddyqInstance,
   EddyqModuleAsyncOptions,
   EddyqModuleOptions,
   QueueRegistration,
 } from "./eddyq.types.js";
+
+/**
+ * The three runtime shapes share a `migrate()` method only on Postgres-only
+ * (`Eddyq`) and multi-backend (`EddyqApp`) — `EddyqRedis` does not have
+ * migrations. Use this guard before calling `migrate` / `close` etc.
+ */
+function hasPgPath(queue: EddyqInstance): queue is Eddyq | EddyqApp {
+  return typeof (queue as { migrate?: unknown }).migrate === "function";
+}
+
+/** True when the runtime is the multi-backend container. */
+function isApp(queue: EddyqInstance): queue is EddyqApp {
+  return typeof (queue as { hasPostgres?: unknown }).hasPostgres !== "undefined";
+}
 
 /**
  * NestJS module for eddyq.
@@ -44,7 +59,7 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
 
   constructor(
     @Inject(EDDYQ_OPTIONS) private readonly options: EddyqModuleOptions,
-    @Inject(EDDYQ_INSTANCE) private readonly queue: Eddyq,
+    @Inject(EDDYQ_INSTANCE) private readonly queue: EddyqInstance,
     private readonly explorer: EddyqExplorer,
     private readonly aggregator: EddyqQueueAggregator,
   ) {}
@@ -114,7 +129,7 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
         { provide: regToken, useValue: registration },
         {
           provide: handleToken,
-          useFactory: (eddyq: Eddyq, reg: QueueRegistration) =>
+          useFactory: (eddyq: EddyqInstance, reg: QueueRegistration) =>
             new QueueHandleImpl(eddyq, reg),
           inject: [EDDYQ_INSTANCE, regToken],
         },
@@ -125,13 +140,20 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
 
   async onApplicationBootstrap(): Promise<void> {
     if (this.options.runMigrations) {
-      EddyqModule.logger.log("applying migrations…");
-      const report = await this.queue.migrate();
-      if (report.applied.length > 0) {
+      if (hasPgPath(this.queue)) {
+        EddyqModule.logger.log("applying migrations…");
+        // `EddyqApp.migrate()` returns `null` when no PG backend is wired.
+        const report = await this.queue.migrate();
+        if (report && report.applied.length > 0) {
+          EddyqModule.logger.log(
+            `applied ${report.applied.length} migration(s): ${report.applied
+              .map((r) => `${r.version}:${r.name}`)
+              .join(", ")}`,
+          );
+        }
+      } else {
         EddyqModule.logger.log(
-          `applied ${report.applied.length} migration(s): ${report.applied
-            .map((r) => `${r.version}:${r.name}`)
-            .join(", ")}`,
+          "runMigrations=true ignored on Redis backend (no schema migrations)",
         );
       }
     }
@@ -155,13 +177,40 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     const rootSchedules = this.options.schedules;
     if (rootSchedules !== undefined || perQueueSchedules.length > 0) {
       const combined = [...(rootSchedules ?? []), ...perQueueSchedules];
-      const report = await this.queue.syncSchedules(combined);
-      EddyqModule.logger.log(
-        `synced schedules: upserted ${report.upserted}` +
-          (report.deleted.length > 0
-            ? `, deleted ${report.deleted.length} (${report.deleted.join(", ")})`
-            : ""),
-      );
+      if (isApp(this.queue)) {
+        // Multi-backend: group schedules by which backend their `queue`
+        // routes to, then sync each backend independently. A queue without
+        // a route lands on the default provider.
+        const routes = new Map<string, "postgres" | "redis">();
+        for (const r of this.options.queues ?? []) routes.set(r.name, r.provider);
+        const defaultProvider = this.options.defaultProvider!;
+        const groups: Record<"postgres" | "redis", typeof combined> = {
+          postgres: [],
+          redis: [],
+        };
+        for (const s of combined) {
+          const provider = routes.get(s.queue ?? "default") ?? defaultProvider;
+          groups[provider].push(s);
+        }
+        for (const provider of ["postgres", "redis"] as const) {
+          if (groups[provider].length === 0) continue;
+          const report = await this.queue.syncSchedules(provider, groups[provider]);
+          EddyqModule.logger.log(
+            `synced ${provider} schedules: upserted ${report.upserted}` +
+              (report.deleted.length > 0
+                ? `, deleted ${report.deleted.length} (${report.deleted.join(", ")})`
+                : ""),
+          );
+        }
+      } else {
+        const report = await this.queue.syncSchedules(combined);
+        EddyqModule.logger.log(
+          `synced schedules: upserted ${report.upserted}` +
+            (report.deleted.length > 0
+              ? `, deleted ${report.deleted.length} (${report.deleted.join(", ")})`
+              : ""),
+        );
+      }
     }
 
     const handlers = this.explorer.discover();
@@ -203,26 +252,41 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
       return;
     }
 
-    const pool = this.options.connectOptions?.maxConnections ?? 5;
-    const concurrency = this.options.workerConcurrency ?? 10;
-    const listenSocket = this.options.connectOptions?.pollOnly ? 0 : 1;
-    const totalPerPod = pool + listenSocket;
-    EddyqModule.logger.log(
-      `connection budget: pool=${pool} concurrency=${concurrency} listen=${listenSocket} → ${totalPerPod}/pod` +
-      ` — at N pods: N×${totalPerPod} connections to Postgres`,
-    );
-    if (concurrency > pool * 5) {
-      EddyqModule.logger.warn(
-        `workerConcurrency (${concurrency}) is high relative to maxConnections (${pool}). ` +
-        `Jobs will queue waiting for pool slots under sustained load. ` +
-        `Consider raising connectOptions.maxConnections or lowering workerConcurrency.`,
+    // Connection-budget warnings only make sense for the Postgres backend.
+    // The Redis client is a managed connection multiplexer — no per-pod
+    // pool sizing trade-off, no LISTEN socket. Skip the warning when this
+    // is an `EddyqApp` since the warning would apply to only one half.
+    if (hasPgPath(this.queue) && !isApp(this.queue)) {
+      const pool = this.options.connectOptions?.maxConnections ?? 5;
+      const concurrency = this.options.workerConcurrency ?? 10;
+      const listenSocket = this.options.connectOptions?.pollOnly ? 0 : 1;
+      const totalPerPod = pool + listenSocket;
+      EddyqModule.logger.log(
+        `connection budget: pool=${pool} concurrency=${concurrency} listen=${listenSocket} → ${totalPerPod}/pod` +
+        ` — at N pods: N×${totalPerPod} connections to Postgres`,
       );
+      if (concurrency > pool * 5) {
+        EddyqModule.logger.warn(
+          `workerConcurrency (${concurrency}) is high relative to maxConnections (${pool}). ` +
+          `Jobs will queue waiting for pool slots under sustained load. ` +
+          `Consider raising connectOptions.maxConnections or lowering workerConcurrency.`,
+        );
+      }
     }
 
-    await this.queue.start({
-      ...(this.options.tuning ?? {}),
-      skipMigrationCheck: this.options.skipMigrationCheck,
-    });
+    if (hasPgPath(this.queue)) {
+      // `Eddyq.start` and `EddyqApp.start` both accept `StartOptions`;
+      // `skipMigrationCheck` is harmless on the multi-backend path
+      // (forwarded to the PG side, ignored by Redis).
+      await this.queue.start({
+        ...(this.options.tuning ?? {}),
+        skipMigrationCheck: this.options.skipMigrationCheck,
+      });
+    } else {
+      // EddyqRedis.start does not accept `skipMigrationCheck` (Redis has no
+      // migrations). Pass only the shared tuning knobs.
+      await this.queue.start(this.options.tuning ?? undefined);
+    }
     this.started = true;
     EddyqModule.logger.log("worker runtime started");
   }
@@ -243,21 +307,68 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
       }
       this.started = false;
     }
-    try {
-      await this.queue.close();
-    } catch (e) {
-      EddyqModule.logger.error(
-        `pool close failed: ${(e as Error).message}`,
-      );
+    if (hasPgPath(this.queue)) {
+      try {
+        // `Eddyq.close()` closes the PG pool; `EddyqApp.close()` does the
+        // same when its PG backend is configured, no-ops otherwise.
+        await this.queue.close();
+      } catch (e) {
+        EddyqModule.logger.error(
+          `pool close failed: ${(e as Error).message}`,
+        );
+      }
     }
+    // Redis backend has no explicit close — ConnectionManager is dropped
+    // when this instance is GC'd, which Nest does after the shutdown hook.
   }
 }
 
 function eddyqInstanceProvider(): Provider {
   return {
     provide: EDDYQ_INSTANCE,
-    useFactory: async (options: EddyqModuleOptions): Promise<Eddyq> =>
-      Eddyq.connect(options.databaseUrl, options.connectOptions ?? undefined),
+    useFactory: async (
+      options: EddyqModuleOptions,
+    ): Promise<EddyqInstance> => {
+      const hasPg = typeof options.databaseUrl === "string" && options.databaseUrl.length > 0;
+      const hasRedis = options.redis !== undefined;
+      if (!hasPg && !hasRedis) {
+        throw new Error(
+          "@eddyq/nestjs: forRoot requires `databaseUrl`, `redis`, or both",
+        );
+      }
+      // Multi-backend → construct `EddyqApp`. The `queues` routing table is
+      // optional but typically required for non-default queues; without it
+      // every queue lands on `defaultProvider`.
+      if (hasPg && hasRedis) {
+        if (!options.defaultProvider) {
+          throw new Error(
+            "@eddyq/nestjs: forRoot with both backends requires `defaultProvider` " +
+              "('postgres' | 'redis')",
+          );
+        }
+        return EddyqApp.connect({
+          postgres: {
+            databaseUrl: options.databaseUrl!,
+            options: options.connectOptions ?? undefined,
+          },
+          redis: {
+            url: options.redis!.url,
+            line: options.redis!.line,
+          },
+          queues: (options.queues ?? []).map((q) => ({
+            name: q.name,
+            provider: q.provider,
+          })),
+          defaultProvider: options.defaultProvider,
+        });
+      }
+      if (hasRedis && options.redis) {
+        return EddyqRedis.connect(options.redis.url, {
+          line: options.redis.line,
+        });
+      }
+      return Eddyq.connect(options.databaseUrl!, options.connectOptions ?? undefined);
+    },
     inject: [EDDYQ_OPTIONS],
   };
 }

@@ -21,6 +21,8 @@ workspace = true
 
 [dependencies]
 eddyq-client = { path = "../eddyq-client", version = "0.0.1" }
+eddyq-core = { path = "../eddyq-core", version = "0.0.1" }
+eddyq-redis = { path = "../eddyq-redis", version = "0.0.1" }
 napi = { version = "3", default-features = false, features = ["napi4", "tokio_rt", "serde-json", "chrono_date"] }
 napi-derive = "3"
 tokio = { workspace = true }

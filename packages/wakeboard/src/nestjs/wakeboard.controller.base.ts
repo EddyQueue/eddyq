@@ -9,6 +9,11 @@ import type { EddyqWakeboardOptions } from './wakeboard.types.js';
 
 const DIST_PUBLIC = join(dirname(fileURLToPath(import.meta.url)), 'public');
 const VALID_STATES = new Set(['pending', 'running', 'completed', 'failed', 'scheduled', 'cancelled']);
+const VALID_PROVIDERS = new Set(['postgres', 'redis']);
+
+function pickProvider(s?: string): 'postgres' | 'redis' | undefined {
+  return s && VALID_PROVIDERS.has(s) ? (s as 'postgres' | 'redis') : undefined;
+}
 
 @Controller()
 export class WakeboardControllerBase {
@@ -30,9 +35,16 @@ export class WakeboardControllerBase {
 
   // --- REST API ---
 
+  /** Backends this dashboard can talk to (1 or 2). */
+  @Get('api/providers')
+  providers() {
+    return { providers: this.service.providers() };
+  }
+
   @Get('api/stats')
-  stats() {
-    return this.service.getStats();
+  stats(@Query('provider') provider?: string) {
+    const p = pickProvider(provider);
+    return p ? this.service.getStatsFor(p) : this.service.getStats();
   }
 
   @Get('api/jobs')
@@ -43,65 +55,70 @@ export class WakeboardControllerBase {
     @Query('groupKey') groupKey?: string,
     @Query('tag') tag?: string,
     @Query('page') page = '1',
+    @Query('provider') provider?: string,
   ) {
     const offset = (Math.max(1, parseInt(page, 10) || 1) - 1) * 50;
     const safeState = state && VALID_STATES.has(state) ? state : undefined;
-    return this.service.listJobs({ queue, state: safeState, kind, groupKey, tag }, { limit: 50, offset });
+    return this.service.listJobs(
+      { queue, state: safeState, kind, groupKey, tag },
+      { limit: 50, offset },
+      pickProvider(provider),
+    );
   }
 
   @Get('api/queues')
-  queues() {
-    return this.service.listQueues();
+  queues(@Query('provider') provider?: string) {
+    return this.service.listQueues(pickProvider(provider));
   }
 
   @Get('api/groups')
-  groups() {
-    return this.service.listGroups();
+  groups(@Query('provider') provider?: string) {
+    return this.service.listGroups(pickProvider(provider));
   }
 
   @Get('api/schedules')
-  schedules() {
-    return this.service.listSchedules();
+  schedules(@Query('provider') provider?: string) {
+    return this.service.listSchedules(pickProvider(provider));
   }
 
   @Post('api/jobs/:id/cancel')
-  cancelJob(@Param('id') id: string) {
-    return this.service.cancelJob(parseInt(id, 10));
+  cancelJob(@Param('id') id: string, @Query('provider') provider?: string) {
+    return this.service.cancelJob(parseInt(id, 10), pickProvider(provider));
   }
 
   @Post('api/queues/:name/pause')
-  pauseQueue(@Param('name') name: string) {
-    return this.service.pauseQueue(name);
+  pauseQueue(@Param('name') name: string, @Query('provider') provider?: string) {
+    return this.service.pauseQueue(name, pickProvider(provider));
   }
 
   @Post('api/queues/:name/resume')
-  resumeQueue(@Param('name') name: string) {
-    return this.service.resumeQueue(name);
+  resumeQueue(@Param('name') name: string, @Query('provider') provider?: string) {
+    return this.service.resumeQueue(name, pickProvider(provider));
   }
 
   @Post('api/groups/:key/pause')
-  pauseGroup(@Param('key') key: string) {
-    return this.service.pauseGroup(key);
+  pauseGroup(@Param('key') key: string, @Query('provider') provider?: string) {
+    return this.service.pauseGroup(key, pickProvider(provider));
   }
 
   @Post('api/groups/:key/resume')
-  resumeGroup(@Param('key') key: string) {
-    return this.service.resumeGroup(key);
+  resumeGroup(@Param('key') key: string, @Query('provider') provider?: string) {
+    return this.service.resumeGroup(key, pickProvider(provider));
   }
 
   @Post('api/schedules/:name/enable')
-  enableSchedule(@Param('name') name: string) {
-    return this.service.setScheduleEnabled(name, true);
+  enableSchedule(@Param('name') name: string, @Query('provider') provider?: string) {
+    return this.service.setScheduleEnabled(name, true, pickProvider(provider));
   }
 
   @Post('api/schedules/:name/disable')
-  disableSchedule(@Param('name') name: string) {
-    return this.service.setScheduleEnabled(name, false);
+  disableSchedule(@Param('name') name: string, @Query('provider') provider?: string) {
+    return this.service.setScheduleEnabled(name, false, pickProvider(provider));
   }
 
   @Post('api/schedules/:name/remove')
-  removeSchedule(@Param('name') name: string) {
-    return this.service.removeSchedule(name);
+  removeSchedule(@Param('name') name: string, @Query('provider') provider?: string) {
+    return this.service.removeSchedule(name, pickProvider(provider));
   }
 
   // --- SPA serving (catch-all, must be last) ---
