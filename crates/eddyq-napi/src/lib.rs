@@ -14,6 +14,8 @@ use eddyq_client::{
     Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DynEnqueue, HandlerFailure,
     JobContext, JobResult, JobState, ScheduleDeclaration as CoreScheduleDeclaration, ShutdownMode,
 };
+use eddyq_core::backend::Backend;
+use eddyq_redis::{RedisBackend, RedisConfig};
 use napi::{
     bindgen_prelude::*,
     threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
@@ -273,6 +275,12 @@ pub struct StartOptions {
     /// Fetch poll interval in poll-only mode (no LISTEN/NOTIFY).
     /// Default 1_000 (1s). Ignored when LISTEN is enabled.
     pub fetch_poll_interval_ms: Option<u32>,
+
+    /// How often the leader scheduler loop fires due schedules + promotes
+    /// delayed jobs. Default 5_000 (5s). Lower values make `{ every: ms }`
+    /// interval schedules feel more responsive at the cost of more leader
+    /// round-trips. Don't push below ~50ms.
+    pub scheduler_interval_ms: Option<u32>,
 }
 
 // -- Dashboard DTOs ----------------------------------------------------------
@@ -836,10 +844,17 @@ impl Queue {
     /// ```
     #[napi(ts_args_type = "kind: string, handler: (call: JobCall) => Promise<unknown>")]
     pub fn work(&self, kind: String, handler: JsTsFn) -> Result<()> {
+        self.register_handler_arc(kind, Arc::new(handler))
+    }
+
+    /// Rust-only handler-registration path. Takes an `Arc<JsTsFn>` so a
+    /// shared threadsafe-function can fan out to multiple backends (used
+    /// by `EddyqApp`). Not exposed to NAPI (no `#[napi]` attribute).
+    pub(crate) fn register_handler_arc(&self, kind: String, handler: JsHandler) -> Result<()> {
         let mut state = self.state.lock().expect("worker state lock poisoned");
         match &mut *state {
             WorkerState::Building { handlers, .. } => {
-                handlers.push((kind, Arc::new(handler)));
+                handlers.push((kind, handler));
                 Ok(())
             }
             WorkerState::Running { .. } => Err(napi::Error::from_reason(
@@ -1002,6 +1017,9 @@ impl Queue {
             if let Some(ms) = o.fetch_poll_interval_ms {
                 builder = builder.fetch_poll_interval(Duration::from_millis(u64::from(ms)));
             }
+            if let Some(ms) = o.scheduler_interval_ms {
+                builder = builder.scheduler_interval(Duration::from_millis(u64::from(ms)));
+            }
         }
         for (kind, tsfn) in handlers {
             builder = builder.register_dyn(kind, dispatcher(tsfn));
@@ -1083,19 +1101,20 @@ impl Queue {
             }
         };
 
-        // Drain: fire abort *first* so handlers receive `signal.aborted`
-        // during the graceful-wait window and can wind down cooperatively.
+        // Drain & Abandon: fire abort *first* so JS handlers receive
+        // `signal.aborted` and can clear their timers / resolve before the
+        // runtime tears down its TSFN refs. Without this, hostile-but-
+        // cooperative handlers can strand the Node event loop (their setTimeout
+        // never gets cleared because the abort callback was queued behind a
+        // close() that releases the TSFN).
         //
-        // Force/Abandon: fire abort *after* core shutdown. The Force path
-        // needs to snapshot the `in_flight` set before any handler resolves,
-        // and the abort-callback path can race with that snapshot through
-        // the spawn_blocking yield (JS resolves handler → mark_completed →
-        // in_flight.remove → snapshot finds an empty set). Firing abort
-        // after shutdown_with returns is correct because:
-        //   - Force: runtime tasks are already aborted; JS handlers
-        //     resolving has nowhere to go on the Rust side, but JS still
-        //     gets `signal.aborted` so its event loop drains.
-        //   - Abandon: same — handlers wake up, resolve, JS exits cleanly.
+        // Force: fire abort *after* core shutdown. The Force path needs to
+        // snapshot the `in_flight` set before any handler resolves, and the
+        // abort-callback path can race with that snapshot through the
+        // spawn_blocking yield (JS resolves handler → mark_completed →
+        // in_flight.remove → snapshot finds an empty set). Force's reclaim
+        // still calls `c.abort(reason)` from JS once shutdown_with returns,
+        // so handlers eventually drain.
         //
         // The TSFN is left on `self.abort_handler` for `close()` to drop.
         let fire_abort_now = || {
@@ -1111,29 +1130,36 @@ impl Queue {
             }
         };
 
-        if core_mode == ShutdownMode::Drain {
-            fire_abort_now();
-            let grace = Duration::from_millis(u64::from(
-                options
-                    .as_ref()
-                    .and_then(|o| o.graceful_timeout_ms)
-                    .unwrap_or(30_000),
-            ));
-            let fut = run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) });
-            match tokio::time::timeout(grace, fut).await {
-                Ok(res) => res,
-                Err(_) => Err(napi::Error::from_reason(format!(
-                    "shutdown exceeded graceful timeout ({grace:?}) — runtime tasks still in flight. \
-                     Re-run with mode=\"force\" if jobs need to be made re-eligible immediately."
-                ))),
+        match core_mode {
+            ShutdownMode::Drain => {
+                fire_abort_now();
+                let grace = Duration::from_millis(u64::from(
+                    options
+                        .as_ref()
+                        .and_then(|o| o.graceful_timeout_ms)
+                        .unwrap_or(30_000),
+                ));
+                let fut =
+                    run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) });
+                match tokio::time::timeout(grace, fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(napi::Error::from_reason(format!(
+                        "shutdown exceeded graceful timeout ({grace:?}) — runtime tasks still in flight. \
+                         Re-run with mode=\"force\" if jobs need to be made re-eligible immediately."
+                    ))),
+                }
             }
-        } else {
-            // Force / Abandon both bound their own work and don't honor a
-            // user-supplied timeout — they're already fast paths.
-            let result =
-                run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) }).await;
-            fire_abort_now();
-            result
+            ShutdownMode::Abandon => {
+                fire_abort_now();
+                run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) }).await
+            }
+            ShutdownMode::Force => {
+                let result =
+                    run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) })
+                        .await;
+                fire_abort_now();
+                result
+            }
         }
     }
 
@@ -1690,5 +1716,1464 @@ fn report_to_dto(report: &eddyq_client::MigrateReport) -> MigrateReport {
                 name: (*n).to_owned(),
             })
             .collect(),
+    }
+}
+
+// ============================================================================
+// EddyqRedis — Redis Functions–backed NAPI class
+// ============================================================================
+//
+// A parallel surface to `Eddyq` for users on Redis. Skips Postgres-only ops
+// (migrate, enqueueInTx). Reuses the JS-side type shapes (`EnqueueOptions`,
+// `EnqueueOutcome`, `JobCall`, `ShutdownOptions`, …) so wrappers can route
+// per-queue without users learning a second API.
+
+type RedisCoreQueue = eddyq_core::Queue<RedisBackend>;
+type RedisCoreQueueBuilder = eddyq_core::QueueBuilder<RedisBackend>;
+
+/// Connection options for `EddyqRedis.connect`. Only the line/hash-tag
+/// namespace is configurable in PR2; connection pooling is internal to the
+/// `redis` crate's `ConnectionManager`.
+#[napi(object)]
+pub struct RedisConnectOptions {
+    /// Hash-tag namespace (`"line"`) that scopes every key. Default `"main"`.
+    /// Use distinct lines to isolate multiple logical queues on one Redis.
+    pub line: Option<String>,
+}
+
+#[napi(js_name = "EddyqRedis")]
+pub struct RedisQueue {
+    backend: Arc<RedisBackend>,
+    line: String,
+    state: Arc<Mutex<RedisWorkerState>>,
+    abort_handler: Arc<Mutex<Option<JsAbortFn>>>,
+}
+
+enum RedisWorkerState {
+    Building {
+        handlers: Vec<(String, JsHandler)>,
+        concurrency: Option<usize>,
+        subscribe: Option<Vec<String>>,
+    },
+    Running {
+        queue: Arc<RedisCoreQueue>,
+    },
+    Stopped,
+}
+
+impl Default for RedisWorkerState {
+    fn default() -> Self {
+        Self::Building {
+            handlers: Vec::new(),
+            concurrency: None,
+            subscribe: None,
+        }
+    }
+}
+
+fn rerr(e: eddyq_core::Error) -> napi::Error {
+    napi::Error::from_reason(e.to_string())
+}
+
+#[napi]
+impl RedisQueue {
+    /// Connect to Redis and bootstrap-load the `eddyq_v1` Functions library.
+    /// Safe to call concurrently from multiple replicas — library load is
+    /// idempotent (compares SHA, replaces only on mismatch).
+    #[napi(factory)]
+    pub async fn connect(url: String, options: Option<RedisConnectOptions>) -> Result<RedisQueue> {
+        let line = options
+            .and_then(|o| o.line)
+            .unwrap_or_else(|| "main".to_string());
+        let cfg = RedisConfig {
+            url,
+            line: line.clone(),
+        };
+        let backend = RedisBackend::connect(cfg)
+            .await
+            .map_err(|e| napi::Error::from_reason(format!("{e}")))?;
+        Ok(RedisQueue {
+            backend: Arc::new(backend),
+            line,
+            state: Arc::new(Mutex::new(RedisWorkerState::default())),
+            abort_handler: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Hash-tag namespace ("line") this queue uses for all keys.
+    #[napi(getter)]
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// Enqueue a single job.
+    #[napi]
+    pub async fn enqueue(
+        &self,
+        kind: String,
+        payload: serde_json::Value,
+        options: Option<EnqueueOptions>,
+    ) -> Result<EnqueueOutcome> {
+        let req = build_dyn_enqueue_from_opts(kind, payload, options)?;
+        let result = self.backend.enqueue(req).await.map_err(rerr)?;
+        Ok(match result {
+            eddyq_core::EnqueueResult::Inserted(id) => EnqueueOutcome {
+                inserted: true,
+                id: Some(id),
+            },
+            eddyq_core::EnqueueResult::Skipped => EnqueueOutcome {
+                inserted: false,
+                id: None,
+            },
+        })
+    }
+
+    /// Bulk-enqueue jobs in a single round-trip. Mixed kinds supported.
+    /// Mirrors the Postgres `enqueueMany` cap (5,000) so client code is
+    /// portable across backends.
+    #[napi]
+    pub async fn enqueue_many(&self, items: Vec<EnqueueManyItem>) -> Result<BulkEnqueueOutcome> {
+        if items.len() > 5_000 {
+            return Err(napi::Error::from_reason(format!(
+                "enqueueMany: batch of {} exceeds max of 5000; split client-side",
+                items.len()
+            )));
+        }
+        let mut reqs = Vec::with_capacity(items.len());
+        for it in items {
+            reqs.push(build_dyn_enqueue_from_many_item(it)?);
+        }
+        let res = self.backend.enqueue_many(reqs).await.map_err(rerr)?;
+        Ok(BulkEnqueueOutcome {
+            inserted: i64::try_from(res.inserted).unwrap_or(i64::MAX),
+            skipped: i64::try_from(res.skipped).unwrap_or(i64::MAX),
+        })
+    }
+
+    /// Cancel a pending or scheduled job. Returns `true` if cancelled,
+    /// `false` if the job doesn't exist or is already running/finalized.
+    #[napi]
+    pub async fn cancel(&self, id: i64) -> Result<bool> {
+        self.backend.cancel(id).await.map_err(rerr)
+    }
+
+    // --- Worker registration --------------------------------------------
+
+    /// Register a JS handler for `kind`. Must be called before `start()`.
+    #[napi(ts_args_type = "kind: string, handler: (call: JobCall) => Promise<unknown>")]
+    pub fn work(&self, kind: String, handler: JsTsFn) -> Result<()> {
+        self.register_handler_arc(kind, Arc::new(handler))
+    }
+
+    /// Rust-only path mirroring `Queue::register_handler_arc`. Takes an
+    /// already-`Arc`'d handler so `EddyqApp` can fan one tsfn out to both
+    /// backends without needing `ThreadsafeFunction: Clone`.
+    pub(crate) fn register_handler_arc(&self, kind: String, handler: JsHandler) -> Result<()> {
+        let mut state = self.state.lock().expect("redis worker state lock");
+        match &mut *state {
+            RedisWorkerState::Building { handlers, .. } => {
+                handlers.push((kind, handler));
+                Ok(())
+            }
+            RedisWorkerState::Running { .. } => Err(napi::Error::from_reason(
+                "EddyqRedis is already running — register handlers before start()",
+            )),
+            RedisWorkerState::Stopped => {
+                Err(napi::Error::from_reason("EddyqRedis has been shut down"))
+            }
+        }
+    }
+
+    /// Set worker concurrency (per-process). Default 10.
+    #[napi]
+    pub fn set_worker_concurrency(&self, n: u32) -> Result<()> {
+        let mut state = self.state.lock().expect("redis worker state lock");
+        match &mut *state {
+            RedisWorkerState::Building { concurrency, .. } => {
+                *concurrency = Some(n.max(1) as usize);
+                Ok(())
+            }
+            _ => Err(napi::Error::from_reason(
+                "setWorkerConcurrency must be called before start()",
+            )),
+        }
+    }
+
+    /// Subscribe workers to specific named queues. Default `["default"]`.
+    #[napi]
+    pub fn subscribe_to(&self, queues: Vec<String>) -> Result<()> {
+        let mut state = self.state.lock().expect("redis worker state lock");
+        match &mut *state {
+            RedisWorkerState::Building { subscribe, .. } => {
+                *subscribe = Some(queues);
+                Ok(())
+            }
+            _ => Err(napi::Error::from_reason(
+                "subscribeTo must be called before start()",
+            )),
+        }
+    }
+
+    /// Start the worker runtime. Errors if no handlers were registered, or if
+    /// already running.
+    #[napi]
+    pub async fn start(&self, options: Option<StartOptions>) -> Result<()> {
+        let (handlers, concurrency, subscribe) = {
+            let mut state = self.state.lock().expect("redis worker state lock");
+            match std::mem::replace(&mut *state, RedisWorkerState::Stopped) {
+                RedisWorkerState::Building {
+                    handlers,
+                    concurrency,
+                    subscribe,
+                } => (handlers, concurrency, subscribe),
+                RedisWorkerState::Running { queue } => {
+                    *state = RedisWorkerState::Running { queue };
+                    return Err(napi::Error::from_reason("EddyqRedis is already running"));
+                }
+                RedisWorkerState::Stopped => {
+                    return Err(napi::Error::from_reason(
+                        "EddyqRedis has been shut down and cannot be reused",
+                    ));
+                }
+            }
+        };
+        if handlers.is_empty() {
+            let mut state = self.state.lock().expect("redis worker state lock");
+            *state = RedisWorkerState::Building {
+                handlers: Vec::new(),
+                concurrency,
+                subscribe,
+            };
+            return Err(napi::Error::from_reason(
+                "No handlers registered — call work(kind, fn) before start()",
+            ));
+        }
+
+        // Build the typed Queue<RedisBackend>. Reuses the same StartOptions
+        // shape as PG; not every knob applies (e.g. fetch_poll_interval is
+        // mostly a poll-fallback knob since Redis has pubsub disabled in PR2).
+        let backend = (*self.backend).clone();
+        let mut builder: RedisCoreQueueBuilder =
+            RedisCoreQueueBuilder::with_backend(backend).line(self.line.clone());
+        if let Some(n) = concurrency {
+            builder = builder.worker_concurrency(n);
+        }
+        if let Some(qs) = subscribe {
+            builder = builder.subscribe_to(qs);
+        }
+        if let Some(o) = options.as_ref() {
+            if let Some(ms) = o.sweep_interval_ms {
+                builder = builder.sweep_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.stale_after_ms {
+                builder = builder.stale_after(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.heartbeat_interval_ms {
+                builder = builder.heartbeat_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.cleanup_interval_ms {
+                builder = builder.cleanup_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(secs) = o.leader_lease_secs {
+                builder = builder.leader_lease_secs(u64::from(secs));
+            }
+            if let Some(ms) = o.fetch_poll_interval_ms {
+                builder = builder.fetch_poll_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.scheduler_interval_ms {
+                builder = builder.scheduler_interval(Duration::from_millis(u64::from(ms)));
+            }
+        }
+        for (kind, tsfn) in handlers {
+            builder = builder.register_dyn(kind, dispatcher(tsfn));
+        }
+
+        let queue = Arc::new(builder.build());
+        queue
+            .start()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+
+        let mut state = self.state.lock().expect("redis worker state lock");
+        *state = RedisWorkerState::Running { queue };
+        Ok(())
+    }
+
+    /// Set the abort-broadcast handler. Called once per shutdown so the JS
+    /// wrapper can fire `.abort()` on all in-flight `AbortController`s.
+    #[napi(ts_args_type = "handler: (reason: string) => void")]
+    pub fn set_abort_handler(&self, handler: JsAbortFn) -> Result<()> {
+        let mut slot = self.abort_handler.lock().expect("abort handler lock");
+        *slot = Some(handler);
+        Ok(())
+    }
+
+    /// Graceful shutdown: stop claiming new jobs, fire `AbortSignal` to
+    /// in-flight handlers, then await them. Modes mirror the Postgres
+    /// `Eddyq.shutdown`.
+    #[napi]
+    pub async fn shutdown(&self, options: Option<ShutdownOptions>) -> Result<()> {
+        let queue = {
+            let mut state = self.state.lock().expect("redis worker state lock");
+            match std::mem::replace(&mut *state, RedisWorkerState::Stopped) {
+                RedisWorkerState::Running { queue } => queue,
+                _ => return Err(napi::Error::from_reason("EddyqRedis is not running")),
+            }
+        };
+        let mode = options
+            .as_ref()
+            .and_then(|o| o.mode.as_deref())
+            .map(parse_shutdown_mode)
+            .transpose()?
+            .unwrap_or(ShutdownMode::Drain);
+        if let Some(handler) = self.abort_handler.lock().expect("abort lock").as_ref() {
+            let reason = match mode {
+                ShutdownMode::Drain => "drain",
+                ShutdownMode::Force => "force",
+                ShutdownMode::Abandon => "abandon",
+            };
+            handler.call(reason.to_string(), ThreadsafeFunctionCallMode::NonBlocking);
+        }
+        queue
+            .shutdown_with(mode)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    // --- Group admin -----------------------------------------------------
+
+    #[napi]
+    pub async fn set_group_concurrency(&self, group_key: String, max: i32) -> Result<()> {
+        self.backend
+            .group_set_concurrency(&group_key, max)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn pause_group(&self, group_key: String) -> Result<()> {
+        self.backend
+            .group_set_paused(&group_key, true)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn resume_group(&self, group_key: String) -> Result<()> {
+        self.backend
+            .group_set_paused(&group_key, false)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn set_group_rate(
+        &self,
+        group_key: String,
+        count: u32,
+        period_ms: u32,
+    ) -> Result<()> {
+        self.backend
+            .group_set_rate(
+                &group_key,
+                count,
+                Duration::from_millis(u64::from(period_ms)),
+            )
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn clear_group_rate(&self, group_key: String) -> Result<()> {
+        self.backend
+            .group_clear_rate(&group_key)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn list_groups(&self) -> Result<Vec<Group>> {
+        let groups = self.backend.group_list().await.map_err(rerr)?;
+        Ok(groups.into_iter().map(group_to_napi).collect())
+    }
+    #[napi]
+    pub async fn get_group(&self, key: String) -> Result<Option<Group>> {
+        Ok(self
+            .backend
+            .group_get(&key)
+            .await
+            .map_err(rerr)?
+            .map(group_to_napi))
+    }
+
+    // --- Named-queue admin ----------------------------------------------
+
+    #[napi]
+    pub async fn set_queue_concurrency(&self, queue: String, max: i32) -> Result<()> {
+        self.backend
+            .queue_set_concurrency(&queue, max)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn pause_queue(&self, queue: String) -> Result<()> {
+        self.backend
+            .queue_set_paused(&queue, true)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn resume_queue(&self, queue: String) -> Result<()> {
+        self.backend
+            .queue_set_paused(&queue, false)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn set_queue_timeout(&self, queue: String, timeout_ms: Option<u32>) -> Result<()> {
+        let t = timeout_ms.map(|ms| Duration::from_millis(u64::from(ms)));
+        self.backend
+            .queue_set_timeout(&queue, t)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn list_named_queues(&self) -> Result<Vec<NamedQueue>> {
+        let qs = self.backend.queue_list().await.map_err(rerr)?;
+        Ok(qs.into_iter().map(nq_to_napi).collect())
+    }
+    #[napi]
+    pub async fn get_queue(&self, name: String) -> Result<Option<NamedQueue>> {
+        Ok(self
+            .backend
+            .queue_get(&name)
+            .await
+            .map_err(rerr)?
+            .map(nq_to_napi))
+    }
+
+    // --- Schedules ------------------------------------------------------
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_schedule(
+        &self,
+        name: String,
+        cron: String,
+        kind: String,
+        payload: serde_json::Value,
+        priority: Option<i32>,
+        max_attempts: Option<i32>,
+        queue: Option<String>,
+    ) -> Result<()> {
+        let prio = i16::try_from(priority.unwrap_or(0)).unwrap_or(0);
+        let max_att = max_attempts.unwrap_or(3);
+        let q = queue.unwrap_or_else(|| eddyq_core::DEFAULT_QUEUE.to_owned());
+        self.backend
+            .upsert_schedule_raw(&name, &cron, &kind, payload, prio, max_att, &q)
+            .await
+            .map_err(rerr)
+    }
+    /// Register a fixed-interval schedule. Fires every `intervalMs`
+    /// milliseconds — no cron expression required. Mirrors BullMQ's
+    /// `upsertJobScheduler(id, { every })`.
+    ///
+    /// `intervalMs` must be positive. The first fire happens after
+    /// `intervalMs` from registration; subsequent fires are
+    /// `previous_fire + intervalMs` (no catch-up under leader downtime —
+    /// missed ticks are skipped, matching the cron path's semantics).
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_interval_schedule(
+        &self,
+        name: String,
+        interval_ms: i64,
+        kind: String,
+        payload: serde_json::Value,
+        priority: Option<i32>,
+        max_attempts: Option<i32>,
+        queue: Option<String>,
+    ) -> Result<()> {
+        let prio = i16::try_from(priority.unwrap_or(0)).unwrap_or(0);
+        let max_att = max_attempts.unwrap_or(3);
+        let q = queue.unwrap_or_else(|| eddyq_core::DEFAULT_QUEUE.to_owned());
+        self.backend
+            .upsert_interval_schedule_raw(&name, interval_ms, &kind, payload, prio, max_att, &q)
+            .await
+            .map_err(rerr)
+    }
+
+    #[napi]
+    pub async fn remove_schedule(&self, name: String) -> Result<bool> {
+        self.backend.remove_schedule(&name).await.map_err(rerr)
+    }
+    #[napi]
+    pub async fn set_schedule_enabled(&self, name: String, enabled: bool) -> Result<bool> {
+        self.backend
+            .set_schedule_enabled(&name, enabled)
+            .await
+            .map_err(rerr)
+    }
+    #[napi]
+    pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
+        let list = self.backend.list_schedules().await.map_err(rerr)?;
+        Ok(list.into_iter().map(schedule_to_napi).collect())
+    }
+
+    // --- Stats / list_jobs --------------------------------------------
+
+    /// Snapshot of job counts grouped by (queue, state). Single Redis
+    /// round-trip — suitable as the landing query for a dashboard.
+    #[napi]
+    pub async fn get_stats(&self) -> Result<JobStats> {
+        let s = self.backend.get_stats().await.map_err(rerr)?;
+        Ok(JobStats {
+            by_queue_state: s
+                .by_queue_state
+                .into_iter()
+                .map(|c| QueueStateCount {
+                    queue: c.queue,
+                    state: state_to_str(c.state).to_string(),
+                    count: c.count,
+                })
+                .collect(),
+        })
+    }
+
+    /// Paginated job listing. Defaults: limit=50, offset=0 (capped at 500).
+    #[napi]
+    pub async fn list_jobs(
+        &self,
+        filter: Option<ListJobsFilter>,
+        pagination: Option<Pagination>,
+    ) -> Result<JobList> {
+        let core_filter = filter.map(napi_filter_to_core).unwrap_or_default();
+        let core_pagination = pagination
+            .map(|p| eddyq_core::stats::Pagination {
+                limit: p.limit.unwrap_or(50),
+                offset: p.offset.unwrap_or(0),
+            })
+            .unwrap_or_default();
+        let list = self
+            .backend
+            .list_jobs(core_filter, core_pagination)
+            .await
+            .map_err(rerr)?;
+        Ok(JobList {
+            total: list.total,
+            rows: list.rows.into_iter().map(job_row_to_napi).collect(),
+        })
+    }
+
+    /// Reconcile schedules against a declared list. Same semantics as the
+    /// Postgres `Eddyq.syncSchedules` — upserts every declared entry and
+    /// deletes any stored schedule not in the list. Idempotent.
+    #[napi]
+    pub async fn sync_schedules(
+        &self,
+        declared: Vec<ScheduleDeclaration>,
+    ) -> Result<SyncSchedulesReport> {
+        let mapped: Vec<CoreScheduleDeclaration> = declared
+            .into_iter()
+            .map(|d| CoreScheduleDeclaration {
+                name: d.name,
+                cron_expr: d.cron_expr,
+                kind: d.kind,
+                payload: d.payload,
+                priority: d.priority.unwrap_or(0),
+                max_attempts: d.max_attempts.unwrap_or(3),
+                queue: d
+                    .queue
+                    .unwrap_or_else(|| eddyq_core::DEFAULT_QUEUE.to_string()),
+            })
+            .collect();
+        let report = self.backend.sync_schedules(&mapped).await.map_err(rerr)?;
+        Ok(SyncSchedulesReport {
+            upserted: report.upserted as u32,
+            deleted: report.deleted,
+        })
+    }
+}
+
+// Shared helpers — build DynEnqueue from the JS-side option shapes. Pulled
+// out so both Postgres and Redis paths reuse the same field-by-field mapping.
+fn build_dyn_enqueue_from_opts(
+    kind: String,
+    payload: serde_json::Value,
+    options: Option<EnqueueOptions>,
+) -> Result<DynEnqueue> {
+    let mut req = DynEnqueue::new(kind, payload);
+    if let Some(opts) = options {
+        if let Some(n) = opts.max_attempts {
+            req.max_attempts = n;
+        }
+        if let Some(p) = opts.priority {
+            req.priority = p;
+        }
+        if let Some(q) = opts.queue {
+            req.queue = q;
+        }
+        if opts.scheduled_at_ms.is_some() && opts.delay_ms.is_some() {
+            return Err(napi::Error::from_reason(
+                "enqueue: pass either scheduledAtMs or delayMs, not both",
+            ));
+        }
+        if let Some(ms) = opts.scheduled_at_ms {
+            req.scheduled_at = Some(ms_to_utc(ms));
+        }
+        if let Some(ms) = opts.delay_ms {
+            req.scheduled_at = Some(Utc::now() + chrono::Duration::milliseconds(ms));
+        }
+        if let Some(k) = opts.unique_key {
+            req.unique_key = Some(k);
+        }
+        if let Some(g) = opts.group_key {
+            req.group_key = Some(g);
+        }
+        if let Some(t) = opts.tags {
+            req.tags = t;
+        }
+        if let Some(m) = opts.metadata {
+            req.metadata = m;
+        }
+    }
+    Ok(req)
+}
+
+fn build_dyn_enqueue_from_many_item(it: EnqueueManyItem) -> Result<DynEnqueue> {
+    let mut req = DynEnqueue::new(it.kind, it.payload);
+    if let Some(n) = it.max_attempts {
+        req.max_attempts = n;
+    }
+    if let Some(p) = it.priority {
+        req.priority = p;
+    }
+    if let Some(q) = it.queue {
+        req.queue = q;
+    }
+    if it.scheduled_at_ms.is_some() && it.delay_ms.is_some() {
+        return Err(napi::Error::from_reason(
+            "enqueueMany: pass either scheduledAtMs or delayMs, not both",
+        ));
+    }
+    if let Some(ms) = it.scheduled_at_ms {
+        req.scheduled_at = Some(ms_to_utc(ms));
+    }
+    if let Some(ms) = it.delay_ms {
+        req.scheduled_at = Some(Utc::now() + chrono::Duration::milliseconds(ms));
+    }
+    if let Some(k) = it.unique_key {
+        req.unique_key = Some(k);
+    }
+    if let Some(g) = it.group_key {
+        req.group_key = Some(g);
+    }
+    if let Some(t) = it.tags {
+        req.tags = t;
+    }
+    if let Some(m) = it.metadata {
+        req.metadata = m;
+    }
+    Ok(req)
+}
+
+fn parse_shutdown_mode(s: &str) -> Result<ShutdownMode> {
+    match s {
+        "drain" => Ok(ShutdownMode::Drain),
+        "force" => Ok(ShutdownMode::Force),
+        "abandon" => Ok(ShutdownMode::Abandon),
+        other => Err(napi::Error::from_reason(format!(
+            "shutdown: invalid mode {other:?} (drain | force | abandon)"
+        ))),
+    }
+}
+
+// ============================================================================
+// EddyqApp — single-process multi-backend container.
+//
+// Holds an optional `Eddyq` + an optional `EddyqRedis` and routes `enqueue` /
+// worker pickup per queue. Use when one Nest (or plain Node) app wants e.g.
+// `webhooks` on Redis and `payments` on Postgres.
+// ============================================================================
+
+/// One queue→backend binding for `EddyqAppConfig.queues`.
+#[napi(object)]
+pub struct EddyqAppQueueRoute {
+    /// Queue name (must match what callers pass as `enqueue(..., { queue })`).
+    pub name: String,
+    /// `"postgres"` or `"redis"`. Validated at construction.
+    pub provider: String,
+}
+
+#[napi(object)]
+pub struct EddyqAppPgConfig {
+    pub database_url: String,
+    pub options: Option<ConnectOptions>,
+}
+
+#[napi(object)]
+pub struct EddyqAppRedisConfig {
+    pub url: String,
+    pub line: Option<String>,
+}
+
+/// Top-level config for `EddyqApp.connect`. Both `postgres` and `redis` are
+/// optional, but at least one must be set. Queues whose `name` isn't in
+/// `queues` route to `defaultProvider` (which defaults to whichever backend
+/// you configured if only one is set).
+#[napi(object)]
+pub struct EddyqAppConfig {
+    pub postgres: Option<EddyqAppPgConfig>,
+    pub redis: Option<EddyqAppRedisConfig>,
+    pub queues: Vec<EddyqAppQueueRoute>,
+    pub default_provider: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BackendKind {
+    Pg,
+    Redis,
+}
+
+fn parse_provider(s: &str) -> Result<BackendKind> {
+    match s {
+        "postgres" | "pg" => Ok(BackendKind::Pg),
+        "redis" => Ok(BackendKind::Redis),
+        other => Err(napi::Error::from_reason(format!(
+            "unknown provider {other:?} — expected 'postgres' or 'redis'"
+        ))),
+    }
+}
+
+#[napi(js_name = "EddyqApp")]
+pub struct EddyqApp {
+    pg: Option<Arc<Queue>>,
+    redis: Option<Arc<RedisQueue>>,
+    routes: std::collections::HashMap<String, BackendKind>,
+    default_provider: BackendKind,
+    abort_handler: Arc<Mutex<Option<JsAbortFn>>>,
+}
+
+#[napi]
+impl EddyqApp {
+    /// Construct + connect both backends. `queues` declares the routing
+    /// table (queue name → "postgres" | "redis"). Unrouted queue names fall
+    /// back to `defaultProvider`; if that's omitted, the only configured
+    /// backend wins.
+    #[napi(factory)]
+    pub async fn connect(config: EddyqAppConfig) -> Result<EddyqApp> {
+        let want_pg = config.postgres.is_some();
+        let want_redis = config.redis.is_some();
+        if !want_pg && !want_redis {
+            return Err(napi::Error::from_reason(
+                "EddyqApp.connect: at least one of `postgres` or `redis` must be set",
+            ));
+        }
+
+        // Build the routing map up front so we can fail-fast on typos.
+        let mut routes: std::collections::HashMap<String, BackendKind> =
+            std::collections::HashMap::new();
+        for r in &config.queues {
+            let kind = parse_provider(&r.provider)?;
+            if matches!(kind, BackendKind::Pg) && !want_pg {
+                return Err(napi::Error::from_reason(format!(
+                    "queue {:?} routes to 'postgres' but no postgres config provided",
+                    r.name
+                )));
+            }
+            if matches!(kind, BackendKind::Redis) && !want_redis {
+                return Err(napi::Error::from_reason(format!(
+                    "queue {:?} routes to 'redis' but no redis config provided",
+                    r.name
+                )));
+            }
+            routes.insert(r.name.clone(), kind);
+        }
+
+        let default_provider = match config.default_provider.as_deref() {
+            Some(s) => parse_provider(s)?,
+            None => {
+                // Single-backend setup picks itself as default.
+                if want_pg && !want_redis {
+                    BackendKind::Pg
+                } else if want_redis && !want_pg {
+                    BackendKind::Redis
+                } else {
+                    return Err(napi::Error::from_reason(
+                        "EddyqApp.connect: both backends configured — set `defaultProvider`",
+                    ));
+                }
+            }
+        };
+
+        let pg = if let Some(c) = config.postgres {
+            Some(Arc::new(Queue::connect(c.database_url, c.options).await?))
+        } else {
+            None
+        };
+        let redis = if let Some(c) = config.redis {
+            let opts = c.line.map(|line| RedisConnectOptions { line: Some(line) });
+            Some(Arc::new(RedisQueue::connect(c.url, opts).await?))
+        } else {
+            None
+        };
+
+        // Pre-subscribe each backend to the queues that route to it. The user
+        // can override later via the app-level subscribeTo helpers if they
+        // want a worker-only process that subscribes to a subset.
+        let mut pg_queues: Vec<String> = Vec::new();
+        let mut redis_queues: Vec<String> = Vec::new();
+        for r in &config.queues {
+            match parse_provider(&r.provider)? {
+                BackendKind::Pg => pg_queues.push(r.name.clone()),
+                BackendKind::Redis => redis_queues.push(r.name.clone()),
+            }
+        }
+        if let (Some(p), false) = (&pg, pg_queues.is_empty()) {
+            p.subscribe_to(pg_queues)?;
+        }
+        if let (Some(r), false) = (&redis, redis_queues.is_empty()) {
+            r.subscribe_to(redis_queues)?;
+        }
+
+        Ok(EddyqApp {
+            pg,
+            redis,
+            routes,
+            default_provider,
+            abort_handler: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn pick(&self, queue_name: &str) -> BackendKind {
+        self.routes
+            .get(queue_name)
+            .copied()
+            .unwrap_or(self.default_provider)
+    }
+
+    fn pg_ref(&self) -> Result<&Arc<Queue>> {
+        self.pg
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("postgres backend not configured"))
+    }
+
+    fn redis_ref(&self) -> Result<&Arc<RedisQueue>> {
+        self.redis
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("redis backend not configured"))
+    }
+
+    /// Enqueue a job. The target backend is picked from `options.queue` via
+    /// the route table — falling back to `defaultProvider` when the queue
+    /// isn't in the table.
+    #[napi]
+    pub async fn enqueue(
+        &self,
+        kind: String,
+        payload: serde_json::Value,
+        options: Option<EnqueueOptions>,
+    ) -> Result<EnqueueOutcome> {
+        let queue_name = options
+            .as_ref()
+            .and_then(|o| o.queue.clone())
+            .unwrap_or_else(|| "default".to_string());
+        match self.pick(&queue_name) {
+            BackendKind::Pg => {
+                let q = self
+                    .pg
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::from_reason("postgres backend not configured"))?;
+                q.enqueue(kind, payload, options).await
+            }
+            BackendKind::Redis => {
+                let q = self
+                    .redis
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::from_reason("redis backend not configured"))?;
+                q.enqueue(kind, payload, options).await
+            }
+        }
+    }
+
+    /// Per-backend job-state snapshot. Same shape as the standalone
+    /// `Eddyq.getStats` / `EddyqRedis.getStats` — just scoped to one
+    /// backend so the dashboard can render each half independently.
+    #[napi]
+    pub async fn get_stats_for(&self, provider: String) -> Result<JobStats> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.get_stats().await,
+            BackendKind::Redis => self.redis_ref()?.get_stats().await,
+        }
+    }
+
+    /// Which backend a queue routes to. Returns `"postgres"` or `"redis"`
+    /// based on the routing table + `defaultProvider`. Useful when callers
+    /// need to pick provider-specific paths (e.g. NestJS `@InjectQueue`
+    /// handles dispatching admin calls correctly).
+    #[napi]
+    pub fn provider_for(&self, queue_name: String) -> String {
+        match self.pick(&queue_name) {
+            BackendKind::Pg => "postgres".to_string(),
+            BackendKind::Redis => "redis".to_string(),
+        }
+    }
+
+    /// Whether this app has a Postgres backend configured. Lets callers
+    /// decide whether to call PG-only methods (`migrate`, `enqueueBatch`).
+    #[napi(getter)]
+    pub fn has_postgres(&self) -> bool {
+        self.pg.is_some()
+    }
+
+    /// Whether this app has a Redis backend configured.
+    #[napi(getter)]
+    pub fn has_redis(&self) -> bool {
+        self.redis.is_some()
+    }
+
+    /// Apply pending Postgres migrations (no-op when no PG backend).
+    /// Mirrors `Eddyq.migrate` so the Nest module can call it uniformly.
+    #[napi]
+    pub async fn migrate(&self) -> Result<Option<MigrateReport>> {
+        match &self.pg {
+            Some(p) => Ok(Some(p.migrate().await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Migration status for the Postgres backend (no-op when no PG backend).
+    #[napi]
+    pub async fn migration_status(&self) -> Result<Vec<MigrationStatus>> {
+        match &self.pg {
+            Some(p) => p.migration_status().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Close the Postgres pool (no-op when no PG backend).
+    #[napi]
+    pub async fn close(&self) -> Result<()> {
+        if let Some(p) = &self.pg {
+            p.close().await?;
+        }
+        Ok(())
+    }
+
+    /// Subscribe each backend's worker pool to the queues that route to it.
+    /// The first time this is called the routes from `connect()` take
+    /// effect; subsequent calls let runtime callers (e.g. NestJS dynamic
+    /// queue registration) extend the subscribed set.
+    #[napi]
+    pub fn subscribe_to(&self, queues: Vec<String>) -> Result<()> {
+        let mut pg_q: Vec<String> = Vec::new();
+        let mut redis_q: Vec<String> = Vec::new();
+        for q in queues {
+            match self.pick(&q) {
+                BackendKind::Pg => pg_q.push(q),
+                BackendKind::Redis => redis_q.push(q),
+            }
+        }
+        if let (Some(p), false) = (&self.pg, pg_q.is_empty()) {
+            p.subscribe_to(pg_q)?;
+        }
+        if let (Some(r), false) = (&self.redis, redis_q.is_empty()) {
+            r.subscribe_to(redis_q)?;
+        }
+        Ok(())
+    }
+
+    /// Set worker concurrency on both backends.
+    #[napi]
+    pub fn set_worker_concurrency(&self, n: u32) -> Result<()> {
+        if let Some(p) = &self.pg {
+            p.set_worker_concurrency(n)?;
+        }
+        if let Some(r) = &self.redis {
+            r.set_worker_concurrency(n)?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile the schedule list against one provider's backend. The
+    /// declared entries are upserted, anything not in the list is deleted.
+    /// Idempotent — safe to run on every boot. Useful when schedules are
+    /// declared in module config and the caller wants to keep them in sync.
+    #[napi]
+    pub async fn sync_schedules(
+        &self,
+        provider: String,
+        declared: Vec<ScheduleDeclaration>,
+    ) -> Result<SyncSchedulesReport> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.sync_schedules(declared).await,
+            BackendKind::Redis => self.redis_ref()?.sync_schedules(declared).await,
+        }
+    }
+
+    /// Bulk-enqueue with per-item routing. Items are grouped by their
+    /// resolved provider (per `options.queue` → routes → `defaultProvider`),
+    /// then dispatched to each backend in a single `enqueueMany` call.
+    /// The returned counts are the sum across both backends.
+    ///
+    /// Mixed batches across backends are supported in one call — useful for
+    /// fan-in jobs where some children land on Redis (e.g. webhook delivery)
+    /// and some on Postgres (e.g. ledger write).
+    #[napi]
+    pub async fn enqueue_many(&self, items: Vec<EnqueueManyItem>) -> Result<BulkEnqueueOutcome> {
+        let mut pg_items: Vec<EnqueueManyItem> = Vec::new();
+        let mut redis_items: Vec<EnqueueManyItem> = Vec::new();
+        for item in items {
+            let q = item.queue.clone().unwrap_or_else(|| "default".to_owned());
+            match self.pick(&q) {
+                BackendKind::Pg => pg_items.push(item),
+                BackendKind::Redis => redis_items.push(item),
+            }
+        }
+        let mut total_inserted: i64 = 0;
+        let mut total_skipped: i64 = 0;
+        if !pg_items.is_empty() {
+            let q = self
+                .pg
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("postgres backend not configured"))?;
+            let r = q.enqueue_many(pg_items).await?;
+            total_inserted += r.inserted;
+            total_skipped += r.skipped;
+        }
+        if !redis_items.is_empty() {
+            let q = self
+                .redis
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("redis backend not configured"))?;
+            let r = q.enqueue_many(redis_items).await?;
+            total_inserted += r.inserted;
+            total_skipped += r.skipped;
+        }
+        Ok(BulkEnqueueOutcome {
+            inserted: total_inserted,
+            skipped: total_skipped,
+        })
+    }
+
+    /// Cancel a pending job. The caller must specify which provider owns the
+    /// id — job ids are not globally unique across backends.
+    #[napi]
+    pub async fn cancel(&self, id: i64, provider: String) -> Result<bool> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => {
+                self.pg
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::from_reason("postgres backend not configured"))?
+                    .cancel(id)
+                    .await
+            }
+            BackendKind::Redis => {
+                self.redis
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::from_reason("redis backend not configured"))?
+                    .cancel(id)
+                    .await
+            }
+        }
+    }
+
+    /// Register a handler for `kind`. The same handler is registered on
+    /// every configured backend — only the backend that actually fetches a
+    /// job of this kind (per its `subscribeTo`) will invoke it.
+    #[napi(ts_args_type = "kind: string, handler: (call: JobCall) => Promise<unknown>")]
+    pub fn work(&self, kind: String, handler: JsTsFn) -> Result<()> {
+        // `ThreadsafeFunction` itself isn't Clone, but the `JsHandler` newtype
+        // (= `Arc<JsTsFn>`) is. Wrap once, share between backends — each
+        // backend stores its own Arc handle and the JS function survives
+        // until both backends are dropped.
+        let shared: JsHandler = Arc::new(handler);
+        if let Some(p) = &self.pg {
+            p.register_handler_arc(kind.clone(), shared.clone())?;
+        }
+        if let Some(r) = &self.redis {
+            r.register_handler_arc(kind, shared)?;
+        }
+        Ok(())
+    }
+
+    // --- Admin: groups -----------------------------------------------------
+    //
+    // Admin calls take a `provider` arg ("postgres" | "redis") because groups
+    // are namespaced per backend — a `tenant-acme` group on Redis is a
+    // different bucket than the same name on Postgres. Callers wanting
+    // cross-backend admin can call the method twice.
+
+    #[napi]
+    pub async fn set_group_concurrency(
+        &self,
+        provider: String,
+        group_key: String,
+        max: i32,
+    ) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.set_group_concurrency(group_key, max).await,
+            BackendKind::Redis => {
+                self.redis_ref()?
+                    .set_group_concurrency(group_key, max)
+                    .await
+            }
+        }
+    }
+
+    #[napi]
+    pub async fn pause_group(&self, provider: String, group_key: String) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.pause_group(group_key).await,
+            BackendKind::Redis => self.redis_ref()?.pause_group(group_key).await,
+        }
+    }
+
+    #[napi]
+    pub async fn resume_group(&self, provider: String, group_key: String) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.resume_group(group_key).await,
+            BackendKind::Redis => self.redis_ref()?.resume_group(group_key).await,
+        }
+    }
+
+    #[napi]
+    pub async fn set_group_rate(
+        &self,
+        provider: String,
+        group_key: String,
+        count: u32,
+        period_ms: u32,
+    ) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => {
+                self.pg_ref()?
+                    .set_group_rate(group_key, count, period_ms)
+                    .await
+            }
+            BackendKind::Redis => {
+                self.redis_ref()?
+                    .set_group_rate(group_key, count, period_ms)
+                    .await
+            }
+        }
+    }
+
+    #[napi]
+    pub async fn clear_group_rate(&self, provider: String, group_key: String) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.clear_group_rate(group_key).await,
+            BackendKind::Redis => self.redis_ref()?.clear_group_rate(group_key).await,
+        }
+    }
+
+    #[napi]
+    pub async fn list_groups(&self, provider: String) -> Result<Vec<Group>> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.list_groups().await,
+            BackendKind::Redis => self.redis_ref()?.list_groups().await,
+        }
+    }
+
+    /// Per-backend named-queue listing. Dashboards typically render one
+    /// list per backend (since queue names aren't globally unique across
+    /// backends — they can collide deliberately or accidentally).
+    #[napi]
+    pub async fn list_named_queues(&self, provider: String) -> Result<Vec<NamedQueue>> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.list_named_queues().await,
+            BackendKind::Redis => self.redis_ref()?.list_named_queues().await,
+        }
+    }
+
+    /// Paginated job listing. Routes by `filter.queue` if set, otherwise
+    /// uses the default provider. Pagination doesn't compose across two
+    /// backends — callers wanting cross-backend results should issue two
+    /// separate calls and stitch UI-side.
+    #[napi]
+    pub async fn list_jobs(
+        &self,
+        filter: Option<ListJobsFilter>,
+        pagination: Option<Pagination>,
+    ) -> Result<JobList> {
+        let queue = filter
+            .as_ref()
+            .and_then(|f| f.queue.clone())
+            .unwrap_or_else(|| "default".to_owned());
+        match self.pick(&queue) {
+            BackendKind::Pg => self.pg_ref()?.list_jobs(filter, pagination).await,
+            BackendKind::Redis => self.redis_ref()?.list_jobs(filter, pagination).await,
+        }
+    }
+
+    // --- Admin: named queues ----------------------------------------------
+
+    #[napi]
+    pub async fn set_queue_concurrency(
+        &self,
+        provider: String,
+        queue: String,
+        max: i32,
+    ) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.set_queue_concurrency(queue, max).await,
+            BackendKind::Redis => self.redis_ref()?.set_queue_concurrency(queue, max).await,
+        }
+    }
+
+    #[napi]
+    pub async fn pause_queue(&self, provider: String, queue: String) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.pause_queue(queue).await,
+            BackendKind::Redis => self.redis_ref()?.pause_queue(queue).await,
+        }
+    }
+
+    #[napi]
+    pub async fn resume_queue(&self, provider: String, queue: String) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.resume_queue(queue).await,
+            BackendKind::Redis => self.redis_ref()?.resume_queue(queue).await,
+        }
+    }
+
+    // --- Admin: schedules --------------------------------------------------
+    //
+    // Schedules are also per-backend. The convention is that schedule names
+    // are unique within a provider; callers using both backends should
+    // namespace by hand (e.g. `pg:nightly-report` and `redis:cache-warm`).
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_schedule(
+        &self,
+        provider: String,
+        name: String,
+        cron: String,
+        kind: String,
+        payload: serde_json::Value,
+        priority: Option<i32>,
+        max_attempts: Option<i32>,
+        queue: Option<String>,
+    ) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => {
+                let opts = ScheduleOptions {
+                    priority: priority.map(|p| i16::try_from(p).unwrap_or(0)),
+                    max_attempts,
+                    queue,
+                };
+                self.pg_ref()?
+                    .add_schedule(name, cron, kind, payload, Some(opts))
+                    .await
+            }
+            BackendKind::Redis => {
+                self.redis_ref()?
+                    .add_schedule(name, cron, kind, payload, priority, max_attempts, queue)
+                    .await
+            }
+        }
+    }
+
+    /// Interval-style schedule — Redis only (matches the underlying class).
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_interval_schedule(
+        &self,
+        name: String,
+        interval_ms: i64,
+        kind: String,
+        payload: serde_json::Value,
+        priority: Option<i32>,
+        max_attempts: Option<i32>,
+        queue: Option<String>,
+    ) -> Result<()> {
+        self.redis_ref()?
+            .add_interval_schedule(
+                name,
+                interval_ms,
+                kind,
+                payload,
+                priority,
+                max_attempts,
+                queue,
+            )
+            .await
+    }
+
+    #[napi]
+    pub async fn remove_schedule(&self, provider: String, name: String) -> Result<bool> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.remove_schedule(name).await,
+            BackendKind::Redis => self.redis_ref()?.remove_schedule(name).await,
+        }
+    }
+
+    #[napi]
+    pub async fn list_schedules(&self, provider: String) -> Result<Vec<Schedule>> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.list_schedules().await,
+            BackendKind::Redis => self.redis_ref()?.list_schedules().await,
+        }
+    }
+
+    /// Register the abort-broadcast handler. lib.cjs uses this to fan out
+    /// shutdown to in-flight `AbortController`s. Stored on the `EddyqApp`
+    /// itself — fired once at the start of `shutdown()`, before either
+    /// inner backend drains, so handlers see the signal regardless of which
+    /// backend they're running on.
+    #[napi(ts_args_type = "handler: (reason: string) => void")]
+    pub fn set_abort_handler(&self, handler: JsAbortFn) -> Result<()> {
+        let mut slot = self.abort_handler.lock().expect("abort lock");
+        *slot = Some(handler);
+        Ok(())
+    }
+
+    /// Start both backends' worker runtimes. Tuning options apply to both.
+    #[napi]
+    pub async fn start(&self, options: Option<StartOptions>) -> Result<()> {
+        if let Some(p) = &self.pg {
+            p.start(options.as_ref().map(clone_start_options)).await?;
+        }
+        if let Some(r) = &self.redis {
+            r.start(options).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain both runtimes. Mode and timeout apply to both in sequence.
+    #[napi]
+    pub async fn shutdown(&self, options: Option<ShutdownOptions>) -> Result<()> {
+        // Fire the abort handler exactly once — both backends' handlers were
+        // registered through `EddyqApp.work`, which stored AbortControllers
+        // under this instance's WeakMap entry. One broadcast covers both.
+        let mode_str = options
+            .as_ref()
+            .and_then(|o| o.mode.as_deref())
+            .unwrap_or("drain")
+            .to_owned();
+        if let Some(handler) = self.abort_handler.lock().expect("abort lock").as_ref() {
+            handler.call(mode_str, ThreadsafeFunctionCallMode::NonBlocking);
+        }
+        if let Some(p) = &self.pg {
+            let _ = p
+                .shutdown(options.as_ref().map(clone_shutdown_options))
+                .await;
+        }
+        if let Some(r) = &self.redis {
+            let _ = r.shutdown(options).await;
+        }
+        Ok(())
+    }
+}
+
+fn clone_start_options(o: &StartOptions) -> StartOptions {
+    StartOptions {
+        skip_migration_check: o.skip_migration_check,
+        sweep_interval_ms: o.sweep_interval_ms,
+        stale_after_ms: o.stale_after_ms,
+        heartbeat_interval_ms: o.heartbeat_interval_ms,
+        cleanup_interval_ms: o.cleanup_interval_ms,
+        completed_retention_secs: o.completed_retention_secs,
+        failed_retention_secs: o.failed_retention_secs,
+        cancelled_retention_secs: o.cancelled_retention_secs,
+        batch_retention_secs: o.batch_retention_secs,
+        leader_lease_secs: o.leader_lease_secs,
+        fetch_poll_interval_ms: o.fetch_poll_interval_ms,
+        scheduler_interval_ms: o.scheduler_interval_ms,
+    }
+}
+
+fn clone_shutdown_options(o: &ShutdownOptions) -> ShutdownOptions {
+    ShutdownOptions {
+        mode: o.mode.clone(),
+        graceful_timeout_ms: o.graceful_timeout_ms,
+    }
+}
+
+fn state_to_str(s: JobState) -> &'static str {
+    match s {
+        JobState::Pending => "pending",
+        JobState::Running => "running",
+        JobState::Completed => "completed",
+        JobState::Failed => "failed",
+        JobState::Scheduled => "scheduled",
+        JobState::Cancelled => "cancelled",
+    }
+}
+
+fn napi_filter_to_core(f: ListJobsFilter) -> eddyq_core::stats::ListJobsFilter {
+    eddyq_core::stats::ListJobsFilter {
+        queue: f.queue,
+        state: f.state.as_deref().and_then(|s| match s {
+            "pending" => Some(JobState::Pending),
+            "running" => Some(JobState::Running),
+            "completed" => Some(JobState::Completed),
+            "failed" => Some(JobState::Failed),
+            "scheduled" => Some(JobState::Scheduled),
+            "cancelled" => Some(JobState::Cancelled),
+            _ => None,
+        }),
+        kind: f.kind,
+        group_key: f.group_key,
+        tag: f.tag,
+        id: f.id,
+    }
+}
+
+fn job_row_to_napi(r: eddyq_core::stats::JobRow) -> JobRow {
+    JobRow {
+        id: r.id,
+        queue: r.queue,
+        kind: r.kind,
+        state: r.state,
+        priority: r.priority,
+        attempt: r.attempt,
+        max_attempts: r.max_attempts,
+        scheduled_at: r.scheduled_at.to_rfc3339(),
+        created_at: r.created_at.to_rfc3339(),
+        finalized_at: r.finalized_at.map(|t| t.to_rfc3339()),
+        group_key: r.group_key,
+        tags: r.tags,
+        payload: r.payload,
+        result: r.result,
+        errors: r.errors,
+        metadata: r.metadata,
+    }
+}
+
+fn group_to_napi(g: eddyq_core::group::Group) -> Group {
+    Group {
+        key: g.key,
+        running_count: g.running_count,
+        max_concurrency: g.max_concurrency,
+        paused: g.paused,
+        rate_count: g.rate_count,
+        rate_period_ms: g.rate_period_ms,
+        tokens: g.tokens,
+        tokens_refilled_at: g.tokens_refilled_at.map(|t| t.to_rfc3339()),
+        created_at: g.created_at.to_rfc3339(),
+        updated_at: g.updated_at.to_rfc3339(),
+    }
+}
+
+fn nq_to_napi(q: eddyq_core::named_queue::NamedQueue) -> NamedQueue {
+    NamedQueue {
+        name: q.name,
+        running_count: q.running_count,
+        max_concurrency: q.max_concurrency,
+        paused: q.paused,
+        default_timeout_ms: q.default_timeout_ms,
+        created_at: q.created_at.to_rfc3339(),
+        updated_at: q.updated_at.to_rfc3339(),
+    }
+}
+
+fn schedule_to_napi(s: eddyq_core::schedule::Schedule) -> Schedule {
+    Schedule {
+        name: s.name,
+        kind: s.kind,
+        payload: s.payload,
+        cron_expr: s.cron_expr,
+        next_run_at: s.next_run_at.to_rfc3339(),
+        last_run_at: s.last_run_at.map(|t| t.to_rfc3339()),
+        enabled: s.enabled,
+        priority: s.priority,
+        max_attempts: s.max_attempts,
+        queue: s.queue,
     }
 }

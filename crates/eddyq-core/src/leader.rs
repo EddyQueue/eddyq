@@ -7,7 +7,7 @@ pub const MAINTENANCE_ROLE: &str = "maintenance";
 /// LISTEN/NOTIFY channel a resigning leader uses to wake other nodes for an
 /// immediate election, so graceful shutdowns don't leave a `lease_secs / 3`
 /// gap before maintenance resumes.
-pub(crate) const LEADER_RESIGN_CHANNEL: &str = "eddyq_leader_resign";
+pub const LEADER_RESIGN_CHANNEL: &str = "eddyq_leader_resign";
 
 /// Try to win or refresh leadership. Returns true if this worker_id is now leader.
 /// Single upsert handles: first boot (insert), lease expired (take over), already leader (refresh), other leader active (no-op).

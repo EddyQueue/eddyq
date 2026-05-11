@@ -130,6 +130,79 @@ native.Eddyq.prototype.work = function work(kind, handler) {
   return origWork.call(this, kind, wrapHandler(handler, this));
 };
 
+// Same wrapper for the Redis-backed class — keeps the JS-side ergonomics
+// (AbortController fan-out, error envelope) identical across backends.
+if (native.EddyqRedis && native.EddyqRedis.prototype.work) {
+  const origRedisWork = native.EddyqRedis.prototype.work;
+  native.EddyqRedis.prototype.work = function work(kind, handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError("queue.work(kind, handler): handler must be a function");
+    }
+    ensureAbortHandler(this);
+    return origRedisWork.call(this, kind, wrapHandler(handler, this));
+  };
+
+}
+
+// Same wrapper for EddyqApp — its `work` registers on both backends, so the
+// AbortController fan-out covers handlers running on either backend.
+if (native.EddyqApp && native.EddyqApp.prototype.work) {
+  const origAppWork = native.EddyqApp.prototype.work;
+  native.EddyqApp.prototype.work = function work(kind, handler) {
+    if (typeof handler !== "function") {
+      throw new TypeError("queue.work(kind, handler): handler must be a function");
+    }
+    ensureAbortHandler(this);
+    return origAppWork.call(this, kind, wrapHandler(handler, this));
+  };
+}
+
+if (native.EddyqRedis && native.EddyqRedis.prototype.work) {
+  // BullMQ-style sugar for addSchedule. Accepts either:
+  //   - cron string:     queue.addSchedule(name, "0 */5 * * * *", kind, payload, ...)
+  //   - object cron:     queue.addSchedule(name, { cron: "..." }, kind, payload, ...)
+  //   - interval object: queue.addSchedule(name, { every: 300000 }, kind, payload, ...)
+  // The interval form routes to addIntervalSchedule under the hood.
+  const origAddSchedule = native.EddyqRedis.prototype.addSchedule;
+  const origAddInterval = native.EddyqRedis.prototype.addIntervalSchedule;
+  native.EddyqRedis.prototype.addSchedule = function addSchedule(
+    name,
+    when,
+    kind,
+    payload,
+    priority,
+    maxAttempts,
+    queue,
+  ) {
+    if (typeof when === "string") {
+      return origAddSchedule.call(this, name, when, kind, payload, priority, maxAttempts, queue);
+    }
+    if (when && typeof when === "object") {
+      if (typeof when.every === "number") {
+        if (!Number.isFinite(when.every) || when.every <= 0) {
+          throw new TypeError("addSchedule: { every } must be a positive number (milliseconds)");
+        }
+        return origAddInterval.call(
+          this,
+          name,
+          when.every,
+          kind,
+          payload,
+          priority,
+          maxAttempts,
+          queue,
+        );
+      }
+      if (typeof when.cron === "string") {
+        return origAddSchedule.call(this, name, when.cron, kind, payload, priority, maxAttempts, queue);
+      }
+    }
+    throw new TypeError(
+      'addSchedule(name, when, kind, …): `when` must be a cron string, { cron: "…" }, or { every: <ms> }',
+    );
+  };
+}
+
 module.exports = {
   ...native,
   CancelError,

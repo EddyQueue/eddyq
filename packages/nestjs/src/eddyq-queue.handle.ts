@@ -2,11 +2,13 @@ import type {
   BatchEnqueueOutcome,
   BulkEnqueueOutcome,
   Eddyq,
+  EddyqApp,
   EnqueueOutcome,
 } from "@eddyq/queue";
 import { Logger } from "@nestjs/common";
 
 import type {
+  EddyqInstance,
   GroupProfile,
   GroupedQueueHandle,
   QueueDefaults,
@@ -16,6 +18,14 @@ import type {
   QueueHandle,
   QueueRegistration,
 } from "./eddyq.types.js";
+
+function hasBatch(queue: EddyqInstance): queue is Eddyq {
+  return typeof (queue as Eddyq).enqueueBatch === "function";
+}
+
+function isAppHandle(queue: EddyqInstance): queue is EddyqApp {
+  return typeof (queue as { providerFor?: unknown }).providerFor === "function";
+}
 
 const logger = new Logger("EddyqQueueHandle");
 
@@ -37,7 +47,7 @@ export class QueueHandleImpl implements QueueHandle {
   private readonly configuredGroups = new Map<string, Promise<void>>();
 
   constructor(
-    private readonly eddyq: Eddyq,
+    private readonly eddyq: EddyqInstance,
     registration: QueueRegistration,
   ) {
     this.name = registration.name;
@@ -68,6 +78,14 @@ export class QueueHandleImpl implements QueueHandle {
   }
 
   enqueueBatch(input: QueueEnqueueBatchInput): Promise<BatchEnqueueOutcome> {
+    if (!hasBatch(this.eddyq)) {
+      // `enqueue_batch` is a Postgres-only primitive (the `eddyq_batches`
+      // table tracks fan-in state in a single transaction). Redis doesn't
+      // expose this surface; surface a clear error rather than a TypeError.
+      throw new Error(
+        "@eddyq/nestjs: enqueueBatch() is only available on the Postgres backend",
+      );
+    }
     return this.eddyq.enqueueBatch({
       items: input.items.map((item) => ({
         ...this.defaults,
@@ -147,15 +165,32 @@ export class QueueHandleImpl implements QueueHandle {
     profile: GroupProfile,
   ): Promise<void> {
     try {
-      if (profile.concurrency !== undefined) {
-        await this.eddyq.setGroupConcurrency(groupKey, profile.concurrency);
-      }
-      if (profile.rate) {
-        await this.eddyq.setGroupRate(
-          groupKey,
-          profile.rate.count,
-          profile.rate.periodMs,
-        );
+      // EddyqApp's group admin takes a `provider` arg; the per-queue handle
+      // knows its queue name → can resolve the provider via the app.
+      if (isAppHandle(this.eddyq)) {
+        const provider = this.eddyq.providerFor(this.name);
+        if (profile.concurrency !== undefined) {
+          await this.eddyq.setGroupConcurrency(provider, groupKey, profile.concurrency);
+        }
+        if (profile.rate) {
+          await this.eddyq.setGroupRate(
+            provider,
+            groupKey,
+            profile.rate.count,
+            profile.rate.periodMs,
+          );
+        }
+      } else {
+        if (profile.concurrency !== undefined) {
+          await this.eddyq.setGroupConcurrency(groupKey, profile.concurrency);
+        }
+        if (profile.rate) {
+          await this.eddyq.setGroupRate(
+            groupKey,
+            profile.rate.count,
+            profile.rate.periodMs,
+          );
+        }
       }
     } catch (err) {
       logger.warn(

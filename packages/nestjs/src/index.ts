@@ -28,8 +28,11 @@ export {
   getQueueRegistrationToken,
 } from "./eddyq.constants.js";
 export type {
+  EddyqInstance,
   EddyqModuleAsyncOptions,
   EddyqModuleOptions,
+  EddyqQueueRoute,
+  EddyqRedisOptions,
   EddyqTuningOptions,
   GroupProfile,
   GroupRate,
@@ -43,7 +46,7 @@ export type {
   QueueRegistration,
 } from "./eddyq.types.js";
 
-export { CancelError, Eddyq, RetryError } from "@eddyq/queue";
+export { CancelError, Eddyq, EddyqApp, EddyqRedis, RetryError } from "@eddyq/queue";
 export type {
   BatchEnqueueOutcome,
   BulkEnqueueOutcome,

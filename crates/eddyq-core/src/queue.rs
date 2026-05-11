@@ -5,7 +5,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
-    enqueue::{EnqueueOptions, EnqueueResult, enqueue},
+    backend::{Backend, PgBackend},
+    enqueue::{EnqueueOptions, EnqueueResult},
     error::{Error, Result},
     job::Job,
     runtime::{self, RuntimeHandles},
@@ -71,18 +72,30 @@ impl Default for QueueConfig {
     }
 }
 
-pub struct QueueBuilder {
-    pool: PgPool,
+pub struct QueueBuilder<B: Backend = PgBackend> {
+    backend: B,
     registry: WorkerRegistry,
     config: QueueConfig,
     line: String,
     queues: Vec<String>,
 }
 
-impl QueueBuilder {
+impl QueueBuilder<PgBackend> {
+    /// Build a Postgres-backed queue. Equivalent to
+    /// `QueueBuilder::with_backend(PgBackend::new(pool))` — kept as the
+    /// primary constructor since Postgres is the default backend.
     pub fn new(pool: PgPool) -> Self {
+        Self::with_backend(PgBackend::new(pool))
+    }
+}
+
+impl<B: Backend> QueueBuilder<B> {
+    /// Build a queue around any `Backend` impl. Use this for non-default
+    /// backends (e.g. `RedisBackend`) or when you've constructed a
+    /// `PgBackend` explicitly.
+    pub fn with_backend(backend: B) -> Self {
         Self {
-            pool,
+            backend,
             registry: WorkerRegistry::new(),
             config: QueueConfig::default(),
             line: crate::migrate::DEFAULT_LINE.to_owned(),
@@ -176,6 +189,14 @@ impl QueueBuilder {
         self
     }
 
+    /// How often the leader scheduler loop fires due schedules + promotes
+    /// delayed jobs. Default 5s. Lower values make interval schedules
+    /// (`{ every: ms }` on Redis) more responsive.
+    pub fn scheduler_interval(mut self, d: Duration) -> Self {
+        self.config.scheduler_interval = d;
+        self
+    }
+
     /// Retention for completed jobs. `None` keeps them forever.
     pub fn completed_retention(mut self, d: Option<Duration>) -> Self {
         self.config.completed_retention = d;
@@ -206,9 +227,9 @@ impl QueueBuilder {
         self
     }
 
-    pub fn build(self) -> Queue {
+    pub fn build(self) -> Queue<B> {
         Queue {
-            pool: self.pool,
+            backend: Arc::new(self.backend),
             registry: Arc::new(self.registry),
             config: self.config,
             line: self.line,
@@ -226,8 +247,8 @@ enum QueueState {
     },
 }
 
-pub struct Queue {
-    pool: PgPool,
+pub struct Queue<B: Backend = PgBackend> {
+    backend: Arc<B>,
     registry: Arc<WorkerRegistry>,
     config: QueueConfig,
     line: String,
@@ -235,83 +256,46 @@ pub struct Queue {
     state: std::sync::Mutex<QueueState>,
 }
 
-impl Queue {
-    pub fn builder(pool: PgPool) -> QueueBuilder {
-        QueueBuilder::new(pool)
+impl Queue<PgBackend> {
+    /// Build a Postgres-backed queue from a `PgPool`. Preserves the original
+    /// API; equivalent to `Queue::with_backend(PgBackend::new(pool))`.
+    pub fn builder(pool: PgPool) -> QueueBuilder<PgBackend> {
+        QueueBuilder::<PgBackend>::new(pool)
     }
 
+    /// Direct access to the Postgres pool. Postgres-only. Used by the
+    /// `hello.rs` example and by callers that want to issue raw SQL
+    /// alongside their queue work.
     pub fn pool(&self) -> &PgPool {
-        &self.pool
+        self.backend.pool()
     }
 
-    /// The migration line this queue was built for (default: `"main"`).
-    pub fn line(&self) -> &str {
-        &self.line
-    }
+    // ---- Postgres-only inherent methods ----------------------------------
 
-    /// Apply all pending schema migrations for this queue's line. Uses the
-    /// `_eddyq_migrations` tracking table (intentionally separate from your
-    /// app's migration tool so there are no collisions).
+    /// Apply all pending schema migrations for this queue's line.
     pub async fn migrate(&self) -> Result<crate::migrate::MigrateReport> {
-        crate::migrate::up(&self.pool, &self.line).await
+        self.backend.migrate_up(&self.line).await
     }
 
     pub async fn migrate_down(&self, max_steps: usize) -> Result<crate::migrate::MigrateReport> {
-        crate::migrate::down(&self.pool, &self.line, max_steps).await
+        self.backend.migrate_down(&self.line, max_steps).await
     }
 
     pub async fn migration_status(&self) -> Result<Vec<crate::migrate::MigrationStatus>> {
-        crate::migrate::status(&self.pool, &self.line).await
-    }
-
-    pub async fn enqueue<J: Job>(&self, job: &J) -> Result<EnqueueResult> {
-        enqueue(&self.pool, job, EnqueueOptions::default()).await
-    }
-
-    pub async fn enqueue_with<J: Job>(
-        &self,
-        job: &J,
-        opts: EnqueueOptions,
-    ) -> Result<EnqueueResult> {
-        enqueue(&self.pool, job, opts).await
-    }
-
-    /// Bulk-enqueue N jobs of the same kind in a single INSERT. Much faster
-    /// than calling `enqueue` in a loop for large batches. Returns an
-    /// aggregate count (inserted + skipped-via-unique-conflict); for per-row
-    /// results, use `enqueue` in a loop.
-    pub async fn enqueue_many<J: Job>(
-        &self,
-        jobs: &[J],
-    ) -> Result<crate::enqueue::BulkEnqueueResult> {
-        crate::enqueue::enqueue_many(&self.pool, jobs).await
-    }
-
-    /// Transactional bulk enqueue. All or nothing — rolls back with the user's tx.
-    pub async fn enqueue_many_in_tx<J: Job>(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        jobs: &[J],
-    ) -> Result<crate::enqueue::BulkEnqueueResult> {
-        crate::enqueue::enqueue_many_in_tx(tx, jobs).await
-    }
-
-    /// Cancel a pending job by id. Returns `true` if cancelled, `false` if
-    /// the job doesn't exist or is already running / finalized. Can't cancel
-    /// a running job — the handler must cooperate for that.
-    pub async fn cancel(&self, id: crate::job::JobId) -> Result<bool> {
-        crate::fetch::cancel(&self.pool, id).await
+        self.backend.migration_status(&self.line).await
     }
 
     /// Enqueue a job inside the caller's transaction. The job row is only
     /// visible to workers if the user's transaction commits. On rollback the
-    /// job — and any follow-on NOTIFY — are discarded.
+    /// job — and any follow-on NOTIFY — are discarded. **Postgres only.**
     pub async fn enqueue_in_tx<J: Job>(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         job: &J,
     ) -> Result<EnqueueResult> {
-        crate::enqueue::enqueue_in_tx(tx, job, EnqueueOptions::default()).await
+        self.backend
+            .enqueue_in_tx(tx, job, EnqueueOptions::default())
+            .await
     }
 
     pub async fn enqueue_in_tx_with<J: Job>(
@@ -320,26 +304,101 @@ impl Queue {
         job: &J,
         opts: EnqueueOptions,
     ) -> Result<EnqueueResult> {
-        crate::enqueue::enqueue_in_tx(tx, job, opts).await
+        self.backend.enqueue_in_tx(tx, job, opts).await
+    }
+
+    /// Transactional bulk enqueue. All or nothing — rolls back with the user's tx.
+    /// **Postgres only.**
+    pub async fn enqueue_many_in_tx<J: Job>(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        jobs: &[J],
+    ) -> Result<crate::enqueue::BulkEnqueueResult> {
+        self.backend.enqueue_many_in_tx(tx, jobs).await
+    }
+}
+
+impl<B: Backend> Queue<B> {
+    /// The migration line this queue was built for (default: `"main"`).
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// Underlying backend (e.g. for capability inspection or backend-specific
+    /// admin calls).
+    pub fn backend(&self) -> &Arc<B> {
+        &self.backend
+    }
+
+    /// Backend capability flags — what this queue can/can't do at runtime.
+    pub fn caps(&self) -> crate::backend::BackendCaps {
+        self.backend.caps()
+    }
+
+    pub async fn enqueue<J: Job>(&self, job: &J) -> Result<EnqueueResult> {
+        let req = build_dyn_enqueue(job, EnqueueOptions::default())?;
+        self.backend.enqueue(req).await
+    }
+
+    pub async fn enqueue_with<J: Job>(
+        &self,
+        job: &J,
+        opts: EnqueueOptions,
+    ) -> Result<EnqueueResult> {
+        let req = build_dyn_enqueue(job, opts)?;
+        self.backend.enqueue(req).await
+    }
+
+    /// Bulk-enqueue N jobs of the same kind in a single round-trip. Much
+    /// faster than calling `enqueue` in a loop for large batches. Returns an
+    /// aggregate count (inserted + skipped-via-unique-conflict); for per-row
+    /// results, use `enqueue` in a loop.
+    pub async fn enqueue_many<J: Job>(
+        &self,
+        jobs: &[J],
+    ) -> Result<crate::enqueue::BulkEnqueueResult> {
+        let mut reqs = Vec::with_capacity(jobs.len());
+        for j in jobs {
+            reqs.push(build_dyn_enqueue(j, EnqueueOptions::default())?);
+        }
+        self.backend.enqueue_many(reqs).await
+    }
+
+    /// Cancel a pending job by id. Returns `true` if cancelled, `false` if
+    /// the job doesn't exist or is already running / finalized. Can't cancel
+    /// a running job — the handler must cooperate for that.
+    pub async fn cancel(&self, id: crate::job::JobId) -> Result<bool> {
+        self.backend.cancel(id).await
     }
 
     /// Register or update a recurring schedule. Jobs will be auto-enqueued when
     /// each cron occurrence is due. Skip-missed semantics: one enqueue per tick,
     /// regardless of how many runs were missed while the scheduler was down.
     pub async fn add_schedule<J: Job>(&self, name: &str, cron_expr: &str, job: &J) -> Result<()> {
-        crate::schedule::upsert_schedule(&self.pool, name, cron_expr, job).await
+        let payload = serde_json::to_value(job)?;
+        self.backend
+            .upsert_schedule_raw(
+                name,
+                cron_expr,
+                J::KIND,
+                payload,
+                job.priority(),
+                job.max_attempts(),
+                job.queue(),
+            )
+            .await
     }
 
     pub async fn remove_schedule(&self, name: &str) -> Result<bool> {
-        crate::schedule::remove_schedule(&self.pool, name).await
+        self.backend.remove_schedule(name).await
     }
 
     pub async fn set_schedule_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
-        crate::schedule::set_enabled(&self.pool, name, enabled).await
+        self.backend.set_schedule_enabled(name, enabled).await
     }
 
     pub async fn list_schedules(&self) -> Result<Vec<crate::schedule::Schedule>> {
-        crate::schedule::list_schedules(&self.pool).await
+        self.backend.list_schedules().await
     }
 
     /// Reconcile DB schedules against a code-declared list. Each entry is
@@ -348,40 +407,40 @@ impl Queue {
         &self,
         declared: &[crate::schedule::ScheduleDeclaration],
     ) -> Result<crate::schedule::SyncReport> {
-        crate::schedule::sync_schedules(&self.pool, declared).await
+        self.backend.sync_schedules(declared).await
     }
 
     /// Set the concurrency cap for a group. Jobs with `group_key(key)` will not
     /// run more than `max` at a time.
     pub async fn set_group_concurrency(&self, key: &str, max: i32) -> Result<()> {
-        crate::group::set_concurrency(&self.pool, key, max).await
+        self.backend.group_set_concurrency(key, max).await
     }
 
     pub async fn pause_group(&self, key: &str) -> Result<()> {
-        crate::group::set_paused(&self.pool, key, true).await
+        self.backend.group_set_paused(key, true).await
     }
 
     pub async fn resume_group(&self, key: &str) -> Result<()> {
-        crate::group::set_paused(&self.pool, key, false).await
+        self.backend.group_set_paused(key, false).await
     }
 
     pub async fn get_group(&self, key: &str) -> Result<Option<crate::group::Group>> {
-        crate::group::get(&self.pool, key).await
+        self.backend.group_get(key).await
     }
 
     pub async fn list_groups(&self) -> Result<Vec<crate::group::Group>> {
-        crate::group::list(&self.pool).await
+        self.backend.group_list().await
     }
 
     /// Set a throughput rate limit: at most `count` jobs may *start* per `period`
     /// for this group. Independent of `max_concurrency` — both constraints apply.
     /// Useful for external-API rate limits (e.g. 1000 req/min for OpenAI).
     pub async fn set_group_rate(&self, key: &str, count: u32, period: Duration) -> Result<()> {
-        crate::group::set_rate(&self.pool, key, count, period).await
+        self.backend.group_set_rate(key, count, period).await
     }
 
     pub async fn clear_group_rate(&self, key: &str) -> Result<()> {
-        crate::group::clear_rate(&self.pool, key).await
+        self.backend.group_clear_rate(key).await
     }
 
     // --- Pattern-based group rules -----------------------------------------
@@ -392,63 +451,49 @@ impl Queue {
     /// called `set_group_concurrency` / `set_group_rate` for that specific key.
     ///
     /// Patterns use `*` (any chars) and `?` (one char).
-    ///
-    /// ```ignore
-    /// // Every Shopify integration auto-caps at 2 concurrent workers:
-    /// queue.set_group_rule("shopify:*", GroupRule::concurrency(2)).await?;
-    ///
-    /// // OpenAI calls per tenant: 2000 requests/min, cap 20 in flight:
-    /// queue.set_group_rule(
-    ///     "tenant:*:openai",
-    ///     GroupRule::both(20, 2000, Duration::from_secs(60)),
-    /// ).await?;
-    /// ```
     pub async fn set_group_rule(&self, pattern: &str, rule: crate::group::GroupRule) -> Result<()> {
-        crate::group::set_rule(&self.pool, pattern, rule).await
+        self.backend.group_set_rule(pattern, rule).await
     }
 
     pub async fn remove_group_rule(&self, pattern: &str) -> Result<bool> {
-        crate::group::remove_rule(&self.pool, pattern).await
+        self.backend.group_remove_rule(pattern).await
     }
 
     pub async fn list_group_rules(&self) -> Result<Vec<crate::group::StoredRule>> {
-        crate::group::list_rules(&self.pool).await
+        self.backend.group_list_rules().await
     }
 
     // --- Named-queue cross-process concurrency -----------------------------
 
     /// Cap the total concurrency of a named queue *across all worker
     /// processes*. Unlike `worker_concurrency` (which is per-process), this
-    /// is a global cap enforced via a shared counter in `eddyq_queues`.
-    ///
-    /// Useful for: "no matter how many ECS replicas we're running, the
-    /// `integrations` queue runs at most 10 jobs total at once."
+    /// is a global cap enforced via a shared counter.
     pub async fn set_queue_concurrency(&self, name: &str, max: i32) -> Result<()> {
-        crate::named_queue::set_concurrency(&self.pool, name, max).await
+        self.backend.queue_set_concurrency(name, max).await
     }
 
     pub async fn pause_queue(&self, name: &str) -> Result<()> {
-        crate::named_queue::set_paused(&self.pool, name, true).await
+        self.backend.queue_set_paused(name, true).await
     }
 
     pub async fn resume_queue(&self, name: &str) -> Result<()> {
-        crate::named_queue::set_paused(&self.pool, name, false).await
+        self.backend.queue_set_paused(name, false).await
     }
 
     pub async fn get_queue(&self, name: &str) -> Result<Option<crate::named_queue::NamedQueue>> {
-        crate::named_queue::get(&self.pool, name).await
+        self.backend.queue_get(name).await
     }
 
     pub async fn list_named_queues(&self) -> Result<Vec<crate::named_queue::NamedQueue>> {
-        crate::named_queue::list(&self.pool).await
+        self.backend.queue_list().await
     }
 
     // --- Stats / read-only queries ----------------------------------------
 
-    /// One-shot snapshot of job counts grouped by (queue, state). Single SQL
-    /// round trip — suitable as the landing query for a dashboard.
+    /// One-shot snapshot of job counts grouped by (queue, state). Single round
+    /// trip — suitable as the landing query for a dashboard.
     pub async fn get_stats(&self) -> Result<crate::stats::JobStats> {
-        crate::stats::get_stats(&self.pool).await
+        self.backend.get_stats().await
     }
 
     /// Paginated job listing with optional filters. Ordered newest-first.
@@ -457,20 +502,14 @@ impl Queue {
         filter: crate::stats::ListJobsFilter,
         pagination: crate::stats::Pagination,
     ) -> Result<crate::stats::JobList> {
-        crate::stats::list_jobs(&self.pool, filter, pagination).await
+        self.backend.list_jobs(filter, pagination).await
     }
 
     /// Set a default per-job timeout for jobs in this queue. Handlers that
     /// don't return within the duration are aborted and the job is marked
     /// failed (with retry if under `max_attempts`). Pass `None` to clear.
-    ///
-    /// **Default is no timeout** — opt in per queue.
-    ///
-    /// Limitation inherited from tokio: only I/O-yielding handlers can be
-    /// cancelled. A handler doing tight CPU work without `.await` won't be
-    /// interrupted by the timeout.
     pub async fn set_queue_timeout(&self, name: &str, timeout: Option<Duration>) -> Result<()> {
-        crate::named_queue::set_timeout(&self.pool, name, timeout).await
+        self.backend.queue_set_timeout(name, timeout).await
     }
 
     pub fn start(&self) -> Result<()> {
@@ -481,7 +520,7 @@ impl Queue {
 
         let shutdown = CancellationToken::new();
         let handles = runtime::start(
-            self.pool.clone(),
+            self.backend.clone(),
             self.registry.clone(),
             self.config.clone(),
             self.queues.clone(),
@@ -492,6 +531,7 @@ impl Queue {
             kinds = ?self.registry.kinds(),
             queues = ?self.queues,
             concurrency = self.config.worker_concurrency,
+            backend = self.backend.caps().name,
             "eddyq queue started"
         );
 
@@ -542,7 +582,7 @@ impl Queue {
                     .copied()
                     .collect();
                 handles.abort_all();
-                let reclaimed = match crate::fetch::reclaim_in_flight(&self.pool, &ids).await {
+                let reclaimed = match self.backend.reclaim_in_flight(&ids).await {
                     Ok(n) => n,
                     Err(e) => {
                         // Best-effort. We've already aborted the runtime; if
@@ -568,6 +608,25 @@ impl Queue {
 
         Ok(())
     }
+}
+
+/// Build a `DynEnqueue` from a typed `Job` + options. Centralizes the
+/// trait-default lookup logic so both `enqueue` and `enqueue_with` share it.
+fn build_dyn_enqueue<J: Job>(job: &J, opts: EnqueueOptions) -> Result<crate::enqueue::DynEnqueue> {
+    let payload = serde_json::to_value(job)?;
+    let mut req = crate::enqueue::DynEnqueue::new(J::KIND, payload);
+    req.max_attempts = opts.max_attempts.unwrap_or_else(|| job.max_attempts());
+    req.priority = opts.priority.unwrap_or_else(|| job.priority());
+    req.scheduled_at = opts.scheduled_at;
+    req.unique_key = opts.unique_key.or_else(|| job.unique_key());
+    req.group_key = opts.group_key.or_else(|| job.group_key());
+    req.tags = opts.tags.unwrap_or_else(|| job.tags());
+    req.metadata = opts
+        .metadata
+        .or_else(|| job.metadata())
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    req.queue = opts.queue.unwrap_or_else(|| job.queue().to_owned());
+    Ok(req)
 }
 
 /// How `Queue::shutdown_with` releases an in-flight worker pool. The right

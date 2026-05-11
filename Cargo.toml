@@ -5,6 +5,7 @@ members = [
     "crates/eddyq-client",
     "crates/eddyq-cli",
     "crates/eddyq-napi",
+    "crates/eddyq-redis",
     "benches",
 ]
 

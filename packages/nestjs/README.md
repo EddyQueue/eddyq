@@ -1,7 +1,7 @@
 # @eddyq/nestjs
 
-NestJS module for [eddyq](https://github.com/eddyqueue/eddyq) — a Rust + Postgres
-job queue with native Node bindings.
+NestJS module for [eddyq](https://github.com/eddyqueue/eddyq) — a Rust job queue
+that runs on **Postgres**, **Redis**, or both, with native Node bindings.
 
 ```
 pnpm add @eddyq/queue @eddyq/nestjs
@@ -9,6 +9,23 @@ pnpm add @eddyq/queue @eddyq/nestjs
 
 > npm has a long-standing bug with `optionalDependencies` + lockfiles that
 > breaks packages shipping prebuilt binaries. **Use pnpm or yarn.**
+
+### Backends supported by `forRoot`
+
+| Shape | Pass | DI returns | Best for |
+|---|---|---|---|
+| Postgres only | `databaseUrl` | `Eddyq` | Transactional enqueue, durable batches |
+| Redis only | `redis: { url, line? }` | `EddyqRedis` | High-throughput, ephemeral, low latency |
+| Multi-backend | both + `queues: [...]` + `defaultProvider` | `EddyqApp` | Per-queue routing in one app |
+
+The DI token (`@InjectEddyq()`) returns whichever shape your `forRoot` config
+implies. `@InjectQueue('foo')` returns a `QueueHandle` regardless — it routes
+to the right backend transparently in the multi-backend case.
+
+> **Run the dashboard.** `@eddyq/wakeboard` mounts a UI under your Nest app
+> (`/wakeboard` by default) that works against any backend shape — stats,
+> queues, groups, schedules, job inspection, pause/resume, cancel. Stop
+> writing one-off admin endpoints. See "Dashboard (Wakeboard)" below.
 
 ## Quick start
 
@@ -118,6 +135,54 @@ EddyqModule.forRootAsync({
   }),
 });
 ```
+
+### Redis-only `forRoot`
+
+```ts
+EddyqModule.forRoot({
+  redis: {
+    url: process.env.REDIS_URL!,
+    line: "main",           // hash-tag namespace; distinct lines isolate keyspaces
+  },
+  workerConcurrency: 20,
+  subscribeTo: ["webhooks", "fanout"],
+});
+```
+
+Same Nest surface — `@InjectEddyq()` returns an `EddyqRedis`, processors and
+`@InjectQueue` work identically. The Redis backend skips migrations
+(`runMigrations`/`skipMigrationCheck` are ignored) and ignores the
+`connectOptions` pool sizing (managed by the Redis connection manager).
+
+### Multi-backend `forRoot` — webhooks on Redis, payments on Postgres
+
+```ts
+EddyqModule.forRoot({
+  databaseUrl: process.env.DATABASE_URL!,
+  redis:       { url: process.env.REDIS_URL!, line: "main" },
+  queues: [
+    { name: "webhooks", provider: "redis" },
+    { name: "payments", provider: "postgres" },
+  ],
+  defaultProvider: "postgres",   // unrouted queue names land here
+});
+```
+
+Inside one Nest app:
+
+- `@InjectQueue('webhooks')` returns a handle that enqueues onto Redis.
+- `@InjectQueue('payments')` returns a handle that enqueues onto Postgres.
+- A single handler registered via `@JobHandler('process')` services jobs of
+  that kind from **either** backend — the backend that actually fetches it
+  invokes the handler. Use `payload.queue` (or any payload field) to branch
+  if the kinds are shared.
+- `enqueueBatch` is Postgres-only — calling it on a Redis-routed handle
+  throws at runtime with a clear message.
+- `enqueueInTx` (and the `SELECT eddyq_enqueue(...)` SQL path) only makes
+  sense for Postgres-routed queues. Calling it on a Redis-routed queue is
+  a programmer error.
+
+Full reference app: [`examples/nestjs-mixed`](https://github.com/eddyqueue/eddyq/tree/main/examples/nestjs-mixed).
 
 ## Error handling
 
@@ -299,10 +364,49 @@ Three ways to apply migrations, in order of recommendation:
 Set `skipMigrationCheck: true` if you manage migrations out-of-band and want
 to silence the boot-time guard.
 
+## Dashboard (Wakeboard)
+
+`@eddyq/wakeboard` mounts a complete admin UI under your Nest app. It
+auto-detects which backend(s) you wired in `forRoot` and renders the right
+sections — stats, queues, groups, schedules, paginated job inspection,
+pause/resume, cancel, set concurrency, set rate limit.
+
+```ts
+import { Module } from "@nestjs/common";
+import { EddyqModule } from "@eddyq/nestjs";
+import { EddyqWakeboardModule } from "@eddyq/wakeboard";
+
+@Module({
+  imports: [
+    EddyqModule.forRoot({
+      databaseUrl: process.env.DATABASE_URL!,
+      redis:       { url: process.env.REDIS_URL!, line: "main" },
+      queues: [
+        { name: "webhooks", provider: "redis" },
+        { name: "payments", provider: "postgres" },
+      ],
+      defaultProvider: "postgres",
+    }),
+    EddyqWakeboardModule.forRoot({
+      mountPath: "/wakeboard",
+      auth: { password: process.env.WAKEBOARD_PASSWORD! },
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Hit `http://localhost:3000/wakeboard` and you're looking at live queue state.
+The REST API under `/wakeboard/api/*` takes an optional `?provider=postgres|redis`
+query param on every endpoint when both backends are configured — wire it up
+to whatever monitoring you want. **Use this. It saves you a thousand lines
+of admin scaffolding.**
+
 ## Requirements
 
 - Node ≥ 20
-- PostgreSQL ≥ 14
+- PostgreSQL ≥ 14 (if using the Postgres backend)
+- Redis ≥ 7 (if using the Redis backend — Redis Functions require 7.0+)
 - `@nestjs/common` and `@nestjs/core` ^10 or ^11 (peer deps)
 - `@eddyq/queue` same minor version (peer dep)
 

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 
+pub mod backend;
 pub mod batch;
 pub mod enqueue;
 pub mod error;
@@ -14,12 +15,13 @@ pub mod migrate;
 pub mod named_queue;
 pub mod queue;
 pub mod retry;
-mod runtime;
+pub(crate) mod runtime;
 pub mod schedule;
 pub mod stats;
 pub mod worker;
 
 pub use async_trait::async_trait;
+pub use backend::{Backend, BackendCaps, PgBackend};
 pub use batch::{BatchEnqueueResult, BatchOptions};
 pub use enqueue::{BulkEnqueueResult, DynEnqueue, EnqueueOptions, EnqueueResult};
 pub use error::{Directive, Error, HandlerFailure, JobResult, Result};
