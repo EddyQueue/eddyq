@@ -5,6 +5,7 @@ use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use crate::{
     error::Result,
     job::{Job, JobId},
+    retention::RetentionRule,
 };
 
 #[derive(Default)]
@@ -17,6 +18,12 @@ pub struct EnqueueOptions {
     pub tags: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
     pub queue: Option<String>,
+    /// BullMQ-style `removeOnComplete`. Forwarded to `DynEnqueue` and
+    /// honored inline by the Redis backend on `complete`. Postgres ignores
+    /// per-job rules (its cleanup tick handles age-based retention).
+    pub remove_on_complete: Option<RetentionRule>,
+    /// BullMQ-style `removeOnFail`. Same semantics on `fail`.
+    pub remove_on_fail: Option<RetentionRule>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +282,15 @@ pub struct DynEnqueue {
     pub tags: Vec<String>,
     pub metadata: serde_json::Value,
     pub batch_id: Option<i64>,
+    /// BullMQ-style `removeOnComplete`. Honored by the Redis backend inline
+    /// on `complete`; Postgres ignores per-job rules and relies on the
+    /// queue-default `cleanup` tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_on_complete: Option<RetentionRule>,
+    /// BullMQ-style `removeOnFail`. Same semantics as `remove_on_complete`
+    /// but applied to the `failed` ZSET on terminal failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_on_fail: Option<RetentionRule>,
 }
 
 impl DynEnqueue {
@@ -293,6 +309,8 @@ impl DynEnqueue {
             tags: Vec::new(),
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             batch_id: None,
+            remove_on_complete: None,
+            remove_on_fail: None,
         }
     }
 }

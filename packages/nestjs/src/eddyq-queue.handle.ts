@@ -77,6 +77,18 @@ export class QueueHandleImpl implements QueueHandle {
     );
   }
 
+  clean(
+    graceMs: number,
+    limit: number,
+    state: "completed" | "failed" | "cancelled",
+  ): Promise<number> {
+    if (isAppHandle(this.eddyq)) {
+      const provider = this.eddyq.providerFor(this.name);
+      return this.eddyq.clean(graceMs, limit, state, provider);
+    }
+    return this.eddyq.clean(graceMs, limit, state);
+  }
+
   enqueueBatch(input: QueueEnqueueBatchInput): Promise<BatchEnqueueOutcome> {
     if (!hasBatch(this.eddyq)) {
       // `enqueue_batch` is a Postgres-only primitive (the `eddyq_batches`

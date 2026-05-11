@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
-    backend::{Backend, PgBackend},
+    backend::{Backend, CleanState, PgBackend},
     enqueue::{EnqueueOptions, EnqueueResult},
     error::{Error, Result},
     job::Job,
@@ -389,6 +389,32 @@ impl<B: Backend> Queue<B> {
             .await
     }
 
+    /// Register or update an interval-driven schedule (BullMQ `{ every: ms }`).
+    /// Fires every `interval_ms` from the moment the previous fire landed.
+    /// Skip-missed semantics match `add_schedule`: a delayed leader doesn't
+    /// catch up.
+    pub async fn add_interval_schedule<J: Job>(
+        &self,
+        name: &str,
+        interval: Duration,
+        job: &J,
+    ) -> Result<()> {
+        let payload = serde_json::to_value(job)?;
+        let interval_ms = i64::try_from(interval.as_millis())
+            .map_err(|_| Error::InvalidArgument("interval too large".into()))?;
+        self.backend
+            .upsert_interval_schedule_raw(
+                name,
+                interval_ms,
+                J::KIND,
+                payload,
+                job.priority(),
+                job.max_attempts(),
+                job.queue(),
+            )
+            .await
+    }
+
     pub async fn remove_schedule(&self, name: &str) -> Result<bool> {
         self.backend.remove_schedule(name).await
     }
@@ -512,6 +538,14 @@ impl<B: Backend> Queue<B> {
         self.backend.queue_set_timeout(name, timeout).await
     }
 
+    /// Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+    /// finalized jobs in `state` that are older than `grace`. Useful for
+    /// one-shot pruning from admin tools or scripts; routine retention
+    /// should go through the configured cleanup tick instead.
+    pub async fn clean(&self, grace: Duration, limit: u32, state: CleanState) -> Result<u64> {
+        self.backend.clean(grace, limit, state).await
+    }
+
     pub fn start(&self) -> Result<()> {
         let mut state = self.state.lock().expect("queue state lock poisoned");
         if matches!(*state, QueueState::Running { .. }) {
@@ -626,6 +660,8 @@ fn build_dyn_enqueue<J: Job>(job: &J, opts: EnqueueOptions) -> Result<crate::enq
         .or_else(|| job.metadata())
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
     req.queue = opts.queue.unwrap_or_else(|| job.queue().to_owned());
+    req.remove_on_complete = opts.remove_on_complete;
+    req.remove_on_fail = opts.remove_on_fail;
     Ok(req)
 }
 

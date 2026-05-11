@@ -508,6 +508,37 @@ pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u
     Ok((completed, failed, cancelled, batches))
 }
 
+/// Ad-hoc retention sweep. Deletes up to `limit` finalized jobs in the
+/// given state older than `grace_secs`. The CTE caps the DELETE to `limit`
+/// rows by selecting IDs first — `DELETE ... LIMIT` isn't valid Postgres.
+/// Returns the count actually deleted.
+pub async fn clean_jobs(pool: &PgPool, state: &str, grace_secs: u64, limit: u32) -> Result<u64> {
+    if limit == 0 {
+        return Ok(0);
+    }
+    let grace_secs = i64::try_from(grace_secs).unwrap_or(i64::MAX);
+    let limit = i64::from(limit);
+    let res = sqlx::query(
+        r#"
+        WITH victims AS (
+            SELECT id FROM eddyq_jobs
+             WHERE state = $1
+               AND finalized_at IS NOT NULL
+               AND finalized_at < NOW() - make_interval(secs => $2)
+             ORDER BY finalized_at ASC
+             LIMIT $3
+        )
+        DELETE FROM eddyq_jobs WHERE id IN (SELECT id FROM victims)
+        "#,
+    )
+    .bind(state)
+    .bind(grace_secs)
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 pub async fn mark_completed(
     pool: &PgPool,
     id: JobId,

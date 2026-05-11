@@ -1521,6 +1521,64 @@ local function fn_list_jobs(keys, args)
 end
 
 -- ====================================================================
+-- eddyq_cleanup
+--
+-- Queue-default retention sweep for the three finalized ZSETs (completed,
+-- failed, cancelled). Per-job retention runs inline in `apply_retention`
+-- on complete/fail; this is the fallback for jobs whose owner didn't set
+-- a per-job rule, plus the `false` opt-out path.
+--
+-- For each state with a non-zero age (seconds), select up to `batch_limit`
+-- of the oldest job IDs (score < cutoff) and tear them down via
+-- `delete_job`, then ZREM them from the finalized index.
+--
+-- ARGV: now_ms, completed_age_secs, failed_age_secs, cancelled_age_secs, batch_limit
+--   age < 0  => skip that state entirely (sentinel for "no rule configured").
+--   age >= 0 => sweep entries finalized more than `age` seconds ago.
+--               `age = 0` means "sweep everything older than now" — used by
+--               `clean(grace=0, ...)` for an immediate ad-hoc prune.
+--   batch_limit caps total work per call so the event loop isn't starved
+--   on a backlog. Default 500 if 0/missing.
+-- Returns: { n_completed_deleted, n_failed_deleted, n_cancelled_deleted, 0 }
+--   The 4th slot is reserved for Redis batch retention (not yet implemented;
+--   batches don't have a dedicated finalized ZSET on Redis today).
+-- ====================================================================
+local function fn_cleanup(keys, args)
+  local prefix      = keys[1]
+  local now_ms      = tonumber(args[1])
+  -- Default to -1 (skip) when missing — never 0, which means "sweep now".
+  local age_c       = tonumber(args[2]) or -1
+  local age_f       = tonumber(args[3]) or -1
+  local age_x       = tonumber(args[4]) or -1
+  local batch_limit = tonumber(args[5]) or 0
+  if batch_limit <= 0 then batch_limit = 500 end
+
+  -- Per-state sweep: select oldest IDs under the cutoff, tear down each
+  -- job (HASH + indexes + unique-key + error log), then ZREM from the
+  -- finalized ZSET so the index stays in sync. Order: completed, failed,
+  -- cancelled — matching the Retention struct slot order in Rust.
+  local function sweep(zsetkey, age_secs)
+    if age_secs < 0 then return 0 end
+    local cutoff = now_ms - (age_secs * 1000)
+    local ids = redis.call('ZRANGEBYSCORE', zsetkey,
+                           '-inf', '(' .. cutoff,
+                           'LIMIT', 0, batch_limit)
+    if #ids == 0 then return 0 end
+    for _, id in ipairs(ids) do
+      delete_job(prefix, id)
+      redis.call('ZREM', zsetkey, id)
+    end
+    return #ids
+  end
+
+  local n_c = sweep(completedkey(prefix), age_c)
+  local n_f = sweep(failedkey(prefix),    age_f)
+  local n_x = sweep(cancelledkey(prefix), age_x)
+
+  return { tostring(n_c), tostring(n_f), tostring(n_x), '0' }
+end
+
+-- ====================================================================
 -- registration
 -- ====================================================================
 redis.register_function('eddyq_enqueue',          fn_enqueue)
@@ -1558,3 +1616,4 @@ redis.register_function('eddyq_list_jobs',             fn_list_jobs)
 redis.register_function('eddyq_group_set_rule',        fn_group_set_rule)
 redis.register_function('eddyq_group_remove_rule',     fn_group_remove_rule)
 redis.register_function('eddyq_group_list_rules',      fn_group_list_rules)
+redis.register_function('eddyq_cleanup',               fn_cleanup)

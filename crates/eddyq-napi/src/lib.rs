@@ -11,8 +11,9 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use eddyq_client::{
-    Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DynEnqueue, HandlerFailure,
-    JobContext, JobResult, JobState, ScheduleDeclaration as CoreScheduleDeclaration, ShutdownMode,
+    CleanState, Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DynEnqueue,
+    HandlerFailure, JobContext, JobResult, JobState, RetentionRule,
+    ScheduleDeclaration as CoreScheduleDeclaration, ShutdownMode,
 };
 use eddyq_core::backend::Backend;
 use eddyq_redis::{RedisBackend, RedisConfig};
@@ -129,6 +130,14 @@ pub struct EnqueueOptions {
     pub tags: Option<Vec<String>>,
     /// Arbitrary JSON metadata attached to the job (not passed to the handler).
     pub metadata: Option<serde_json::Value>,
+    /// BullMQ-style `removeOnComplete`: `true` (drop on finalize) | `false`
+    /// (keep forever) | `number` (keep last N) | `{ age?: seconds; count?: N }`.
+    /// Redis-only — Postgres ignores per-job rules and uses its cleanup tick.
+    #[napi(ts_type = "boolean | number | { age?: number; count?: number }")]
+    pub remove_on_complete: Option<serde_json::Value>,
+    /// BullMQ-style `removeOnFail`. Same shape as `removeOnComplete`.
+    #[napi(ts_type = "boolean | number | { age?: number; count?: number }")]
+    pub remove_on_fail: Option<serde_json::Value>,
 }
 
 /// Result of a single enqueue.
@@ -160,6 +169,12 @@ pub struct EnqueueManyItem {
     /// Admin-visible tags (stored on the job row, queryable via `listJobs`).
     pub tags: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
+    /// See `EnqueueOptions.removeOnComplete`.
+    #[napi(ts_type = "boolean | number | { age?: number; count?: number }")]
+    pub remove_on_complete: Option<serde_json::Value>,
+    /// See `EnqueueOptions.removeOnFail`.
+    #[napi(ts_type = "boolean | number | { age?: number; count?: number }")]
+    pub remove_on_fail: Option<serde_json::Value>,
 }
 
 /// Aggregate result of `enqueueMany`. Per-job ids are not returned — use
@@ -379,13 +394,18 @@ pub struct Group {
     pub updated_at: String,
 }
 
-/// A cron schedule registered via `addSchedule`.
+/// A schedule registered via `addSchedule` (cron) or `addIntervalSchedule`
+/// (`{ every: ms }`). Exactly one of `cronExpr` and `intervalMs` is set;
+/// the DB CHECK on Postgres and the stored entry on Redis both enforce this.
 #[napi(object)]
 pub struct Schedule {
     pub name: String,
     pub kind: String,
     pub payload: serde_json::Value,
-    pub cron_expr: String,
+    /// Cron expression. `null` when the row is interval-driven.
+    pub cron_expr: Option<String>,
+    /// Fixed-interval cadence in milliseconds. `null` when cron-driven.
+    pub interval_ms: Option<i64>,
     pub next_run_at: String,
     pub last_run_at: Option<String>,
     pub enabled: bool,
@@ -597,6 +617,27 @@ impl Queue {
         run(move || do_cancel(client, id)).await
     }
 
+    /// Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+    /// finalized jobs in `state` older than `graceMs` milliseconds. `state` is
+    /// one of `"completed" | "failed" | "cancelled"`. Returns the number of
+    /// rows actually deleted.
+    #[napi(
+        ts_args_type = "graceMs: number, limit: number, state: \"completed\" | \"failed\" | \"cancelled\""
+    )]
+    pub async fn clean(&self, grace_ms: i64, limit: u32, state: String) -> Result<u32> {
+        let client = self.client.clone();
+        let st = parse_clean_state(&state)?;
+        let grace = Duration::from_millis(u64::try_from(grace_ms.max(0)).unwrap_or(0));
+        run(move || async move {
+            client
+                .clean(grace, limit, st)
+                .await
+                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                .map_err(err)
+        })
+        .await
+    }
+
     // --- Group admin ------------------------------------------------------
 
     /// Cap concurrent running jobs in `group_key`. Jobs with
@@ -764,6 +805,42 @@ impl Queue {
                 .add_schedule(
                     &name,
                     &cron_expr,
+                    &kind,
+                    payload,
+                    priority,
+                    max_attempts,
+                    &queue,
+                )
+                .await
+                .map_err(err)
+        })
+        .await
+    }
+
+    /// Register a fixed-interval schedule (BullMQ `{ every: ms }`). Fires
+    /// every `intervalMs` milliseconds — no cron expression required.
+    /// Skip-missed semantics: a delayed fire doesn't catch up, matching
+    /// the cron path and the Redis backend.
+    #[napi]
+    pub async fn add_interval_schedule(
+        &self,
+        name: String,
+        interval_ms: i64,
+        kind: String,
+        payload: serde_json::Value,
+        options: Option<ScheduleOptions>,
+    ) -> Result<()> {
+        let client = self.client.clone();
+        let priority = options.as_ref().and_then(|o| o.priority).unwrap_or(0);
+        let max_attempts = options.as_ref().and_then(|o| o.max_attempts).unwrap_or(3);
+        let queue = options
+            .and_then(|o| o.queue)
+            .unwrap_or_else(|| eddyq_client::DEFAULT_QUEUE.to_string());
+        run(move || async move {
+            client
+                .add_interval_schedule(
+                    &name,
+                    interval_ms,
                     &kind,
                     payload,
                     priority,
@@ -1376,6 +1453,12 @@ async fn do_enqueue(
         if let Some(m) = opts.metadata {
             req.metadata = m;
         }
+        if let Some(v) = opts.remove_on_complete {
+            req.remove_on_complete = Some(normalize_retention("removeOnComplete", v)?);
+        }
+        if let Some(v) = opts.remove_on_fail {
+            req.remove_on_fail = Some(normalize_retention("removeOnFail", v)?);
+        }
     }
     let result = client.enqueue(req).await.map_err(err)?;
     Ok(match result {
@@ -1441,6 +1524,12 @@ async fn do_enqueue_many(
         if let Some(m) = item.metadata {
             req.metadata = m;
         }
+        if let Some(v) = item.remove_on_complete {
+            req.remove_on_complete = Some(normalize_retention("removeOnComplete", v)?);
+        }
+        if let Some(v) = item.remove_on_fail {
+            req.remove_on_fail = Some(normalize_retention("removeOnFail", v)?);
+        }
         reqs.push(req);
     }
     let result = client.enqueue_many(reqs).await.map_err(err)?;
@@ -1487,6 +1576,12 @@ fn item_to_dyn(item: EnqueueManyItem) -> Result<eddyq_client::DynEnqueue> {
     }
     if let Some(m) = item.metadata {
         req.metadata = m;
+    }
+    if let Some(v) = item.remove_on_complete {
+        req.remove_on_complete = Some(normalize_retention("removeOnComplete", v)?);
+    }
+    if let Some(v) = item.remove_on_fail {
+        req.remove_on_fail = Some(normalize_retention("removeOnFail", v)?);
     }
     Ok(req)
 }
@@ -1652,6 +1747,7 @@ async fn do_list_schedules(client: Client) -> Result<Vec<Schedule>> {
             kind: s.kind,
             payload: s.payload,
             cron_expr: s.cron_expr,
+            interval_ms: s.interval_ms,
             next_run_at: s.next_run_at.to_rfc3339(),
             last_run_at: s.last_run_at.map(|t| t.to_rfc3339()),
             enabled: s.enabled,
@@ -1857,6 +1953,20 @@ impl RedisQueue {
         self.backend.cancel(id).await.map_err(rerr)
     }
 
+    /// Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+    /// finalized jobs in `state` older than `graceMs` milliseconds. `state` is
+    /// one of `"completed" | "failed" | "cancelled"`. Per-call cap bounds
+    /// the Lua function's event-loop hold; call repeatedly to drain a backlog.
+    #[napi(
+        ts_args_type = "graceMs: number, limit: number, state: \"completed\" | \"failed\" | \"cancelled\""
+    )]
+    pub async fn clean(&self, grace_ms: i64, limit: u32, state: String) -> Result<u32> {
+        let st = parse_clean_state(&state)?;
+        let grace = Duration::from_millis(u64::try_from(grace_ms.max(0)).unwrap_or(0));
+        let n = self.backend.clean(grace, limit, st).await.map_err(rerr)?;
+        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+    }
+
     // --- Worker registration --------------------------------------------
 
     /// Register a JS handler for `kind`. Must be called before `start()`.
@@ -1973,6 +2083,18 @@ impl RedisQueue {
             }
             if let Some(ms) = o.cleanup_interval_ms {
                 builder = builder.cleanup_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(secs) = o.completed_retention_secs {
+                builder = builder.completed_retention(retention_from_secs(secs));
+            }
+            if let Some(secs) = o.failed_retention_secs {
+                builder = builder.failed_retention(retention_from_secs(secs));
+            }
+            if let Some(secs) = o.cancelled_retention_secs {
+                builder = builder.cancelled_retention(retention_from_secs(secs));
+            }
+            if let Some(secs) = o.batch_retention_secs {
+                builder = builder.batch_retention(retention_from_secs(secs));
             }
             if let Some(secs) = o.leader_lease_secs {
                 builder = builder.leader_lease_secs(u64::from(secs));
@@ -2330,6 +2452,12 @@ fn build_dyn_enqueue_from_opts(
         if let Some(m) = opts.metadata {
             req.metadata = m;
         }
+        if let Some(v) = opts.remove_on_complete {
+            req.remove_on_complete = Some(normalize_retention("removeOnComplete", v)?);
+        }
+        if let Some(v) = opts.remove_on_fail {
+            req.remove_on_fail = Some(normalize_retention("removeOnFail", v)?);
+        }
     }
     Ok(req)
 }
@@ -2368,7 +2496,57 @@ fn build_dyn_enqueue_from_many_item(it: EnqueueManyItem) -> Result<DynEnqueue> {
     if let Some(m) = it.metadata {
         req.metadata = m;
     }
+    if let Some(v) = it.remove_on_complete {
+        req.remove_on_complete = Some(normalize_retention("removeOnComplete", v)?);
+    }
+    if let Some(v) = it.remove_on_fail {
+        req.remove_on_fail = Some(normalize_retention("removeOnFail", v)?);
+    }
     Ok(req)
+}
+
+/// Normalize a JS-side retention value into the canonical `RetentionRule`.
+/// Accepts BullMQ's three shorthands:
+///   bool   → drop / keep
+///   number → `{ count: N }` (BullMQ "keep last N" shorthand)
+///   object → `{ age?, count? }` deserialized directly
+fn normalize_retention(field: &str, v: serde_json::Value) -> Result<RetentionRule> {
+    match v {
+        serde_json::Value::Bool(b) => Ok(RetentionRule::Bool(b)),
+        serde_json::Value::Number(n) => {
+            let n = n.as_u64().ok_or_else(|| {
+                napi::Error::from_reason(format!("{field}: must be a non-negative integer"))
+            })?;
+            let count = u32::try_from(n).map_err(|_| {
+                napi::Error::from_reason(format!("{field}: count {n} exceeds u32::MAX"))
+            })?;
+            Ok(RetentionRule::Rule {
+                age: None,
+                count: Some(count),
+            })
+        }
+        v @ serde_json::Value::Object(_) => {
+            serde_json::from_value::<RetentionRule>(v).map_err(|e| {
+                napi::Error::from_reason(format!(
+                    "{field}: expected {{ age?: number; count?: number }} ({e})"
+                ))
+            })
+        }
+        _ => Err(napi::Error::from_reason(format!(
+            "{field}: expected boolean | number | object"
+        ))),
+    }
+}
+
+fn parse_clean_state(s: &str) -> Result<CleanState> {
+    match s {
+        "completed" => Ok(CleanState::Completed),
+        "failed" => Ok(CleanState::Failed),
+        "cancelled" => Ok(CleanState::Cancelled),
+        other => Err(napi::Error::from_reason(format!(
+            "clean: invalid state {other:?} (completed | failed | cancelled)"
+        ))),
+    }
 }
 
 fn parse_shutdown_mode(s: &str) -> Result<ShutdownMode> {
@@ -2750,6 +2928,36 @@ impl EddyqApp {
         })
     }
 
+    /// Ad-hoc retention sweep (BullMQ `queue.clean()`). The caller specifies
+    /// which provider to clean — retention is a backend-local notion.
+    #[napi(
+        ts_args_type = "graceMs: number, limit: number, state: \"completed\" | \"failed\" | \"cancelled\", provider: string"
+    )]
+    pub async fn clean(
+        &self,
+        grace_ms: i64,
+        limit: u32,
+        state: String,
+        provider: String,
+    ) -> Result<u32> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => {
+                self.pg
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::from_reason("postgres backend not configured"))?
+                    .clean(grace_ms, limit, state)
+                    .await
+            }
+            BackendKind::Redis => {
+                self.redis
+                    .as_ref()
+                    .ok_or_else(|| napi::Error::from_reason("redis backend not configured"))?
+                    .clean(grace_ms, limit, state)
+                    .await
+            }
+        }
+    }
+
     /// Cancel a pending job. The caller must specify which provider owns the
     /// id — job ids are not globally unique across backends.
     #[napi]
@@ -2969,11 +3177,13 @@ impl EddyqApp {
         }
     }
 
-    /// Interval-style schedule — Redis only (matches the underlying class).
+    /// Interval-style schedule. Supported on both Postgres and Redis since
+    /// the schedule_intervals migration landed.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn add_interval_schedule(
         &self,
+        provider: String,
         name: String,
         interval_ms: i64,
         kind: String,
@@ -2982,17 +3192,31 @@ impl EddyqApp {
         max_attempts: Option<i32>,
         queue: Option<String>,
     ) -> Result<()> {
-        self.redis_ref()?
-            .add_interval_schedule(
-                name,
-                interval_ms,
-                kind,
-                payload,
-                priority,
-                max_attempts,
-                queue,
-            )
-            .await
+        match parse_provider(&provider)? {
+            BackendKind::Pg => {
+                let opts = ScheduleOptions {
+                    priority: priority.map(|p| i16::try_from(p).unwrap_or(0)),
+                    max_attempts,
+                    queue,
+                };
+                self.pg_ref()?
+                    .add_interval_schedule(name, interval_ms, kind, payload, Some(opts))
+                    .await
+            }
+            BackendKind::Redis => {
+                self.redis_ref()?
+                    .add_interval_schedule(
+                        name,
+                        interval_ms,
+                        kind,
+                        payload,
+                        priority,
+                        max_attempts,
+                        queue,
+                    )
+                    .await
+            }
+        }
     }
 
     #[napi]
@@ -3169,6 +3393,7 @@ fn schedule_to_napi(s: eddyq_core::schedule::Schedule) -> Schedule {
         kind: s.kind,
         payload: s.payload,
         cron_expr: s.cron_expr,
+        interval_ms: s.interval_ms,
         next_run_at: s.next_run_at.to_rfc3339(),
         last_run_at: s.last_run_at.map(|t| t.to_rfc3339()),
         enabled: s.enabled,

@@ -471,7 +471,7 @@ async fn schedule_upsert_and_remove(pool: PgPool) {
 
     let schedules = queue.list_schedules().await.unwrap();
     assert_eq!(schedules.len(), 1);
-    assert_eq!(schedules[0].cron_expr, "0 0 12 * * * *");
+    assert_eq!(schedules[0].cron_expr.as_deref(), Some("0 0 12 * * * *"));
 
     let removed = queue.remove_schedule("daily").await.unwrap();
     assert!(removed);
@@ -3452,4 +3452,178 @@ async fn sweeper_recovers_stale_running_direct(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(state, "pending", "recovered job should go back to pending");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn interval_schedule_fires_repeatedly(pool: PgPool) {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(CountWorker {
+            counter: counter.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    // 200ms interval — should fire >=2x in 700ms even with leader-loop jitter.
+    queue
+        .add_interval_schedule("tick", Duration::from_millis(200), &Count { n: 0 })
+        .await
+        .unwrap();
+
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while counter.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("200ms interval should fire at least 2x within 3s");
+    queue.shutdown().await.unwrap();
+
+    let schedules = eddyq_core::schedule::list_schedules(&pool).await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert!(schedules[0].last_run_at.is_some());
+    assert!(
+        schedules[0].cron_expr.is_none(),
+        "interval row has no cron_expr"
+    );
+    assert_eq!(schedules[0].interval_ms, Some(200));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn schedule_check_rejects_both_or_neither_trigger(pool: PgPool) {
+    // Direct INSERTs that bypass the Rust validators — the DB CHECK must
+    // refuse both "both set" and "neither set" rows. Defends against a
+    // future Rust regression that forgets to NULL one column.
+    let both_set = sqlx::query(
+        r#"
+        INSERT INTO eddyq_schedules
+            (name, kind, payload, cron_expr, interval_ms, next_run_at)
+        VALUES ('both', 'x', '{}'::jsonb, '* * * * * * *', 1000, NOW())
+        "#,
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        both_set.is_err(),
+        "CHECK must reject row with cron_expr AND interval_ms"
+    );
+
+    let neither = sqlx::query(
+        r#"
+        INSERT INTO eddyq_schedules
+            (name, kind, payload, cron_expr, interval_ms, next_run_at)
+        VALUES ('neither', 'x', '{}'::jsonb, NULL, NULL, NOW())
+        "#,
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        neither.is_err(),
+        "CHECK must reject row with neither cron_expr nor interval_ms"
+    );
+
+    // Sanity: a valid cron-only row succeeds, a valid interval-only row succeeds.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_schedules
+            (name, kind, payload, cron_expr, interval_ms, next_run_at)
+        VALUES ('ok_cron', 'x', '{}'::jsonb, '* * * * * * *', NULL, NOW())
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_schedules
+            (name, kind, payload, cron_expr, interval_ms, next_run_at)
+        VALUES ('ok_interval', 'x', '{}'::jsonb, NULL, 500, NOW())
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn interval_upsert_flips_cron_row_to_interval(pool: PgPool) {
+    // Upserting an interval onto a name that previously held a cron schedule
+    // must clear cron_expr (else the CHECK fails). Defends against an
+    // ON CONFLICT clause that forgets to NULL the other trigger column.
+    let queue = Queue::builder(pool.clone()).build();
+
+    queue
+        .add_schedule("flippable", "0 0 0 * * * *", &Count { n: 0 })
+        .await
+        .unwrap();
+
+    queue
+        .add_interval_schedule("flippable", Duration::from_secs(60), &Count { n: 0 })
+        .await
+        .unwrap();
+
+    let schedules = eddyq_core::schedule::list_schedules(&pool).await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert!(schedules[0].cron_expr.is_none());
+    assert_eq!(schedules[0].interval_ms, Some(60_000));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn clean_jobs_caps_deletions_per_call(pool: PgPool) {
+    use eddyq_core::fetch::clean_jobs;
+
+    // 10 completed jobs older than the grace; clean(grace=1h, limit=5) twice
+    // should drain them in two batches of 5.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        SELECT 'old_ok', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 hours'
+        FROM generate_series(1, 10)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let n1 = clean_jobs(&pool, "completed", 3600, 5).await.unwrap();
+    assert_eq!(n1, 5, "first call deletes up to limit=5");
+
+    let n2 = clean_jobs(&pool, "completed", 3600, 5).await.unwrap();
+    assert_eq!(n2, 5, "second call drains the rest");
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn clean_jobs_respects_grace_and_state(pool: PgPool) {
+    use eddyq_core::fetch::clean_jobs;
+
+    // Mixed ages and states; clean(completed, 1h, 100) must only touch
+    // completed jobs older than 1 hour.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('old_ok',  '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 hours'),
+            ('new_ok',  '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '30 seconds'),
+            ('old_fail','{}'::jsonb, 'failed',    3, 3, NOW() - INTERVAL '2 hours')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let n = clean_jobs(&pool, "completed", 3600, 100).await.unwrap();
+    assert_eq!(n, 1, "only the old completed row should be deleted");
+
+    let remaining: Vec<String> = sqlx::query_scalar("SELECT kind FROM eddyq_jobs ORDER BY kind")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, vec!["new_ok", "old_fail"]);
 }

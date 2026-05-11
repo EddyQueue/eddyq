@@ -19,7 +19,13 @@ pub struct Schedule {
     pub name: String,
     pub kind: String,
     pub payload: serde_json::Value,
-    pub cron_expr: String,
+    /// Cron expression. `None` when the row is interval-driven; the DB
+    /// CHECK guarantees exactly one of `cron_expr` / `interval_ms` is set.
+    pub cron_expr: Option<String>,
+    /// Fixed-interval cadence in milliseconds. `None` for cron-driven rows.
+    /// On each fire, `next_run_at` advances to `now + interval_ms` — same
+    /// skip-missed semantics as cron.
+    pub interval_ms: Option<i64>,
     pub next_run_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub enabled: bool,
@@ -82,17 +88,21 @@ pub async fn upsert_schedule_raw(
 
     // Preserve `next_run_at` when the cron expression is unchanged so that
     // re-calling upsert (e.g. on redeploy) doesn't reset an imminent tick.
+    // Sets interval_ms = NULL so the CHECK passes on cron-driven rows; on
+    // conflict, also resets interval_ms in case the row was previously
+    // interval-driven (cron and interval are mutually exclusive triggers).
     sqlx::query(
         r#"
         INSERT INTO eddyq_schedules
-            (name, kind, payload, cron_expr, next_run_at, priority, max_attempts, queue)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (name, kind, payload, cron_expr, interval_ms, next_run_at, priority, max_attempts, queue)
+        VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8)
         ON CONFLICT (name) DO UPDATE
             SET kind         = EXCLUDED.kind,
                 payload      = EXCLUDED.payload,
                 cron_expr    = EXCLUDED.cron_expr,
+                interval_ms  = NULL,
                 next_run_at  = CASE
-                                  WHEN eddyq_schedules.cron_expr = EXCLUDED.cron_expr
+                                  WHEN eddyq_schedules.cron_expr IS NOT DISTINCT FROM EXCLUDED.cron_expr
                                   THEN eddyq_schedules.next_run_at
                                   ELSE EXCLUDED.next_run_at
                                END,
@@ -106,6 +116,68 @@ pub async fn upsert_schedule_raw(
     .bind(kind)
     .bind(payload)
     .bind(cron_expr)
+    .bind(next)
+    .bind(priority)
+    .bind(max_attempts)
+    .bind(queue)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Upsert an interval-driven schedule. Fires every `interval_ms` (matches
+/// BullMQ's `upsertJobScheduler(id, { every })` and the Redis backend's
+/// existing inherent method). `interval_ms` must be positive. Skip-missed
+/// semantics: a delayed fire doesn't catch up — the next `next_run_at` is
+/// always `now + interval_ms` from the firing tick.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_interval_schedule_raw(
+    pool: &PgPool,
+    name: &str,
+    interval_ms: i64,
+    kind: &str,
+    payload: serde_json::Value,
+    priority: i16,
+    max_attempts: i32,
+    queue: &str,
+) -> Result<()> {
+    validate_queue_name(queue)?;
+    if interval_ms <= 0 {
+        return Err(crate::error::Error::InvalidArgument(
+            "interval_ms must be > 0".into(),
+        ));
+    }
+    let next = Utc::now() + chrono::Duration::milliseconds(interval_ms);
+
+    // Preserve `next_run_at` when the interval is unchanged so re-upsert on
+    // redeploy doesn't reset an imminent tick. Sets cron_expr = NULL so the
+    // CHECK constraint passes and a row previously cron-driven flips cleanly.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_schedules
+            (name, kind, payload, cron_expr, interval_ms, next_run_at, priority, max_attempts, queue)
+        VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8)
+        ON CONFLICT (name) DO UPDATE
+            SET kind         = EXCLUDED.kind,
+                payload      = EXCLUDED.payload,
+                cron_expr    = NULL,
+                interval_ms  = EXCLUDED.interval_ms,
+                next_run_at  = CASE
+                                  WHEN eddyq_schedules.interval_ms IS NOT DISTINCT FROM EXCLUDED.interval_ms
+                                  THEN eddyq_schedules.next_run_at
+                                  ELSE EXCLUDED.next_run_at
+                               END,
+                priority     = EXCLUDED.priority,
+                max_attempts = EXCLUDED.max_attempts,
+                queue        = EXCLUDED.queue,
+                updated_at   = NOW()
+        "#,
+    )
+    .bind(name)
+    .bind(kind)
+    .bind(payload)
+    .bind(interval_ms)
     .bind(next)
     .bind(priority)
     .bind(max_attempts)
@@ -171,14 +243,15 @@ pub async fn sync_schedules(pool: &PgPool, declared: &[ScheduleDeclaration]) -> 
         sqlx::query(
             r#"
             INSERT INTO eddyq_schedules
-                (name, kind, payload, cron_expr, next_run_at, priority, max_attempts, queue)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (name, kind, payload, cron_expr, interval_ms, next_run_at, priority, max_attempts, queue)
+            VALUES ($1, $2, $3, $4, NULL, $5, $6, $7, $8)
             ON CONFLICT (name) DO UPDATE
                 SET kind         = EXCLUDED.kind,
                     payload      = EXCLUDED.payload,
                     cron_expr    = EXCLUDED.cron_expr,
+                    interval_ms  = NULL,
                     next_run_at  = CASE
-                                      WHEN eddyq_schedules.cron_expr = EXCLUDED.cron_expr
+                                      WHEN eddyq_schedules.cron_expr IS NOT DISTINCT FROM EXCLUDED.cron_expr
                                       THEN eddyq_schedules.next_run_at
                                       ELSE EXCLUDED.next_run_at
                                    END,
@@ -235,7 +308,7 @@ pub async fn set_enabled(pool: &PgPool, name: &str, enabled: bool) -> Result<boo
 
 pub async fn list_schedules(pool: &PgPool) -> Result<Vec<Schedule>> {
     let rows = sqlx::query_as::<_, Schedule>(
-        "SELECT name, kind, payload, cron_expr, next_run_at, last_run_at, enabled, priority, max_attempts, queue
+        "SELECT name, kind, payload, cron_expr, interval_ms, next_run_at, last_run_at, enabled, priority, max_attempts, queue
          FROM eddyq_schedules
          ORDER BY name",
     )
@@ -260,7 +333,7 @@ pub(crate) async fn tick(pool: &PgPool) -> Result<usize> {
     }
 
     let due: Vec<Schedule> = sqlx::query_as::<_, Schedule>(
-        "SELECT name, kind, payload, cron_expr, next_run_at, last_run_at, enabled, priority, max_attempts, queue
+        "SELECT name, kind, payload, cron_expr, interval_ms, next_run_at, last_run_at, enabled, priority, max_attempts, queue
          FROM eddyq_schedules
          WHERE enabled AND next_run_at <= NOW()
          FOR UPDATE",
@@ -287,12 +360,24 @@ pub(crate) async fn tick(pool: &PgPool) -> Result<usize> {
         enqueued += 1;
         notify = true;
 
-        let schedule = CronSchedule::from_str(&s.cron_expr)
-            .map_err(|e| crate::error::Error::Cron(e.to_string()))?;
-        let next = schedule
-            .upcoming(Utc)
-            .next()
-            .ok_or_else(|| crate::error::Error::Cron("cron never fires".into()))?;
+        // Compute next_run_at from whichever trigger this row carries. The
+        // DB CHECK enforces exactly-one, so the `else` branch shouldn't be
+        // reachable for valid rows — treat it as a data integrity error.
+        let next = if let Some(ms) = s.interval_ms {
+            Utc::now() + chrono::Duration::milliseconds(ms)
+        } else if let Some(expr) = &s.cron_expr {
+            let schedule = CronSchedule::from_str(expr)
+                .map_err(|e| crate::error::Error::Cron(e.to_string()))?;
+            schedule
+                .upcoming(Utc)
+                .next()
+                .ok_or_else(|| crate::error::Error::Cron("cron never fires".into()))?
+        } else {
+            return Err(crate::error::Error::Cron(format!(
+                "schedule {:?} has neither cron_expr nor interval_ms (CHECK violated)",
+                s.name
+            )));
+        };
 
         sqlx::query(
             "UPDATE eddyq_schedules
