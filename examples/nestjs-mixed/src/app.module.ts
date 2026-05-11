@@ -1,6 +1,7 @@
 import { Module } from "@nestjs/common";
 
 import { EddyqModule } from "@eddyq/nestjs";
+import { EddyqWakeboardModule } from "@eddyq/wakeboard";
 
 import { PaymentsModule } from "./payments/payments.module.js";
 import { WebhooksModule } from "./webhooks/webhooks.module.js";
@@ -33,6 +34,10 @@ import { WebhooksModule } from "./webhooks/webhooks.module.js";
       // Local-dev convenience: apply PG migrations on boot. In production
       // run them as a deploy step (the Redis side has no migrations).
       runMigrations: process.env.EDDYQ_RUN_MIGRATIONS === "true",
+    }),
+    EddyqWakeboardModule.forRoot({
+      mountPath: "/wakeboard",
+      auth: { password: process.env.WAKEBOARD_PASSWORD ?? "admin" },
     }),
     WebhooksModule,
     PaymentsModule,

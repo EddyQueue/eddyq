@@ -1528,17 +1528,21 @@ end
 -- on complete/fail; this is the fallback for jobs whose owner didn't set
 -- a per-job rule, plus the `false` opt-out path.
 --
--- For each state with a non-zero age (seconds), select up to `batch_limit`
--- of the oldest job IDs (score < cutoff) and tear them down via
--- `delete_job`, then ZREM them from the finalized index.
+-- For each state, a row is reaped if it exceeds *either* the age window
+-- *or* the count cap (OR semantics, BullMQ-style). Up to `batch_limit`
+-- victims per state per call so a backlog can't block the event loop.
 --
--- ARGV: now_ms, completed_age_secs, failed_age_secs, cancelled_age_secs, batch_limit
---   age < 0  => skip that state entirely (sentinel for "no rule configured").
---   age >= 0 => sweep entries finalized more than `age` seconds ago.
---               `age = 0` means "sweep everything older than now" — used by
---               `clean(grace=0, ...)` for an immediate ad-hoc prune.
---   batch_limit caps total work per call so the event loop isn't starved
---   on a backlog. Default 500 if 0/missing.
+-- ARGV: now_ms,
+--       completed_age_secs, failed_age_secs, cancelled_age_secs,
+--       completed_count,    failed_count,    cancelled_count,
+--       batch_limit
+--   age < 0   => skip age check for that state.
+--   age >= 0  => sweep entries finalized more than `age` seconds ago.
+--                `age = 0` means "sweep everything older than now" — used
+--                by `clean(grace=0, ...)` for an immediate ad-hoc prune.
+--   count < 0 => no count cap for that state.
+--   count >= 0=> keep at most `count` newest entries (by `finalized_at`).
+--   batch_limit caps total work per state per call. Default 500 if 0.
 -- Returns: { n_completed_deleted, n_failed_deleted, n_cancelled_deleted, 0 }
 --   The 4th slot is reserved for Redis batch retention (not yet implemented;
 --   batches don't have a dedicated finalized ZSET on Redis today).
@@ -1546,34 +1550,63 @@ end
 local function fn_cleanup(keys, args)
   local prefix      = keys[1]
   local now_ms      = tonumber(args[1])
-  -- Default to -1 (skip) when missing — never 0, which means "sweep now".
+  -- Default to -1 (skip) when missing — never 0, which means "sweep now"
+  -- (age) or "delete everything" (count).
   local age_c       = tonumber(args[2]) or -1
   local age_f       = tonumber(args[3]) or -1
   local age_x       = tonumber(args[4]) or -1
-  local batch_limit = tonumber(args[5]) or 0
+  local cnt_c       = tonumber(args[5]) or -1
+  local cnt_f       = tonumber(args[6]) or -1
+  local cnt_x       = tonumber(args[7]) or -1
+  local batch_limit = tonumber(args[8]) or 0
   if batch_limit <= 0 then batch_limit = 500 end
 
-  -- Per-state sweep: select oldest IDs under the cutoff, tear down each
-  -- job (HASH + indexes + unique-key + error log), then ZREM from the
-  -- finalized ZSET so the index stays in sync. Order: completed, failed,
-  -- cancelled — matching the Retention struct slot order in Rust.
-  local function sweep(zsetkey, age_secs)
-    if age_secs < 0 then return 0 end
-    local cutoff = now_ms - (age_secs * 1000)
-    local ids = redis.call('ZRANGEBYSCORE', zsetkey,
-                           '-inf', '(' .. cutoff,
-                           'LIMIT', 0, batch_limit)
-    if #ids == 0 then return 0 end
-    for _, id in ipairs(ids) do
+  -- Per-state sweep: collect the union of (age victims, count victims)
+  -- capped at `batch_limit`, tear each down via `delete_job` (HASH + indexes
+  -- + unique-key + error log), then ZREM from the finalized ZSET. Order:
+  -- completed, failed, cancelled — matching the Retention struct slot order
+  -- in Rust.
+  local function sweep(zsetkey, age_secs, count)
+    if age_secs < 0 and count < 0 then return 0 end
+    local victims = {}
+    local seen = {}
+    -- Age-based: oldest scores first.
+    if age_secs >= 0 then
+      local cutoff = now_ms - (age_secs * 1000)
+      local ids = redis.call('ZRANGEBYSCORE', zsetkey,
+                             '-inf', '(' .. cutoff,
+                             'LIMIT', 0, batch_limit)
+      for _, id in ipairs(ids) do
+        if not seen[id] then
+          seen[id] = true
+          victims[#victims + 1] = id
+          if #victims >= batch_limit then break end
+        end
+      end
+    end
+    -- Count-cap: ZRANGE 0 to -(count+1) selects everything except the
+    -- newest `count`. Out-of-range stop → empty result (Redis-safe).
+    if count >= 0 and #victims < batch_limit then
+      local stop = -(count + 1)
+      local ids = redis.call('ZRANGE', zsetkey, 0, stop)
+      for _, id in ipairs(ids) do
+        if not seen[id] then
+          seen[id] = true
+          victims[#victims + 1] = id
+          if #victims >= batch_limit then break end
+        end
+      end
+    end
+    for _, id in ipairs(victims) do
       delete_job(prefix, id)
       redis.call('ZREM', zsetkey, id)
     end
-    return #ids
+    return #victims
   end
 
-  local n_c = sweep(completedkey(prefix), age_c)
-  local n_f = sweep(failedkey(prefix),    age_f)
-  local n_x = sweep(cancelledkey(prefix), age_x)
+  local n_c = sweep(completedkey(prefix), age_c, cnt_c)
+  local n_f = sweep(failedkey(prefix),    age_f, cnt_f)
+  local n_x = sweep(cancelledkey(prefix), age_x, cnt_x)
 
   return { tostring(n_c), tostring(n_f), tostring(n_x), '0' }
 end

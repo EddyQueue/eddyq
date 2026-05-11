@@ -1217,6 +1217,9 @@ impl Backend for RedisBackend {
         if retention.completed_secs.is_none()
             && retention.failed_secs.is_none()
             && retention.cancelled_secs.is_none()
+            && retention.completed_count.is_none()
+            && retention.failed_count.is_none()
+            && retention.cancelled_count.is_none()
         {
             return Ok((0, 0, 0, 0));
         }
@@ -1230,9 +1233,18 @@ impl Backend for RedisBackend {
             None => "-1".to_string(),
             Some(s) => i64::try_from(s).unwrap_or(i64::MAX).to_string(),
         };
+        // -1 = no count cap; >= 0 means keep at most N newest. The Lua side
+        // applies negative-index ZRANGE to pick victims beyond the top-N.
+        let count_to_arg = |o: Option<i64>| match o {
+            None => "-1".to_string(),
+            Some(n) => n.max(0).to_string(),
+        };
         let c = age_to_arg(retention.completed_secs);
         let f = age_to_arg(retention.failed_secs);
         let x = age_to_arg(retention.cancelled_secs);
+        let cc = count_to_arg(retention.completed_count);
+        let cf = count_to_arg(retention.failed_count);
+        let cx = count_to_arg(retention.cancelled_count);
         let limit = PER_STATE_LIMIT.to_string();
 
         let value: redis::Value = with_retry(&mut conn, |mut conn| {
@@ -1241,6 +1253,9 @@ impl Backend for RedisBackend {
             let c = c.clone();
             let f = f.clone();
             let x = x.clone();
+            let cc = cc.clone();
+            let cf = cf.clone();
+            let cx = cx.clone();
             let limit = limit.clone();
             async move {
                 redis::cmd("FCALL")
@@ -1251,6 +1266,9 @@ impl Backend for RedisBackend {
                     .arg(&c)
                     .arg(&f)
                     .arg(&x)
+                    .arg(&cc)
+                    .arg(&cf)
+                    .arg(&cx)
                     .arg(&limit)
                     .query_async(&mut conn)
                     .await
@@ -1284,12 +1302,13 @@ impl Backend for RedisBackend {
         let limit_s = limit.to_string();
         // -1 on the two states we're not targeting so fn_cleanup skips them
         // (the targeted state gets the actual grace, which may be 0 meaning
-        // "sweep everything past now").
+        // "sweep everything past now"). `clean()` is the ad-hoc surface — no
+        // count caps; the per-call cap is the batch_limit slot.
         let skip = "-1".to_string();
         let (c, f, x) = match state {
-            CleanState::Completed => (grace_secs.clone(), skip.clone(), skip),
-            CleanState::Failed => (skip.clone(), grace_secs.clone(), skip),
-            CleanState::Cancelled => (skip.clone(), skip, grace_secs.clone()),
+            CleanState::Completed => (grace_secs.clone(), skip.clone(), skip.clone()),
+            CleanState::Failed => (skip.clone(), grace_secs.clone(), skip.clone()),
+            CleanState::Cancelled => (skip.clone(), skip.clone(), grace_secs.clone()),
         };
 
         let value: redis::Value = with_retry(&mut conn, |mut conn| {
@@ -1298,6 +1317,7 @@ impl Backend for RedisBackend {
             let c = c.clone();
             let f = f.clone();
             let x = x.clone();
+            let skip = skip.clone();
             let limit_s = limit_s.clone();
             async move {
                 redis::cmd("FCALL")
@@ -1308,6 +1328,10 @@ impl Backend for RedisBackend {
                     .arg(&c)
                     .arg(&f)
                     .arg(&x)
+                    // No count cap on ad-hoc clean — limit is the batch cap.
+                    .arg(&skip)
+                    .arg(&skip)
+                    .arg(&skip)
                     .arg(&limit_s)
                     .query_async(&mut conn)
                     .await
