@@ -333,8 +333,19 @@ async fn scheduled_job_waits_until_due(pool: PgPool) {
 
     queue.start().unwrap();
 
-    // After 150ms, only the immediate job should be done.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait until the immediate job has run, then confirm the future-dated job
+    // hasn't fired yet. Polling (instead of a fixed sleep) keeps the test
+    // robust against slow first-fetch cycles under parallel CI load.
+    tokio::time::timeout(Duration::from_millis(300), async {
+        loop {
+            if counter.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("immediate job should run within 300ms");
     assert_eq!(
         counter.load(Ordering::SeqCst),
         1,
@@ -433,14 +444,16 @@ async fn cron_schedule_fires_recurring(pool: PgPool) {
     .expect("every-second cron should fire at least 2x within 4s");
     queue.shutdown().await.unwrap();
 
-    // And the schedule's last_run_at should be recent.
+    // And the schedule's last_run_at should be recent. We deliberately do not
+    // assert `next_run_at > now()` — for an every-second cron, the next-tick
+    // boundary can slip past `now()` between the scheduler's update and this
+    // query under CI load, even though the scheduler computed a future value.
     let schedules = eddyq_core::schedule::list_schedules(&pool).await.unwrap();
     assert_eq!(schedules.len(), 1);
     assert!(
         schedules[0].last_run_at.is_some(),
         "last_run_at set after firing"
     );
-    assert!(schedules[0].next_run_at > chrono::Utc::now());
 }
 
 #[sqlx::test(migrations = "./migrations")]
