@@ -555,22 +555,22 @@ async fn cleanup_loop<B: Backend>(
     shutdown: CancellationToken,
     is_leader: Arc<AtomicBool>,
 ) {
-    // Short-circuit if no retention is configured — nothing to do.
-    if config.completed_retention.is_none()
-        && config.failed_retention.is_none()
-        && config.cancelled_retention.is_none()
-        && config.batch_retention.is_none()
-    {
-        debug!("cleanup disabled (all retentions None)");
-        return;
-    }
-    info!("eddyq cleanup started");
     let retention = crate::fetch::Retention {
         completed_secs: config.completed_retention.map(|d| d.as_secs()),
         failed_secs: config.failed_retention.map(|d| d.as_secs()),
         cancelled_secs: config.cancelled_retention.map(|d| d.as_secs()),
         batch_secs: config.batch_retention.map(|d| d.as_secs()),
+        completed_count: config.completed_retention_count,
+        failed_count: config.failed_retention_count,
+        cancelled_count: config.cancelled_retention_count,
+        batch_count: config.batch_retention_count,
     };
+    // Short-circuit if nothing is configured — nothing to do.
+    if retention.is_disabled() {
+        debug!("cleanup disabled (all retentions None)");
+        return;
+    }
+    info!("eddyq cleanup started");
     let mut interval = tokio::time::interval(config.cleanup_interval);
     interval.tick().await;
     loop {

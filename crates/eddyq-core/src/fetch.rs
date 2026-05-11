@@ -444,7 +444,10 @@ pub async fn cancel(pool: &PgPool, id: JobId) -> Result<bool> {
     Ok(cancelled)
 }
 
-/// Per-state retention policy (seconds). `None` = keep forever.
+/// Per-state retention policy. `*_secs = None` and `*_count = None` together
+/// mean "keep forever." When both are set, OR semantics apply: a row is reaped
+/// if it exceeds *either* the age window *or* the count cap. This matches
+/// BullMQ and gives Redis users a hard memory bound that age alone can't.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Retention {
     pub completed_secs: Option<u64>,
@@ -455,57 +458,204 @@ pub struct Retention {
     /// `ON DELETE SET NULL`, so deleting a batch row is safe regardless of
     /// whether its jobs have already been reaped.
     pub batch_secs: Option<u64>,
+    /// Keep at most this many completed jobs (newest by `finalized_at`).
+    pub completed_count: Option<i64>,
+    pub failed_count: Option<i64>,
+    pub cancelled_count: Option<i64>,
+    pub batch_count: Option<i64>,
 }
 
-/// Delete finalized rows older than the configured retention. Returns
-/// (completed_jobs, failed_jobs, cancelled_jobs, batches).
+impl Retention {
+    /// True when no field would ever cause a delete — cleanup can short-circuit.
+    pub fn is_disabled(&self) -> bool {
+        self.completed_secs.is_none()
+            && self.failed_secs.is_none()
+            && self.cancelled_secs.is_none()
+            && self.batch_secs.is_none()
+            && self.completed_count.is_none()
+            && self.failed_count.is_none()
+            && self.cancelled_count.is_none()
+            && self.batch_count.is_none()
+    }
+}
+
+/// Delete finalized rows that exceed the configured retention (age OR count).
+/// Returns (completed_jobs, failed_jobs, cancelled_jobs, batches).
 pub async fn cleanup(pool: &PgPool, retention: Retention) -> Result<(u64, u64, u64, u64)> {
     let mut completed = 0u64;
     let mut failed = 0u64;
     let mut cancelled = 0u64;
-    let mut batches = 0u64;
 
-    for (state, maybe_secs, out) in [
-        ("completed", retention.completed_secs, &mut completed),
-        ("failed", retention.failed_secs, &mut failed),
-        ("cancelled", retention.cancelled_secs, &mut cancelled),
+    for (state, maybe_secs, maybe_count, out) in [
+        (
+            "completed",
+            retention.completed_secs,
+            retention.completed_count,
+            &mut completed,
+        ),
+        (
+            "failed",
+            retention.failed_secs,
+            retention.failed_count,
+            &mut failed,
+        ),
+        (
+            "cancelled",
+            retention.cancelled_secs,
+            retention.cancelled_count,
+            &mut cancelled,
+        ),
     ] {
-        let Some(secs) = maybe_secs else { continue };
-        let secs = i64::try_from(secs).unwrap_or(i64::MAX);
-        // Uses eddyq_jobs_finalized (finalized_at DESC) partial index.
-        let res = sqlx::query(
-            r#"
-            DELETE FROM eddyq_jobs
-             WHERE state = $1
-               AND finalized_at IS NOT NULL
-               AND finalized_at < NOW() - make_interval(secs => $2)
-            "#,
-        )
-        .bind(state)
-        .bind(secs)
-        .execute(pool)
-        .await?;
-        *out = res.rows_affected();
+        *out = cleanup_jobs_state(pool, state, maybe_secs, maybe_count).await?;
     }
 
-    if let Some(secs) = retention.batch_secs {
-        let secs = i64::try_from(secs).unwrap_or(i64::MAX);
-        // Uses eddyq_batches_finalized partial index.
-        let res = sqlx::query(
-            r#"
-            DELETE FROM eddyq_batches
-             WHERE state = 'complete'
-               AND finalized_at IS NOT NULL
-               AND finalized_at < NOW() - make_interval(secs => $1)
-            "#,
-        )
-        .bind(secs)
-        .execute(pool)
-        .await?;
-        batches = res.rows_affected();
-    }
+    let batches = cleanup_batches(pool, retention.batch_secs, retention.batch_count).await?;
 
     Ok((completed, failed, cancelled, batches))
+}
+
+async fn cleanup_jobs_state(
+    pool: &PgPool,
+    state: &str,
+    age_secs: Option<u64>,
+    count: Option<i64>,
+) -> Result<u64> {
+    match (age_secs, count) {
+        (None, None) => Ok(0),
+        // Age-only — fast path, uses eddyq_jobs_finalized partial index.
+        (Some(secs), None) => {
+            let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+            let res = sqlx::query(
+                r#"
+                DELETE FROM eddyq_jobs
+                 WHERE state = $1
+                   AND finalized_at IS NOT NULL
+                   AND finalized_at < NOW() - make_interval(secs => $2)
+                "#,
+            )
+            .bind(state)
+            .bind(secs)
+            .execute(pool)
+            .await?;
+            Ok(res.rows_affected())
+        }
+        // Count-only — keep newest N, delete the rest. Window scan over
+        // finalized rows in this state; bounded by the partial index.
+        (None, Some(count)) => {
+            let count = count.max(0);
+            let res = sqlx::query(
+                r#"
+                WITH ranked AS (
+                  SELECT id, row_number() OVER (ORDER BY finalized_at DESC) AS rn
+                    FROM eddyq_jobs
+                   WHERE state = $1
+                     AND finalized_at IS NOT NULL
+                )
+                DELETE FROM eddyq_jobs
+                 WHERE id IN (SELECT id FROM ranked WHERE rn > $2)
+                "#,
+            )
+            .bind(state)
+            .bind(count)
+            .execute(pool)
+            .await?;
+            Ok(res.rows_affected())
+        }
+        // Both — OR semantics: delete if expired by age OR beyond the newest N.
+        (Some(secs), Some(count)) => {
+            let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+            let count = count.max(0);
+            let res = sqlx::query(
+                r#"
+                WITH ranked AS (
+                  SELECT id, finalized_at,
+                         row_number() OVER (ORDER BY finalized_at DESC) AS rn
+                    FROM eddyq_jobs
+                   WHERE state = $1
+                     AND finalized_at IS NOT NULL
+                )
+                DELETE FROM eddyq_jobs
+                 WHERE id IN (
+                   SELECT id FROM ranked
+                    WHERE finalized_at < NOW() - make_interval(secs => $2)
+                       OR rn > $3
+                 )
+                "#,
+            )
+            .bind(state)
+            .bind(secs)
+            .bind(count)
+            .execute(pool)
+            .await?;
+            Ok(res.rows_affected())
+        }
+    }
+}
+
+async fn cleanup_batches(pool: &PgPool, age_secs: Option<u64>, count: Option<i64>) -> Result<u64> {
+    match (age_secs, count) {
+        (None, None) => Ok(0),
+        (Some(secs), None) => {
+            let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+            let res = sqlx::query(
+                r#"
+                DELETE FROM eddyq_batches
+                 WHERE state = 'complete'
+                   AND finalized_at IS NOT NULL
+                   AND finalized_at < NOW() - make_interval(secs => $1)
+                "#,
+            )
+            .bind(secs)
+            .execute(pool)
+            .await?;
+            Ok(res.rows_affected())
+        }
+        (None, Some(count)) => {
+            let count = count.max(0);
+            let res = sqlx::query(
+                r#"
+                WITH ranked AS (
+                  SELECT id, row_number() OVER (ORDER BY finalized_at DESC) AS rn
+                    FROM eddyq_batches
+                   WHERE state = 'complete'
+                     AND finalized_at IS NOT NULL
+                )
+                DELETE FROM eddyq_batches
+                 WHERE id IN (SELECT id FROM ranked WHERE rn > $1)
+                "#,
+            )
+            .bind(count)
+            .execute(pool)
+            .await?;
+            Ok(res.rows_affected())
+        }
+        (Some(secs), Some(count)) => {
+            let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+            let count = count.max(0);
+            let res = sqlx::query(
+                r#"
+                WITH ranked AS (
+                  SELECT id, finalized_at,
+                         row_number() OVER (ORDER BY finalized_at DESC) AS rn
+                    FROM eddyq_batches
+                   WHERE state = 'complete'
+                     AND finalized_at IS NOT NULL
+                )
+                DELETE FROM eddyq_batches
+                 WHERE id IN (
+                   SELECT id FROM ranked
+                    WHERE finalized_at < NOW() - make_interval(secs => $1)
+                       OR rn > $2
+                 )
+                "#,
+            )
+            .bind(secs)
+            .bind(count)
+            .execute(pool)
+            .await?;
+            Ok(res.rows_affected())
+        }
+    }
 }
 
 /// Ad-hoc retention sweep. Deletes up to `limit` finalized jobs in the

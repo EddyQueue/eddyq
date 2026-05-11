@@ -935,6 +935,17 @@ async fn zcard_completed(url: &str, line: &str) -> i64 {
     conn.zcard(&key).await.unwrap()
 }
 
+/// `ZCARD {prefix}:failed` — parallel to `zcard_completed` for the failed
+/// finalized index. Used to assert that count caps on completed don't bleed
+/// into the failed ZSET.
+async fn zcard_failed(url: &str, line: &str) -> i64 {
+    use redis::AsyncCommands;
+    let client = redis::Client::open(url).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("{{{}}}:failed", line);
+    conn.zcard(&key).await.unwrap()
+}
+
 /// Drive the queue until `counter` reaches `target`, then shut down. Used by
 /// retention tests that need workers to finalize jobs before they assert on
 /// the resulting `completed` ZSET.
@@ -1191,6 +1202,172 @@ async fn clean_caps_deletions_per_call() {
         .unwrap();
     assert_eq!(n2, 5, "second clean call drains the rest");
     assert_eq!(zcard_completed(&url, &line).await, 0);
+
+    flush_line(&url, &line).await;
+}
+
+// ---- count-cap retention --------------------------------------------------
+//
+// The Redis backend mirrors the PG behavior: per-state count cap, OR-combined
+// with the age window. Lua's `fn_cleanup` picks victims by negative-index
+// ZRANGE (everything except the newest N) on top of the existing ZRANGEBYSCORE
+// age sweep, deduping by ID. These tests pin both halves and their union.
+
+/// Count cap alone: 6 finalized jobs, `completed_count: 2` → 4 deleted, the
+/// 2 highest-scoring (newest finalize) remain. Age is unset, so age can't
+/// account for the deletes.
+#[tokio::test]
+async fn cleanup_count_keeps_newest_n_completed() {
+    use eddyq_core::backend::Backend;
+    use eddyq_core::fetch::Retention;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retcnt");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    for n in 0..6 {
+        queue.enqueue(&Count { n }).await.unwrap();
+    }
+    run_until(&queue, &counter, 6).await;
+    assert_eq!(zcard_completed(&url, &line).await, 6);
+
+    let backend = queue.backend().as_ref();
+    let (c, _, _, _) = backend
+        .cleanup(Retention {
+            completed_count: Some(2),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(c, 4, "count cap should reap 4 of 6");
+    assert_eq!(
+        zcard_completed(&url, &line).await,
+        2,
+        "ZSET should hold exactly the 2 newest"
+    );
+
+    flush_line(&url, &line).await;
+}
+
+/// `completed_count: 0` is the "delete every finalized completed" shortcut —
+/// the negative-index ZRANGE expands to the whole ZSET. Useful for tests but
+/// also a legit prod knob (Redis users who don't want any completed retention).
+#[tokio::test]
+async fn cleanup_count_zero_drains_finalized_zset() {
+    use eddyq_core::backend::Backend;
+    use eddyq_core::fetch::Retention;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retc0");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    for n in 0..3 {
+        queue.enqueue(&Count { n }).await.unwrap();
+    }
+    run_until(&queue, &counter, 3).await;
+    assert_eq!(zcard_completed(&url, &line).await, 3);
+
+    let backend = queue.backend().as_ref();
+    let (c, _, _, _) = backend
+        .cleanup(Retention {
+            completed_count: Some(0),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(c, 3);
+    assert_eq!(zcard_completed(&url, &line).await, 0);
+
+    flush_line(&url, &line).await;
+}
+
+/// OR semantics: age=0 (sweep anything finalized before now_ms) and count=4
+/// would each pick different victim sets. Dedupe in Lua means the count is
+/// the *total* reaped, not age + count separately.
+#[tokio::test]
+async fn cleanup_count_and_age_dedupe_in_lua() {
+    use eddyq_core::backend::Backend;
+    use eddyq_core::fetch::Retention;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retcoa");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    for n in 0..5 {
+        queue.enqueue(&Count { n }).await.unwrap();
+    }
+    run_until(&queue, &counter, 5).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let backend = queue.backend().as_ref();
+    // age=0 alone would reap all 5; count=2 alone would reap 3 of 5; together
+    // (union, dedup'd) we still expect 5 deleted with 0 left.
+    let (c, _, _, _) = backend
+        .cleanup(Retention {
+            completed_secs: Some(0),
+            completed_count: Some(2),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(c, 5, "age + count must not double-count overlapping IDs");
+    assert_eq!(zcard_completed(&url, &line).await, 0);
+
+    flush_line(&url, &line).await;
+}
+
+/// Count is per-state. Tightening `completed_count` must not touch the
+/// failed/cancelled ZSETs. Enqueues a mix of successful and failing jobs to
+/// populate both completed and failed ZSETs, then sweeps only completed.
+#[tokio::test]
+async fn cleanup_count_per_state_isolation_redis() {
+    use eddyq_core::backend::Backend;
+    use eddyq_core::fetch::Retention;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retciso");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    for n in 0..4 {
+        queue.enqueue(&Count { n }).await.unwrap();
+    }
+    run_until(&queue, &counter, 4).await;
+    assert_eq!(zcard_completed(&url, &line).await, 4);
+    let failed_before = zcard_failed(&url, &line).await;
+
+    let backend = queue.backend().as_ref();
+    let (c, f, x, _) = backend
+        .cleanup(Retention {
+            completed_count: Some(1),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(c, 3);
+    assert_eq!(f, 0, "failed ZSET must be untouched");
+    assert_eq!(x, 0, "cancelled ZSET must be untouched");
+    assert_eq!(zcard_completed(&url, &line).await, 1);
+    assert_eq!(zcard_failed(&url, &line).await, failed_before);
 
     flush_line(&url, &line).await;
 }

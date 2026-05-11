@@ -108,6 +108,10 @@ fn fast_config() -> QueueConfig {
         failed_retention: None,
         cancelled_retention: None,
         batch_retention: None,
+        completed_retention_count: None,
+        failed_retention_count: None,
+        cancelled_retention_count: None,
+        batch_retention_count: None,
         poll_only: false,
         leader_lease_secs: 30,
     }
@@ -1845,6 +1849,7 @@ async fn cleanup_deletes_old_finalized_jobs(pool: PgPool) {
         failed_secs: Some(3600),
         cancelled_secs: Some(3600),
         batch_secs: None,
+        ..Default::default()
     };
 
     let (c, f, x, _) = cleanup(&pool, retention).await.unwrap();
@@ -1882,6 +1887,7 @@ async fn cleanup_respects_none_retention(pool: PgPool) {
             failed_secs: None,
             cancelled_secs: None,
             batch_secs: None,
+            ..Default::default()
         },
     )
     .await
@@ -1919,6 +1925,7 @@ async fn cleanup_does_not_touch_pending_or_running(pool: PgPool) {
             failed_secs: Some(1),
             cancelled_secs: Some(1),
             batch_secs: Some(1),
+            ..Default::default()
         },
     )
     .await
@@ -1960,6 +1967,7 @@ async fn cleanup_deletes_old_finalized_batches(pool: PgPool) {
             failed_secs: None,
             cancelled_secs: None,
             batch_secs: Some(3600),
+            ..Default::default()
         },
     )
     .await
@@ -1996,6 +2004,7 @@ async fn cleanup_does_not_touch_pending_batches(pool: PgPool) {
             failed_secs: None,
             cancelled_secs: None,
             batch_secs: Some(1),
+            ..Default::default()
         },
     )
     .await
@@ -2043,6 +2052,7 @@ async fn cleanup_jobs_and_batches_in_one_call(pool: PgPool) {
             failed_secs: Some(3600),
             cancelled_secs: Some(3600),
             batch_secs: Some(3600),
+            ..Default::default()
         },
     )
     .await
@@ -2082,6 +2092,7 @@ async fn cleanup_batch_only_does_not_touch_jobs(pool: PgPool) {
             failed_secs: None,
             cancelled_secs: None,
             batch_secs: Some(3600),
+            ..Default::default()
         },
     )
     .await
@@ -2133,6 +2144,7 @@ async fn cleanup_batch_delete_nulls_surviving_job_batch_id(pool: PgPool) {
             failed_secs: None,
             cancelled_secs: None,
             batch_secs: Some(3600), // 1h — batch is reapable
+            ..Default::default()
         },
     )
     .await
@@ -2184,6 +2196,317 @@ async fn cleanup_batch_respects_none_retention(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(remaining, 1);
+}
+
+// ---- count-cap retention ---------------------------------------------------
+//
+// Age caps a row's max lifetime; count caps the table's max size. We support
+// both, with OR semantics — a row is reaped if it exceeds *either* bound,
+// matching BullMQ's `removeOnComplete: { age, count }`. The count cap is what
+// makes Redis safe under high throughput: 24h of completed at 10K j/s is tens
+// of GB, but `count: 10_000` is bounded.
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_count_only_keeps_newest_n(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Five completed jobs, finalized in increasing-age order. With count=2
+    // and no age cap, the two newest should survive.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('c1', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '5 minutes'),
+            ('c2', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '4 minutes'),
+            ('c3', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '3 minutes'),
+            ('c4', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 minutes'),
+            ('c5', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '1 minute')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, f, x, b) = cleanup(
+        &pool,
+        Retention {
+            completed_count: Some(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((c, f, x, b), (3, 0, 0, 0));
+
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM eddyq_jobs ORDER BY finalized_at DESC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kinds, vec!["c5", "c4"], "newest two must survive");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_count_zero_deletes_all_finalized(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // count=0 means "keep zero" — every finalized row in the targeted state
+    // should be deleted. Pending rows must still be left alone.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('c1', '{}'::jsonb, 'completed', 1, 3, NOW()),
+            ('c2', '{}'::jsonb, 'completed', 1, 3, NOW()),
+            ('p1', '{}'::jsonb, 'pending',   0, 3, NULL)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, _, _, _) = cleanup(
+        &pool,
+        Retention {
+            completed_count: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(c, 2);
+
+    let surviving: Vec<String> = sqlx::query_scalar("SELECT kind FROM eddyq_jobs ORDER BY kind")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(surviving, vec!["p1"], "pending row must remain");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_count_and_age_use_or_semantics(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // 6 rows: 3 are old (>1h), 3 are young.
+    //   age cutoff 1h alone would reap {old_1, old_2, old_3} (3).
+    //   count cap 2 alone would reap {old_1, old_2, old_3, young_1} (4 — keep
+    //   newest 2 = young_2 + young_3).
+    //   Union (OR) reaps the same 4 — old set is a subset of count's victims.
+    //   The point of OR semantics: a row leaving via age *or* via count, so
+    //   the tighter rule dominates per row. Count tightens further than age
+    //   here, dropping young_1 even though it's well under the age cutoff.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('old_1',   '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '6 hours'),
+            ('old_2',   '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '5 hours'),
+            ('old_3',   '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '4 hours'),
+            ('young_1', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '3 minutes'),
+            ('young_2', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 minutes'),
+            ('young_3', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '1 minute')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, _, _, _) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: Some(3600), // 1 hour
+            completed_count: Some(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(c, 4, "count subsumes age here: 4 reaped, 2 survive");
+
+    let kinds: Vec<String> =
+        sqlx::query_scalar("SELECT kind FROM eddyq_jobs ORDER BY finalized_at DESC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kinds, vec!["young_3", "young_2"]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_age_can_tighten_beyond_count(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Symmetric of the above — set up so age picks a *superset* of count's
+    // victims. count=5 (keep 5) would do nothing on 4 rows; age=1m reaps the
+    // 3 old. Verifies age can tighten beyond count.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('old_1', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '1 hour'),
+            ('old_2', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '50 minutes'),
+            ('old_3', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '40 minutes'),
+            ('new_1', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '5 seconds')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, _, _, _) = cleanup(
+        &pool,
+        Retention {
+            completed_secs: Some(60), // 1 minute
+            completed_count: Some(5), // larger than row count → no-op alone
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(c, 3, "age cap drives the deletes here");
+
+    let remaining: Vec<String> = sqlx::query_scalar("SELECT kind FROM eddyq_jobs ORDER BY kind")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, vec!["new_1"]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_count_does_not_touch_pending_or_running(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // count caps must only consider finalized rows. A tiny count must not
+    // entice the cleanup to "make room" by deleting pending/running.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('p1', '{}'::jsonb, 'pending', 0, 3, NULL),
+            ('r1', '{}'::jsonb, 'running', 1, 3, NULL)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, f, x, _) = cleanup(
+        &pool,
+        Retention {
+            completed_count: Some(0),
+            failed_count: Some(0),
+            cancelled_count: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((c, f, x), (0, 0, 0));
+
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 2);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_count_per_state_isolation(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // count is per-state — a tight cap on completed must not affect failed or
+    // cancelled rows. Three rows in each terminal state; cap completed at 1.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, finalized_at)
+        VALUES
+            ('cmp_1', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '3 minutes'),
+            ('cmp_2', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '2 minutes'),
+            ('cmp_3', '{}'::jsonb, 'completed', 1, 3, NOW() - INTERVAL '1 minute'),
+            ('fal_1', '{}'::jsonb, 'failed',    3, 3, NOW() - INTERVAL '3 minutes'),
+            ('fal_2', '{}'::jsonb, 'failed',    3, 3, NOW() - INTERVAL '2 minutes'),
+            ('fal_3', '{}'::jsonb, 'failed',    3, 3, NOW() - INTERVAL '1 minute'),
+            ('cxl_1', '{}'::jsonb, 'cancelled', 0, 3, NOW() - INTERVAL '3 minutes'),
+            ('cxl_2', '{}'::jsonb, 'cancelled', 0, 3, NOW() - INTERVAL '2 minutes'),
+            ('cxl_3', '{}'::jsonb, 'cancelled', 0, 3, NOW() - INTERVAL '1 minute')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (c, f, x, _) = cleanup(
+        &pool,
+        Retention {
+            completed_count: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!((c, f, x), (2, 0, 0));
+
+    let by_state: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT state, COUNT(*)::bigint FROM eddyq_jobs GROUP BY state ORDER BY state",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        by_state,
+        vec![
+            ("cancelled".to_string(), 3),
+            ("completed".to_string(), 1),
+            ("failed".to_string(), 3),
+        ]
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn cleanup_batch_count_keeps_newest_n(pool: PgPool) {
+    use eddyq_core::fetch::{Retention, cleanup};
+
+    // Mirror of the job count cap, for `eddyq_batches`. Pending batches must
+    // not be considered against the count (their `finalized_at` is NULL).
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_batches (state, total, completed, finalized_at)
+        VALUES
+            ('complete', 1, 1, NOW() - INTERVAL '4 hours'),
+            ('complete', 1, 1, NOW() - INTERVAL '3 hours'),
+            ('complete', 1, 1, NOW() - INTERVAL '2 hours'),
+            ('complete', 1, 1, NOW() - INTERVAL '1 hour'),
+            ('pending',  1, 0, NULL)
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (_, _, _, b) = cleanup(
+        &pool,
+        Retention {
+            batch_count: Some(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(b, 2);
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_batches WHERE state = 'complete'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining, 2);
+
+    // Pending batch must still be present.
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_batches WHERE state = 'pending'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, 1);
 }
 
 #[test]

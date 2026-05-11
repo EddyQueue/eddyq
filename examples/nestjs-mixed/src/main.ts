@@ -20,6 +20,10 @@ async function bootstrap(): Promise<void> {
     "POST /webhooks/fire to enqueue on Redis · POST /payments/charge to enqueue on Postgres",
     "Bootstrap",
   );
+  Logger.log(
+    `wakeboard mounted at http://localhost:${port}/wakeboard (password: ${process.env.WAKEBOARD_PASSWORD ?? "admin"})`,
+    "Bootstrap",
+  );
 }
 
 void bootstrap();

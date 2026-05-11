@@ -7,7 +7,8 @@ name: Release
 #      and uploads it as an artifact
 #   2. publish: downloads every artifact, moves them into per-target npm/ subdirs,
 #      then publishes `@eddyq/queue` (triggers per-platform package publishes via
-#      `napi prepublish`) followed by `@eddyq/nestjs`
+#      `napi prepublish`), `@eddyq/nestjs`, then `@eddyq/wakeboard`. All three
+#      are version-locked.
 #
 # Requires secret: NPM_TOKEN (an npm token with publish rights to @eddyq).
 
@@ -186,8 +187,9 @@ jobs:
       - name: Set version in package.json files
         run: |
           V="${{ steps.version.outputs.version }}"
-          npm --prefix packages/queue  version "$V" --no-git-tag-version --allow-same-version
-          npm --prefix packages/nestjs version "$V" --no-git-tag-version --allow-same-version
+          npm --prefix packages/queue     version "$V" --no-git-tag-version --allow-same-version
+          npm --prefix packages/nestjs    version "$V" --no-git-tag-version --allow-same-version
+          npm --prefix packages/wakeboard version "$V" --no-git-tag-version --allow-same-version
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
@@ -238,6 +240,21 @@ jobs:
           cd packages/nestjs
           pnpm pack
           npm publish eddyq-nestjs-*.tgz --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build @eddyq/wakeboard
+        run: pnpm -C packages/wakeboard build
+
+      - name: Publish @eddyq/wakeboard
+        # Same pnpm pack → npm publish dance as @eddyq/nestjs to resolve the
+        # workspace:* deps on @eddyq/queue and @eddyq/nestjs.
+        run: |
+          cd packages/wakeboard
+          pnpm pack
+          npm publish eddyq-wakeboard-*.tgz --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

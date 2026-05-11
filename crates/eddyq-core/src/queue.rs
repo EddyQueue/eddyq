@@ -40,6 +40,22 @@ pub struct QueueConfig {
     /// keeps them forever (table grows unbounded for batch-heavy workloads).
     /// Default: 7 days.
     pub batch_retention: Option<Duration>,
+    /// Keep at most this many completed jobs. `None` = no count cap.
+    /// Independent of `completed_retention` (age): on each cleanup tick a row
+    /// is deleted if it exceeds *either* the age window *or* the count cap
+    /// (BullMQ-style OR semantics). Useful as a hard memory bound on Redis,
+    /// where 24h of completed-job retention can be tens of GB at high
+    /// throughput. Default: `None`.
+    pub completed_retention_count: Option<i64>,
+    /// Keep at most this many failed jobs. See `completed_retention_count`.
+    /// Default: `None`.
+    pub failed_retention_count: Option<i64>,
+    /// Keep at most this many cancelled jobs. See `completed_retention_count`.
+    /// Default: `None`.
+    pub cancelled_retention_count: Option<i64>,
+    /// Keep at most this many finalized batch rows. See
+    /// `completed_retention_count`. Default: `None`.
+    pub batch_retention_count: Option<i64>,
     /// When `true`, do not spawn a LISTEN/NOTIFY listener. Use this when connected
     /// through PgBouncer in transaction-pooling mode (LISTEN is incompatible).
     pub poll_only: bool,
@@ -66,6 +82,10 @@ impl Default for QueueConfig {
             failed_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             cancelled_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
             batch_retention: Some(Duration::from_secs(7 * 24 * 60 * 60)), // 7d
+            completed_retention_count: None,
+            failed_retention_count: None,
+            cancelled_retention_count: None,
+            batch_retention_count: None,
             poll_only: false,
             leader_lease_secs: 30,
         }
@@ -219,6 +239,32 @@ impl<B: Backend> QueueBuilder<B> {
     /// `eddyq_batches` table grows unbounded for batch-heavy workloads.
     pub fn batch_retention(mut self, d: Option<Duration>) -> Self {
         self.config.batch_retention = d;
+        self
+    }
+
+    /// Count cap for completed jobs — keep at most N newest. Combined with
+    /// `completed_retention` (age) using OR semantics: a row is reaped if it
+    /// exceeds either bound. `None` disables the count cap.
+    pub fn completed_retention_count(mut self, n: Option<i64>) -> Self {
+        self.config.completed_retention_count = n;
+        self
+    }
+
+    /// Count cap for failed jobs. See `completed_retention_count`.
+    pub fn failed_retention_count(mut self, n: Option<i64>) -> Self {
+        self.config.failed_retention_count = n;
+        self
+    }
+
+    /// Count cap for cancelled jobs. See `completed_retention_count`.
+    pub fn cancelled_retention_count(mut self, n: Option<i64>) -> Self {
+        self.config.cancelled_retention_count = n;
+        self
+    }
+
+    /// Count cap for finalized batch rows. See `completed_retention_count`.
+    pub fn batch_retention_count(mut self, n: Option<i64>) -> Self {
+        self.config.batch_retention_count = n;
         self
     }
 

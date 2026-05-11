@@ -282,6 +282,25 @@ pub struct StartOptions {
     /// grow unbounded for batch-heavy workloads.
     pub batch_retention_secs: Option<i64>,
 
+    /// Count cap for completed jobs — keep at most N newest. Combined with
+    /// `completedRetentionSecs` using OR semantics: a row is reaped if it
+    /// exceeds either bound. Useful as a hard memory bound on Redis where
+    /// age alone (24h at high throughput = tens of GB) is not enough.
+    /// Default: undefined (no count cap). Pass `-1` to explicitly disable.
+    pub completed_retention_count: Option<i64>,
+
+    /// Count cap for failed jobs. See `completedRetentionCount`.
+    /// Default: undefined.
+    pub failed_retention_count: Option<i64>,
+
+    /// Count cap for cancelled jobs. See `completedRetentionCount`.
+    /// Default: undefined.
+    pub cancelled_retention_count: Option<i64>,
+
+    /// Count cap for finalized batch rows. See `completedRetentionCount`.
+    /// Default: undefined.
+    pub batch_retention_count: Option<i64>,
+
     /// Leader-election lease in seconds — the elected maintenance node
     /// (scheduler + cleanup) refreshes every `leaseSecs / 3` seconds.
     /// Default 30.
@@ -1788,6 +1807,12 @@ fn retention_from_secs(secs: i64) -> Option<Duration> {
     }
 }
 
+/// Map a JS-supplied retention count to `Option<i64>`. `< 0` disables the
+/// count cap; `>= 0` keeps at most that many newest rows.
+fn count_from_napi(n: i64) -> Option<i64> {
+    if n < 0 { None } else { Some(n) }
+}
+
 fn ms_to_utc(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms)
         .single()
@@ -2095,6 +2120,18 @@ impl RedisQueue {
             }
             if let Some(secs) = o.batch_retention_secs {
                 builder = builder.batch_retention(retention_from_secs(secs));
+            }
+            if let Some(n) = o.completed_retention_count {
+                builder = builder.completed_retention_count(count_from_napi(n));
+            }
+            if let Some(n) = o.failed_retention_count {
+                builder = builder.failed_retention_count(count_from_napi(n));
+            }
+            if let Some(n) = o.cancelled_retention_count {
+                builder = builder.cancelled_retention_count(count_from_napi(n));
+            }
+            if let Some(n) = o.batch_retention_count {
+                builder = builder.batch_retention_count(count_from_napi(n));
             }
             if let Some(secs) = o.leader_lease_secs {
                 builder = builder.leader_lease_secs(u64::from(secs));
@@ -3296,6 +3333,10 @@ fn clone_start_options(o: &StartOptions) -> StartOptions {
         failed_retention_secs: o.failed_retention_secs,
         cancelled_retention_secs: o.cancelled_retention_secs,
         batch_retention_secs: o.batch_retention_secs,
+        completed_retention_count: o.completed_retention_count,
+        failed_retention_count: o.failed_retention_count,
+        cancelled_retention_count: o.cancelled_retention_count,
+        batch_retention_count: o.batch_retention_count,
         leader_lease_secs: o.leader_lease_secs,
         fetch_poll_interval_ms: o.fetch_poll_interval_ms,
         scheduler_interval_ms: o.scheduler_interval_ms,

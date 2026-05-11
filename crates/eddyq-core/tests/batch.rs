@@ -114,6 +114,10 @@ fn fast_config() -> QueueConfig {
         failed_retention: None,
         cancelled_retention: None,
         batch_retention: None,
+        completed_retention_count: None,
+        failed_retention_count: None,
+        cancelled_retention_count: None,
+        batch_retention_count: None,
         poll_only: false,
         leader_lease_secs: 30,
     }
