@@ -24,7 +24,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 futures-util = "0.3"
 sha2 = "0.10"
 cron = "0.15"
