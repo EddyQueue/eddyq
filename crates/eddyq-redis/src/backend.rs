@@ -541,6 +541,11 @@ fn filter_matches(row: &eddyq_core::stats::JobRow, filter: &ListJobsFilter) -> b
             return false;
         }
     }
+    if let Some(before) = filter.before_created_at {
+        if row.created_at >= before {
+            return false;
+        }
+    }
     true
 }
 

@@ -78,6 +78,13 @@ pub struct ListJobsFilter {
     /// Jobs whose `tags` array contains this tag (`tags @> ARRAY[tag]`).
     pub tag: Option<String>,
     pub id: Option<JobId>,
+    /// Keyset cursor for newest-first pagination: return only jobs with
+    /// `created_at < before_created_at`. Pair with `Pagination.limit` and
+    /// `offset = 0` to scroll through results in chronological pages without
+    /// drift from concurrent inserts. Rows with `created_at` exactly equal
+    /// to the cursor are excluded (microsecond resolution makes collisions
+    /// rare; an admin UI tolerates the edge case).
+    pub before_created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,5 +195,8 @@ fn push_filters<'a>(
         qb.push(" AND tags @> ARRAY[")
             .push_bind(tag.as_str())
             .push("]::text[]");
+    }
+    if let Some(before) = filter.before_created_at {
+        qb.push(" AND created_at < ").push_bind(before);
     }
 }

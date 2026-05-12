@@ -52,14 +52,13 @@ export class WakeboardControllerBase {
     @Query('kind') kind?: string,
     @Query('groupKey') groupKey?: string,
     @Query('tag') tag?: string,
-    @Query('page') page = '1',
+    @Query('before') before?: string,
     @Query('provider') provider?: string,
   ) {
-    const offset = (Math.max(1, parseInt(page, 10) || 1) - 1) * 50;
     const safeState = state && VALID_STATES.has(state) ? state : undefined;
     return this.service.listJobs(
-      { queue, state: safeState, kind, groupKey, tag },
-      { limit: 50, offset },
+      { queue, state: safeState, kind, groupKey, tag, beforeCreatedAt: before },
+      { limit: 50, offset: 0 },
       pickProvider(provider),
     );
   }
