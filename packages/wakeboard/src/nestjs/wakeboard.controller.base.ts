@@ -149,7 +149,13 @@ export class WakeboardControllerBase {
 
   private sendIndex(res: Response) {
     if (this.indexHtml) {
-      res.type('html').send(this.indexHtml);
+      // Use the full MIME type string, not the `html` shortcut: Fastify's
+      // `reply.type()` is an alias for `header('Content-Type', value)` and
+      // does no shortcut resolution, so `type('html')` sets a literal
+      // `content-type: html` header. Combined with `X-Content-Type-Options:
+      // nosniff` (set by helmet et al.) the browser renders the response
+      // as plain text instead of HTML.
+      res.type('text/html; charset=utf-8').send(this.indexHtml);
     } else {
       res.status(503).send('Run "pnpm build:frontend" in packages/wakeboard first.');
     }
