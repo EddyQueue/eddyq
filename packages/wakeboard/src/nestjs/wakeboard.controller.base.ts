@@ -52,14 +52,13 @@ export class WakeboardControllerBase {
     @Query('kind') kind?: string,
     @Query('groupKey') groupKey?: string,
     @Query('tag') tag?: string,
-    @Query('page') page = '1',
+    @Query('before') before?: string,
     @Query('provider') provider?: string,
   ) {
-    const offset = (Math.max(1, parseInt(page, 10) || 1) - 1) * 50;
     const safeState = state && VALID_STATES.has(state) ? state : undefined;
     return this.service.listJobs(
-      { queue, state: safeState, kind, groupKey, tag },
-      { limit: 50, offset },
+      { queue, state: safeState, kind, groupKey, tag, beforeCreatedAt: before },
+      { limit: 50, offset: 0 },
       pickProvider(provider),
     );
   }
@@ -159,3 +158,15 @@ export class WakeboardControllerBase {
     }
   }
 }
+
+// Hide wakeboard routes from any `@nestjs/swagger`-generated OpenAPI doc the
+// host app builds. The SPA catch-all (`@Get('*')`) and `:param` paths trip up
+// codegen tools like orval that consume the spec, and there is no useful
+// schema to publish for an admin UI mount. Setting the metadata key directly
+// avoids adding `@nestjs/swagger` as a dependency — if Swagger is not in use,
+// this key is simply ignored.
+Reflect.defineMetadata(
+  'swagger/apiExcludeController',
+  [{ disable: true }],
+  WakeboardControllerBase,
+);

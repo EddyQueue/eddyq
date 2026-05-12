@@ -5,6 +5,7 @@ import type {
   EddyqApp,
   EddyqRedis,
   Group,
+  JobList,
   JobStats,
   ListJobsFilter,
   NamedQueue,
@@ -79,10 +80,15 @@ export class WakeboardService {
 
   // --- stats ---------------------------------------------------------------
 
-  getStats(): Promise<JobStats> {
+  async getStats(): Promise<JobStats> {
     const q = this.q;
-    if (isApp(q)) return q.getStatsFor(this.defaultProvider());
-    return q.getStats();
+    if (!isApp(q)) return q.getStats();
+    // Multi-backend: union the per-provider snapshots. `byQueueState` is a
+    // flat (queue, state, count) histogram and queue names aren't globally
+    // unique across backends, so we just concat — each row is already
+    // self-describing.
+    const parts = await Promise.all(this.providers().map((p) => q.getStatsFor(p)));
+    return { byQueueState: parts.flatMap((s) => s.byQueueState) };
   }
 
   getStatsFor(provider: Provider): Promise<JobStats> {
@@ -98,14 +104,40 @@ export class WakeboardService {
 
   // --- listings ------------------------------------------------------------
 
-  listJobs(
+  async listJobs(
     filter: ListJobsFilter = {},
     pagination: Pagination = { limit: 50, offset: 0 },
-    _provider?: Provider,
-  ) {
+    provider?: Provider,
+  ): Promise<JobList> {
     const q = this.q;
-    if (isApp(q)) return q.listJobs(filter, pagination);
-    return q.listJobs(filter, pagination);
+    if (!isApp(q)) return q.listJobs(filter, pagination);
+    if (provider !== undefined) return q.listJobsFor(provider, filter, pagination);
+    // With a queue filter, the app's routed `listJobs` already picks the
+    // right backend — no merge needed.
+    if (filter.queue) return q.listJobs(filter, pagination);
+
+    // Multi-backend union by keyset cursor. Each backend is asked for the
+    // top `limit` rows older than `filter.beforeCreatedAt` (the caller's
+    // cursor); we merge by `createdAt` desc and take the top `limit`. The
+    // next-page cursor is the smallest `createdAt` we return — the
+    // frontend just passes it back as `beforeCreatedAt`.
+    //
+    // Why this is exact: every union row older than the cursor must appear
+    // in at least one backend's top-K-before-cursor result, because each
+    // backend returns its own K newest-before-cursor rows. So the top K of
+    // the union ⊆ ⋃ (top K of each). O(K) work per page, regardless of
+    // depth — no offset drift, no over-fetch.
+    const limit = pagination.limit ?? 50;
+    const targets = this.providers();
+    const parts = await Promise.all(
+      targets.map((p) => q.listJobsFor(p, filter, { limit, offset: 0 })),
+    );
+    const merged = parts
+      .flatMap((p) => p.rows)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit);
+    const total = parts.reduce((sum, p) => sum + p.total, 0);
+    return { total, rows: merged };
   }
 
   async listQueues(provider?: Provider): Promise<NamedQueue[]> {

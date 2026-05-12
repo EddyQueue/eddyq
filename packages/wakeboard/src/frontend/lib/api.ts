@@ -11,7 +11,7 @@ async function req<T>(path: string, method = 'GET'): Promise<T> {
 export const getStats = () => req<import('./types.js').Stats>('/api/stats');
 export const listJobs = (params: Record<string, string> = {}) => {
   const qs = new URLSearchParams(params).toString();
-  return req<import('./types.js').JobList>(`/api/jobs?${qs}`);
+  return req<import('./types.js').JobList>(`/api/jobs${qs ? `?${qs}` : ''}`);
 };
 export const listQueues = () => req<import('./types.js').NamedQueue[]>('/api/queues');
 export const listGroups = () => req<import('./types.js').Group[]>('/api/groups');

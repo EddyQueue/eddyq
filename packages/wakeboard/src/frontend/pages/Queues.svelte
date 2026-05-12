@@ -3,6 +3,8 @@
   import { getStats, listQueues, pauseQueue, resumeQueue } from '../lib/api.js';
   import type { NamedQueue, QueueStateCount } from '../lib/types.js';
 
+  type QueueRow = NamedQueue & { implicit?: boolean };
+
   let queues: NamedQueue[] = [];
   let statRows: QueueStateCount[] = [];
   let error = '';
@@ -13,6 +15,30 @@
     acc[r.queue][r.state] = r.count;
     return acc;
   }, {});
+
+  // Union the configured queues (rows in `eddyq_queues`, with limits/pause
+  // state) with queues observed in job stats but never configured. The DB
+  // table only has rows for queues someone has explicitly capped/paused/
+  // timed-out — but jobs can flow through any queue name, so the tab needs
+  // to surface those implicit queues too. Pause/Resume on an implicit row
+  // works as-is: the backend inserts the row on first write.
+  $: allQueues = ((): QueueRow[] => {
+    const configured = new Set(queues.map((q) => q.name));
+    const implicit: QueueRow[] = Object.keys(byQueue)
+      .filter((name) => !configured.has(name))
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((name) => ({
+        name,
+        runningCount: byQueue[name]?.running ?? 0,
+        maxConcurrency: 0,
+        paused: false,
+        defaultTimeoutMs: undefined,
+        createdAt: '',
+        updatedAt: '',
+        implicit: true,
+      }));
+    return [...queues, ...implicit];
+  })();
 
   async function load() {
     try {
@@ -25,7 +51,7 @@
     }
   }
 
-  async function toggle(q: NamedQueue) {
+  async function toggle(q: QueueRow) {
     acting = q.name;
     try {
       if (q.paused) await resumeQueue(q.name);
@@ -60,13 +86,18 @@
         </tr>
       </thead>
       <tbody class="divide-y divide-gray-800">
-        {#each queues as q}
+        {#each allQueues as q}
           <tr class="hover:bg-gray-900/50 transition-colors">
             <td class="px-4 py-2 font-mono text-gray-200">
               <a href="#/jobs?queue={encodeURIComponent(q.name)}" class="hover:text-indigo-400">{q.name}</a>
+              {#if q.implicit}
+                <span class="ml-2 text-[10px] uppercase tracking-wide text-gray-600" title="No row in eddyq_queues — unlimited, never paused. Pause/Resume creates the row.">unconfigured</span>
+              {/if}
             </td>
             <td class="text-right px-3 py-2 tabular-nums text-blue-300">{q.runningCount}</td>
-            <td class="text-right px-3 py-2 tabular-nums text-gray-400">{q.maxConcurrency}</td>
+            <td class="text-right px-3 py-2 tabular-nums text-gray-400">
+              {q.maxConcurrency > 0 ? q.maxConcurrency : '∞'}
+            </td>
             <td class="text-right px-3 py-2 tabular-nums text-yellow-300">
               {byQueue[q.name]?.pending?.toLocaleString() ?? '—'}
             </td>
@@ -91,8 +122,8 @@
             </td>
           </tr>
         {/each}
-        {#if queues.length === 0}
-          <tr><td colspan="7" class="px-4 py-6 text-center text-gray-600">No named queues configured.</td></tr>
+        {#if allQueues.length === 0}
+          <tr><td colspan="7" class="px-4 py-6 text-center text-gray-600">No queues — enqueue a job to populate this list.</td></tr>
         {/if}
       </tbody>
     </table>

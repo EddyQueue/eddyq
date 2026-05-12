@@ -26,23 +26,23 @@
   </div>
 
   {#if job.payload !== undefined}
-    <div>
+    <div class="min-w-0">
       <div class="text-xs text-gray-500 mb-1 uppercase tracking-wide">Payload</div>
-      <pre class="bg-gray-950 rounded p-3 text-xs text-green-300 overflow-auto max-h-40">{fmt(job.payload)}</pre>
+      <pre class="bg-gray-950 rounded p-3 text-xs text-green-300 overflow-y-auto max-h-40 whitespace-pre-wrap break-all">{fmt(job.payload)}</pre>
     </div>
   {/if}
 
   {#if job.result !== undefined}
-    <div>
+    <div class="min-w-0">
       <div class="text-xs text-gray-500 mb-1 uppercase tracking-wide">Result</div>
-      <pre class="bg-gray-950 rounded p-3 text-xs text-blue-300 overflow-auto max-h-40">{fmt(job.result)}</pre>
+      <pre class="bg-gray-950 rounded p-3 text-xs text-blue-300 overflow-y-auto max-h-40 whitespace-pre-wrap break-all">{fmt(job.result)}</pre>
     </div>
   {/if}
 
   {#if job.errors !== undefined && job.errors !== null}
-    <div>
+    <div class="min-w-0">
       <div class="text-xs text-gray-500 mb-1 uppercase tracking-wide">Errors</div>
-      <pre class="bg-gray-950 rounded p-3 text-xs text-red-300 overflow-auto max-h-40">{fmt(job.errors)}</pre>
+      <pre class="bg-gray-950 rounded p-3 text-xs text-red-300 overflow-y-auto max-h-40 whitespace-pre-wrap break-all">{fmt(job.errors)}</pre>
     </div>
   {/if}
 </div>

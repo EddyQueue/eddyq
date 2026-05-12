@@ -3,7 +3,6 @@
   import { cancelJob, listJobs } from '../lib/api.js';
   import Badge from '../lib/components/Badge.svelte';
   import JobDetail from '../lib/components/JobDetail.svelte';
-  import Pagination from '../lib/components/Pagination.svelte';
   import type { JobRow } from '../lib/types.js';
 
   const STATES = ['', 'pending', 'running', 'completed', 'failed', 'scheduled', 'cancelled'];
@@ -11,14 +10,21 @@
 
   let jobs: JobRow[] = [];
   let total = 0;
-  let page = 1;
   let error = '';
   let cancelling = 0;
   let expanded: number | null = null;
   // Auto-expand detail rows when viewing a single state that has errors (e.g. failed).
   $: autoExpand = filters.state === 'failed';
 
-  // Filters — read initial values from hash query string
+  // Keyset cursor stack. Top of stack is the current page's `beforeCreatedAt`
+  // (null = first page, newest jobs). "Older" pushes the oldest createdAt of
+  // the current page; "Newer" pops back. Auto-refresh keeps re-fetching the
+  // page at the current cursor so the top page stays live.
+  let cursors: (string | null)[] = [null];
+  $: cursor = cursors[cursors.length - 1];
+  $: atTop = cursors.length === 1;
+  $: hasMore = jobs.length === PAGE_SIZE;
+
   function parseHash() {
     const qs = window.location.hash.split('?')[1] ?? '';
     const p = new URLSearchParams(qs);
@@ -42,17 +48,18 @@
     if (filters.tag)      p.set('tag',      filters.tag);
     const qs = p.toString();
     window.location.hash = '#/jobs' + (qs ? '?' + qs : '');
-    page = 1;
+    cursors = [null];
     load();
   }
 
   async function load() {
-    const params: Record<string, string> = { page: String(page) };
+    const params: Record<string, string> = {};
     if (filters.queue)    params.queue    = filters.queue;
     if (filters.state)    params.state    = filters.state;
     if (filters.kind)     params.kind     = filters.kind;
     if (filters.groupKey) params.groupKey = filters.groupKey;
     if (filters.tag)      params.tag      = filters.tag;
+    if (cursor)           params.before   = cursor;
     try {
       const result = await listJobs(params);
       jobs = result.rows;
@@ -61,6 +68,24 @@
     } catch (e) {
       error = (e as Error).message;
     }
+  }
+
+  function older() {
+    if (jobs.length === 0) return;
+    const oldest = jobs[jobs.length - 1].createdAt;
+    cursors = [...cursors, oldest];
+    load();
+  }
+
+  function newer() {
+    if (cursors.length <= 1) return;
+    cursors = cursors.slice(0, -1);
+    load();
+  }
+
+  function newest() {
+    cursors = [null];
+    load();
   }
 
   async function doCancel(id: number) {
@@ -193,5 +218,26 @@
     </table>
   </div>
 
-  <Pagination {page} {total} pageSize={PAGE_SIZE} onPage={(p) => { page = p; load(); }} />
+  <div class="flex items-center justify-between text-xs text-gray-500">
+    <span class="tabular-nums">
+      {total.toLocaleString()} matching{atTop ? '' : ` · page ${cursors.length}`}
+    </span>
+    <div class="flex items-center gap-2">
+      <button
+        class="px-3 py-1 rounded border border-gray-700 text-gray-300 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent"
+        disabled={atTop}
+        on:click={newest}
+      >Newest</button>
+      <button
+        class="px-3 py-1 rounded border border-gray-700 text-gray-300 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent"
+        disabled={atTop}
+        on:click={newer}
+      >← Newer</button>
+      <button
+        class="px-3 py-1 rounded border border-gray-700 text-gray-300 hover:bg-gray-800 disabled:opacity-30 disabled:hover:bg-transparent"
+        disabled={!hasMore}
+        on:click={older}
+      >Older →</button>
+    </div>
+  </div>
 </div>

@@ -345,6 +345,12 @@ pub struct ListJobsFilter {
     pub group_key: Option<String>,
     pub tag: Option<String>,
     pub id: Option<i64>,
+    /// Keyset cursor for newest-first pagination. ISO-8601 timestamp string;
+    /// only jobs with `createdAt` strictly less than this are returned. Pair
+    /// with `Pagination.limit` (and `offset: 0`) to scroll through pages
+    /// without offset drift from concurrent inserts. Useful when stitching
+    /// `listJobsFor` results from both backends — one cursor, one merge.
+    pub before_created_at: Option<String>,
 }
 
 /// Pagination options for `listJobs`. Defaults: limit=50, offset=0. Limit caps at 500.
@@ -1660,6 +1666,7 @@ async fn do_list_jobs(
         group_key: None,
         tag: None,
         id: None,
+        before_created_at: None,
     });
     let state = match filter.state.as_deref() {
         None => None,
@@ -1672,6 +1679,10 @@ async fn do_list_jobs(
         group_key: filter.group_key,
         tag: filter.tag,
         id: filter.id,
+        before_created_at: filter
+            .before_created_at
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc)),
     };
     let core_pag = match pagination {
         Some(p) => eddyq_client::Pagination {
@@ -3145,6 +3156,22 @@ impl EddyqApp {
         }
     }
 
+    /// Per-backend `listJobs`. Same shape as the routed `listJobs` — just
+    /// scoped to one backend so a dashboard can fetch each half and stitch
+    /// results UI-side (sort by `createdAt`, sum the totals).
+    #[napi]
+    pub async fn list_jobs_for(
+        &self,
+        provider: String,
+        filter: Option<ListJobsFilter>,
+        pagination: Option<Pagination>,
+    ) -> Result<JobList> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.list_jobs(filter, pagination).await,
+            BackendKind::Redis => self.redis_ref()?.list_jobs(filter, pagination).await,
+        }
+    }
+
     // --- Admin: named queues ----------------------------------------------
 
     #[napi]
@@ -3377,6 +3404,10 @@ fn napi_filter_to_core(f: ListJobsFilter) -> eddyq_core::stats::ListJobsFilter {
         group_key: f.group_key,
         tag: f.tag,
         id: f.id,
+        before_created_at: f
+            .before_created_at
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc)),
     }
 }
 
