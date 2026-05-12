@@ -1715,7 +1715,14 @@ local function fn_backfill_nq_states(keys, args)
       local queue = redis.call('HGET', jobkey(prefix, id), 'queue')
       if queue and queue ~= '' then
         local added = redis.call('ZADD', src[2](prefix, queue), 'NX', score, id)
-        if added == 1 then inserted = inserted + 1 end
+        if added == 1 then
+          inserted = inserted + 1
+          -- Mark the queue as seen so `fn_get_stats` enumerates it.
+          -- Without this, a queue whose only state is `completed`/`failed`
+          -- (no live pending or running jobs) would never appear in the
+          -- dashboard, leaving its mirrored counts invisible.
+          redis.call('SADD', queueseenkey(prefix), queue)
+        end
       end
     end
   end
