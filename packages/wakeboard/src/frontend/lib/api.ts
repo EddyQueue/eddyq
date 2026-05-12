@@ -1,8 +1,6 @@
-declare global {
-  interface Window { __EDDYQ_API_BASE__: string }
-}
-
-const base = (): string => window.__EDDYQ_API_BASE__ ?? '/wakeboard';
+// Derive the API base from the document's <base href> so the SPA works at any
+// mount path without an inline bootstrap script (which CSPs commonly block).
+const base = (): string => new URL(document.baseURI).pathname.replace(/\/$/, '');
 
 async function req<T>(path: string, method = 'GET'): Promise<T> {
   const res = await fetch(`${base()}${path}`, { method });
