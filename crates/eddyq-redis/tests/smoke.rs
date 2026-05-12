@@ -884,6 +884,213 @@ async fn stats_and_list_jobs_round_trip() {
     flush_line(&url, &line).await;
 }
 
+/// Per-queue stats attribution: completed/failed/cancelled jobs land in
+/// `nq:<q>:<state>` mirror ZSETs and surface under their queue in
+/// `get_stats`, not under the legacy `_global` bucket. Regression guard
+/// for the wakeboard dashboard showing every Redis completion as
+/// `_global` because the global ZSETs weren't queue-partitioned.
+#[tokio::test]
+async fn stats_partition_completed_per_queue() {
+    use eddyq_core::enqueue::EnqueueOptions;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("statspq");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    // Workers default to subscribing only to `default`; subscribe to the
+    // two named queues so they actually get drained.
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.to_owned(),
+        line: line.to_owned(),
+    })
+    .await
+    .expect("redis backend connect");
+    let queue: Queue<RedisBackend> = QueueBuilder::with_backend(backend)
+        .register::<Count, _>(CountWorker {
+            counter: counter.clone(),
+        })
+        .config(fast_config())
+        .line(line.to_owned())
+        .subscribe_to(["alpha".to_owned(), "beta".to_owned()])
+        .build();
+
+    // 3 jobs on queue "alpha", 2 on queue "beta".
+    for _ in 0..3 {
+        queue
+            .enqueue_with(
+                &Count { n: 1 },
+                EnqueueOptions {
+                    queue: Some("alpha".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        queue
+            .enqueue_with(
+                &Count { n: 1 },
+                EnqueueOptions {
+                    queue: Some("beta".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while counter.load(Ordering::SeqCst) < 5 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("five jobs drain in 3s");
+    queue.shutdown().await.unwrap();
+
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.clone(),
+        line: line.clone(),
+    })
+    .await
+    .unwrap();
+    let admin: Queue<RedisBackend> = QueueBuilder::with_backend(backend)
+        .config(fast_config())
+        .line(line.clone())
+        .build();
+    let stats = admin.get_stats().await.unwrap();
+
+    let find_completed = |q: &str| -> i64 {
+        stats
+            .by_queue_state
+            .iter()
+            .find(|s| s.queue == q && matches!(s.state, eddyq_core::JobState::Completed))
+            .map(|s| s.count)
+            .unwrap_or(0)
+    };
+    assert_eq!(find_completed("alpha"), 3, "alpha completed count");
+    assert_eq!(find_completed("beta"), 2, "beta completed count");
+    // No `_global` row should appear once every completed job has been
+    // mirrored into its per-queue ZSET (the remainder calc nets to zero).
+    let global = find_completed("_global");
+    assert_eq!(global, 0, "no _global remainder after per-queue mirroring");
+
+    flush_line(&url, &line).await;
+}
+
+/// Backfill function attributes legacy global-ZSET entries to per-queue
+/// mirrors. Simulates the "upgraded from old library" path: we hand-write
+/// rows into `:completed` *without* mirroring (bypassing fn_complete),
+/// then invoke `eddyq_backfill_nq_states` and assert the mirrors fill in
+/// and `_global` empties.
+#[tokio::test]
+async fn backfill_attributes_legacy_global_entries() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("backfill");
+    flush_line(&url, &line).await;
+
+    // Connect once so the library is loaded.
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.clone(),
+        line: line.clone(),
+    })
+    .await
+    .unwrap();
+
+    // Hand-write three legacy completed jobs (job hash + global ZSET only,
+    // no per-queue mirror) to simulate state from before this upgrade.
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = format!("{{{}}}", line);
+    let global_completed = format!("{}:completed", prefix);
+    for (id, q) in [(1001i64, "alpha"), (1002, "alpha"), (1003, "beta")] {
+        let _: () = redis::cmd("HSET")
+            .arg(format!("{}:job:{}", prefix, id))
+            .arg("queue")
+            .arg(q)
+            .arg("state")
+            .arg("completed")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("ZADD")
+            .arg(&global_completed)
+            .arg(1_700_000_000_000i64)
+            .arg(id)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // Before backfill: `_global` carries the three entries.
+    let admin: Queue<RedisBackend> = QueueBuilder::with_backend(backend)
+        .config(fast_config())
+        .line(line.clone())
+        .build();
+    let pre = admin.get_stats().await.unwrap();
+    let pre_global = pre
+        .by_queue_state
+        .iter()
+        .find(|s| s.queue == "_global" && matches!(s.state, eddyq_core::JobState::Completed))
+        .map(|s| s.count)
+        .unwrap_or(0);
+    assert_eq!(
+        pre_global, 3,
+        "legacy entries surface as _global before backfill"
+    );
+
+    // Run backfill.
+    let inserted: redis::Value = redis::cmd("FCALL")
+        .arg("eddyq_backfill_nq_states")
+        .arg(1)
+        .arg(&prefix)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let n = match inserted {
+        redis::Value::Int(i) => i,
+        _ => panic!("expected int reply, got {:?}", inserted),
+    };
+    assert_eq!(n, 3, "backfill mirrors three entries");
+
+    // After backfill: per-queue counts populated, `_global` is zero.
+    let post = admin.get_stats().await.unwrap();
+    let find_q = |q: &str| -> i64 {
+        post.by_queue_state
+            .iter()
+            .find(|s| s.queue == q && matches!(s.state, eddyq_core::JobState::Completed))
+            .map(|s| s.count)
+            .unwrap_or(0)
+    };
+    assert_eq!(find_q("alpha"), 2, "alpha attribution after backfill");
+    assert_eq!(find_q("beta"), 1, "beta attribution after backfill");
+    assert_eq!(find_q("_global"), 0, "no _global remainder after backfill");
+
+    // Idempotent: second backfill call inserts nothing.
+    let again: redis::Value = redis::cmd("FCALL")
+        .arg("eddyq_backfill_nq_states")
+        .arg(1)
+        .arg(&prefix)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let n2 = match again {
+        redis::Value::Int(i) => i,
+        _ => -1,
+    };
+    assert_eq!(n2, 0, "backfill is idempotent");
+
+    flush_line(&url, &line).await;
+}
+
 #[tokio::test]
 async fn group_list_round_trips() {
     let Some(url) = redis_url() else {
