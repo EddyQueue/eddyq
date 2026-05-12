@@ -27,9 +27,7 @@ export class WakeboardControllerBase {
     const htmlPath = join(DIST_PUBLIC, 'index.html');
     if (existsSync(htmlPath)) {
       const raw = readFileSync(htmlPath, 'utf-8');
-      this.indexHtml = raw
-        .replace('__WAKEBOARD_BASE__', `${mountPath}/`)
-        .replace("'__EDDYQ_API_BASE__'", `'${mountPath}'`);
+      this.indexHtml = raw.replace('__WAKEBOARD_BASE__', `${mountPath}/`);
     }
   }
 
