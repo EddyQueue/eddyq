@@ -16,15 +16,6 @@ const DB_URL =
 const SCENARIO = process.argv[2];
 const KIND = `shutdown-smoke.${SCENARIO}.${Date.now()}`;
 
-async function waitFor(predicate, timeoutMs) {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    if (await predicate()) return;
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`waitFor timeout after ${timeoutMs}ms`);
-}
-
 async function connectAndClose() {
   const q = await Eddyq.connect(DB_URL, { maxConnections: 2 });
   await q.close();
@@ -48,8 +39,19 @@ async function fullLifecycle() {
 // AbortSignal flips. Real handlers should look like this. Returns once
 // the signal aborts, which lets Node's event loop drain naturally after
 // queue.shutdown / close.
+//
+// Returns `{ handler, entered }` where `entered` resolves the first time
+// the handler is invoked. This is a deterministic "job is in-flight"
+// signal — by the time the JS handler body runs, the worker has already
+// claimed the row (state=running) AND inserted into the in_flight set,
+// so callers can replace DB-polling preconditions with `await entered`.
 function makeSlowCooperative() {
-  return async ({ signal }) => {
+  let onEntered;
+  const entered = new Promise((r) => {
+    onEntered = r;
+  });
+  const handler = async ({ signal }) => {
+    onEntered();
     await new Promise((resolve) => {
       const t = setTimeout(resolve, 30_000);
       signal.addEventListener("abort", () => {
@@ -58,6 +60,7 @@ function makeSlowCooperative() {
       });
     });
   };
+  return { handler, entered };
 }
 
 async function forceShutdown() {
@@ -65,24 +68,14 @@ async function forceShutdown() {
   try {
     await q.migrate();
   } catch {}
-  await q.work(KIND, makeSlowCooperative());
+  const { handler, entered } = makeSlowCooperative();
+  await q.work(KIND, handler);
   await q.enqueue(KIND, {}, { uniqueKey: `force-${Date.now()}` });
   await q.start();
-  // Wait long enough for the worker to claim the job AND for the in_flight
-  // set to register it. Default fetch_poll_interval is 1s; LISTEN/NOTIFY
-  // usually wakes the fetcher faster, but give a comfortable margin so the
-  // test isn't timing-sensitive in CI.
-  await waitFor(async () => {
-    const { default: pg } = await import("pg");
-    const c = new pg.Client({ connectionString: DB_URL });
-    await c.connect();
-    const { rows } = await c.query(
-      "SELECT state FROM eddyq_jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1",
-      [KIND],
-    );
-    await c.end();
-    return rows[0]?.state === "running";
-  }, 10000);
+  // Deterministic wait: the handler resolves `entered` on first invocation,
+  // which guarantees the worker has both transitioned the row to `running`
+  // and registered it in the in_flight set.
+  await entered;
 
   const t = Date.now();
   await q.shutdown({ mode: "force" });
@@ -117,24 +110,14 @@ async function abandonShutdown() {
   try {
     await q.migrate();
   } catch {}
-  await q.work(KIND, makeSlowCooperative());
+  const { handler, entered } = makeSlowCooperative();
+  await q.work(KIND, handler);
   await q.enqueue(KIND, {}, { uniqueKey: `abandon-${Date.now()}` });
   await q.start();
-  // Wait long enough for the worker to claim the job AND for the in_flight
-  // set to register it. Default fetch_poll_interval is 1s; LISTEN/NOTIFY
-  // usually wakes the fetcher faster, but give a comfortable margin so the
-  // test isn't timing-sensitive in CI.
-  await waitFor(async () => {
-    const { default: pg } = await import("pg");
-    const c = new pg.Client({ connectionString: DB_URL });
-    await c.connect();
-    const { rows } = await c.query(
-      "SELECT state FROM eddyq_jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1",
-      [KIND],
-    );
-    await c.end();
-    return rows[0]?.state === "running";
-  }, 10000);
+  // Deterministic wait: the handler resolves `entered` on first invocation,
+  // which guarantees the worker has both transitioned the row to `running`
+  // and registered it in the in_flight set.
+  await entered;
 
   const t = Date.now();
   await q.shutdown({ mode: "abandon" });
