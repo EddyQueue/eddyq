@@ -22,33 +22,39 @@
   // timed-out — but jobs can flow through any queue name, so the tab needs
   // to surface those implicit queues too. Pause/Resume on an implicit row
   // works as-is: the backend inserts the row on first write.
-  $: allQueues = ((): QueueRow[] => {
-    const configured = new Set(queues.map((q) => q.name));
-    const implicit: QueueRow[] = Object.keys(byQueue)
-      .filter((name) => !configured.has(name))
-      .sort((a, b) => a.name.localeCompare(b.name))
-      .map((name) => ({
-        name,
-        runningCount: byQueue[name]?.running ?? 0,
-        maxConcurrency: 0,
-        paused: false,
-        defaultTimeoutMs: undefined,
-        createdAt: '',
-        updatedAt: '',
-        implicit: true,
-      }));
-    return [...queues, ...implicit];
-  })();
+  $: configuredNames = new Set(queues.map((q) => q.name));
+  $: implicitQueues = Object.keys(byQueue)
+    .filter((name) => !configuredNames.has(name))
+    .sort((a, b) => a.localeCompare(b))
+    .map((name): QueueRow => ({
+      name,
+      runningCount: byQueue[name]?.running ?? 0,
+      maxConcurrency: 0,
+      paused: false,
+      defaultTimeoutMs: undefined,
+      createdAt: '',
+      updatedAt: '',
+      implicit: true,
+    }));
+  $: allQueues = [...queues, ...implicitQueues];
 
   async function load() {
-    try {
-      const [nqs, stats] = await Promise.all([listQueues(), getStats()]);
-      queues = nqs;
-      statRows = stats.byQueueState;
-      error = '';
-    } catch (e) {
-      error = (e as Error).message;
+    // Load stats and configured queues independently. If `listQueues` fails
+    // (e.g. a Redis backend with an older function library missing
+    // `eddyq_queue_list`), we still want the stats-driven implicit-queue
+    // rows to surface — otherwise the tab looks empty even though the
+    // Overview shows active queues.
+    const [statsRes, queuesRes] = await Promise.allSettled([getStats(), listQueues()]);
+    if (statsRes.status === 'fulfilled') {
+      statRows = statsRes.value.byQueueState;
     }
+    if (queuesRes.status === 'fulfilled') {
+      queues = queuesRes.value;
+    }
+    const errs = [statsRes, queuesRes]
+      .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+      .map((r) => (r.reason as Error).message);
+    error = errs.join(' · ');
   }
 
   async function toggle(q: QueueRow) {

@@ -42,6 +42,15 @@ local function grouprulekey(prefix)      return prefix .. ":group_rules"      en
 local function nqmetakey(prefix, q)      return prefix .. ":nq:"      .. q .. ":meta"    end
 local function nqrunkey(prefix, q)       return prefix .. ":nq:"      .. q .. ":running" end
 local function nqsetkey(prefix)          return prefix .. ":nqs"              end
+-- Per-queue mirrors of the global state ZSETs. Maintained alongside the
+-- global ZSETs (`:completed`, `:failed`, `:delayed`, `:cancelled`) so
+-- dashboards can render correct per-queue counts. The global ZSETs remain
+-- the source of truth for cross-queue `list_jobs` queries; the per-queue
+-- mirrors exist for stats and per-queue listings.
+local function nqcompletedkey(prefix, q) return prefix .. ":nq:"      .. q .. ":completed" end
+local function nqfailedkey(prefix, q)    return prefix .. ":nq:"      .. q .. ":failed"    end
+local function nqscheduledkey(prefix, q) return prefix .. ":nq:"      .. q .. ":scheduled" end
+local function nqcancelledkey(prefix, q) return prefix .. ":nq:"      .. q .. ":cancelled" end
 local function schedulekey(prefix)       return prefix .. ":schedules"        end
 local function scheduleidxkey(prefix)    return prefix .. ":schedules:idx"    end
 local function schedulenextkey(prefix)   return prefix .. ":schedules:next"   end
@@ -325,6 +334,7 @@ local function fn_enqueue(keys, args)
     redis.call('PUBLISH', wakeupchan(prefix), tostring(id))
   else
     redis.call('ZADD', delayedkey(prefix), effective_scheduled, id)
+    redis.call('ZADD', nqscheduledkey(prefix, queue), effective_scheduled, id)
   end
 
   return { 'inserted', tostring(id) }
@@ -544,37 +554,51 @@ end
 --   "{\"age\":S}"          -- age secs => prune older than (now - age)
 --   "{\"age\":S,\"count\":N}" -- both
 --
--- Returns true if the job HASH should be deleted (rule == drop).
-local function apply_retention(prefix, id, zsetkey, rule_json, now_ms)
-  if rule_json == nil or rule_json == '' then
+-- Returns true if the job HASH should be deleted (rule == drop). `nqkey`
+-- is the per-queue mirror ZSET (`nq:<q>:completed` etc.); when set, every
+-- ZADD/ZREM/prune operation on `zsetkey` is mirrored to it so dashboards
+-- can render per-queue counts. `nqkey` may be nil for code paths that
+-- don't know the queue (shouldn't happen today — kept tolerant).
+local function apply_retention(prefix, id, zsetkey, nqkey, rule_json, now_ms)
+  local function add_both()
     redis.call('ZADD', zsetkey, now_ms, id)
-    return false
+    if nqkey then redis.call('ZADD', nqkey, now_ms, id) end
+  end
+  if rule_json == nil or rule_json == '' then
+    add_both(); return false
   end
   local ok, rule = pcall(cjson.decode, rule_json)
   if not ok or rule == nil then
-    redis.call('ZADD', zsetkey, now_ms, id)
-    return false
+    add_both(); return false
   end
   -- Boolean shorthand
   if rule == true then
     return true
   end
   if rule == false then
-    redis.call('ZADD', zsetkey, now_ms, id)
-    return false
+    add_both(); return false
   end
   -- Object with age/count
-  redis.call('ZADD', zsetkey, now_ms, id)
+  add_both()
   if rule.age and tonumber(rule.age) then
     local cutoff = now_ms - (tonumber(rule.age) * 1000)
     redis.call('ZREMRANGEBYSCORE', zsetkey, '-inf', '(' .. cutoff)
+    if nqkey then redis.call('ZREMRANGEBYSCORE', nqkey, '-inf', '(' .. cutoff) end
   end
   if rule.count and tonumber(rule.count) then
-    -- Keep newest N: drop everything except the top-N highest scores.
+    -- Keep newest N. Pruned independently per ZSET — global count keeps
+    -- newest N across all queues; per-queue keeps newest N within the
+    -- queue. Both are valid views, just scoped differently.
     local keep = tonumber(rule.count)
     local total = redis.call('ZCARD', zsetkey)
     if total > keep then
       redis.call('ZREMRANGEBYRANK', zsetkey, 0, total - keep - 1)
+    end
+    if nqkey then
+      local ntotal = redis.call('ZCARD', nqkey)
+      if ntotal > keep then
+        redis.call('ZREMRANGEBYRANK', nqkey, 0, ntotal - keep - 1)
+      end
     end
   end
   return false
@@ -641,9 +665,11 @@ local function fn_complete(keys, args)
     'result',       (result == '' and '' or result))
 
   local rule = redis.call('HGET', jobkey(prefix, id), 'remove_on_complete')
-  local should_drop = apply_retention(prefix, id, completedkey(prefix), rule, now_ms)
+  local nqck = (jqueue and jqueue ~= '') and nqcompletedkey(prefix, jqueue) or nil
+  local should_drop = apply_retention(prefix, id, completedkey(prefix), nqck, rule, now_ms)
   if should_drop then
     redis.call('ZREM', completedkey(prefix), id)
+    if nqck then redis.call('ZREM', nqck, id) end
     delete_job(prefix, id)
   end
   return 1
@@ -698,6 +724,9 @@ local function fn_fail(keys, args)
         'state', 'scheduled', 'failed_at', now_ms,
         'scheduled_at', retry_at_ms)
       redis.call('ZADD', delayedkey(prefix), retry_at_ms, id)
+      if queue and queue ~= '' then
+        redis.call('ZADD', nqscheduledkey(prefix, queue), retry_at_ms, id)
+      end
     end
     return { 'scheduled', tostring(attempt) }
   end
@@ -705,9 +734,11 @@ local function fn_fail(keys, args)
   -- Permanent failure / DLQ
   redis.call('HSET', jobkey(prefix, id),
     'state', 'failed', 'failed_at', now_ms)
-  local should_drop = apply_retention(prefix, id, failedkey(prefix), rule, now_ms)
+  local nqfk = (queue and queue ~= '') and nqfailedkey(prefix, queue) or nil
+  local should_drop = apply_retention(prefix, id, failedkey(prefix), nqfk, rule, now_ms)
   if should_drop then
     redis.call('ZREM', failedkey(prefix), id)
+    if nqfk then redis.call('ZREM', nqfk, id) end
     delete_job(prefix, id)
   end
   return { 'failed', tostring(attempt) }
@@ -750,6 +781,9 @@ local function fn_sweep_stale(keys, args)
         'state', 'failed',
         'failed_at', stale_before_ms)
       redis.call('ZADD', failedkey(prefix), stale_before_ms, id)
+      if queue and queue ~= '' then
+        redis.call('ZADD', nqfailedkey(prefix, queue), stale_before_ms, id)
+      end
       push_error(prefix, id, '{"name":"StaleSweep","message":"worker died, no retries left"}')
     else
       -- Retry: back into wait. Reset the lease so the next claimer wins.
@@ -783,6 +817,9 @@ local function fn_promote_delayed(keys, args)
     local priority = tonumber(fields[1]) or 0
     local queue = fields[2]
     redis.call('ZREM', delayedkey(prefix), id)
+    if queue and queue ~= '' then
+      redis.call('ZREM', nqscheduledkey(prefix, queue), id)
+    end
     redis.call('HSET', jobkey(prefix, id), 'state', 'pending')
     redis.call('ZADD', waitkey(prefix, queue), wait_score(priority, now_ms), id)
     count = count + 1
@@ -848,6 +885,9 @@ local function fn_cancel(keys, args)
     redis.call('ZREM', waitkey(prefix, queue), id)
   elseif state == 'scheduled' then
     redis.call('ZREM', delayedkey(prefix), id)
+    if queue and queue ~= '' then
+      redis.call('ZREM', nqscheduledkey(prefix, queue), id)
+    end
   else
     -- Running / completed / failed / cancelled — soft-cancel of running
     -- happens in PR3 via cancel_requested HSET; for now we report 0.
@@ -856,6 +896,9 @@ local function fn_cancel(keys, args)
   redis.call('HSET', jobkey(prefix, id),
     'state', 'cancelled', 'cancelled_at', now_ms)
   redis.call('ZADD', cancelledkey(prefix), now_ms, id)
+  if queue and queue ~= '' then
+    redis.call('ZADD', nqcancelledkey(prefix, queue), now_ms, id)
+  end
   return 1
 end
 
@@ -1379,6 +1422,7 @@ local function fn_get_stats(keys, args)
   local prefix = keys[1]
   local out = {}
   local queues = redis.call('SMEMBERS', queueseenkey(prefix))
+  local accounted = {}  -- ids attributed to a per-queue mirror (drives _global remainder)
   for _, q in ipairs(queues) do
     local pending = redis.call('ZCARD', waitkey(prefix, q))
     if pending > 0 then
@@ -1388,10 +1432,25 @@ local function fn_get_stats(keys, args)
     if running > 0 then
       out[#out + 1] = q .. '|running|' .. tostring(running)
     end
+    local mirrors = {
+      { 'scheduled', nqscheduledkey(prefix, q) },
+      { 'completed', nqcompletedkey(prefix, q) },
+      { 'failed',    nqfailedkey   (prefix, q) },
+      { 'cancelled', nqcancelledkey(prefix, q) },
+    }
+    for _, m in ipairs(mirrors) do
+      local n = redis.call('ZCARD', m[2])
+      if n > 0 then
+        out[#out + 1] = q .. '|' .. m[1] .. '|' .. tostring(n)
+        if not accounted[m[1]] then accounted[m[1]] = 0 end
+        accounted[m[1]] = accounted[m[1]] + n
+      end
+    end
   end
-  -- Global ZSETs — surface under "_global" since we don't partition these
-  -- per queue yet. Dashboards that want per-queue completed/failed should
-  -- request a future partitioned variant.
+  -- Remainder: any global-ZSET entries not yet covered by the per-queue
+  -- mirrors get surfaced under `_global` so historical jobs (predating the
+  -- per-queue mirrors) still appear in totals. Once a backfill / new
+  -- terminal transitions catch up, this row goes to zero and disappears.
   local globals = {
     { 'scheduled', delayedkey(prefix) },
     { 'completed', completedkey(prefix) },
@@ -1399,9 +1458,11 @@ local function fn_get_stats(keys, args)
     { 'cancelled', cancelledkey(prefix) },
   }
   for _, g in ipairs(globals) do
-    local n = redis.call('ZCARD', g[2])
-    if n > 0 then
-      out[#out + 1] = '_global|' .. g[1] .. '|' .. tostring(n)
+    local total = redis.call('ZCARD', g[2])
+    local mirrored = accounted[g[1]] or 0
+    local remainder = total - mirrored
+    if remainder > 0 then
+      out[#out + 1] = '_global|' .. g[1] .. '|' .. tostring(remainder)
     end
   end
   return out
@@ -1566,7 +1627,7 @@ local function fn_cleanup(keys, args)
   -- + unique-key + error log), then ZREM from the finalized ZSET. Order:
   -- completed, failed, cancelled — matching the Retention struct slot order
   -- in Rust.
-  local function sweep(zsetkey, age_secs, count)
+  local function sweep(zsetkey, nq_key_fn, age_secs, count)
     if age_secs < 0 and count < 0 then return 0 end
     local victims = {}
     local seen = {}
@@ -1598,17 +1659,67 @@ local function fn_cleanup(keys, args)
       end
     end
     for _, id in ipairs(victims) do
+      -- Read queue before `delete_job` tears the HASH down — we need it
+      -- to drop the matching per-queue mirror ZSET entry.
+      local queue = redis.call('HGET', jobkey(prefix, id), 'queue')
       delete_job(prefix, id)
       redis.call('ZREM', zsetkey, id)
+      if queue and queue ~= '' then
+        redis.call('ZREM', nq_key_fn(prefix, queue), id)
+      end
     end
     return #victims
   end
 
-  local n_c = sweep(completedkey(prefix), age_c, cnt_c)
-  local n_f = sweep(failedkey(prefix),    age_f, cnt_f)
-  local n_x = sweep(cancelledkey(prefix), age_x, cnt_x)
+  local n_c = sweep(completedkey(prefix), nqcompletedkey, age_c, cnt_c)
+  local n_f = sweep(failedkey(prefix),    nqfailedkey,    age_f, cnt_f)
+  local n_x = sweep(cancelledkey(prefix), nqcancelledkey, age_x, cnt_x)
 
   return { tostring(n_c), tostring(n_f), tostring(n_x), '0' }
+end
+
+-- ====================================================================
+-- eddyq_backfill_nq_states
+--
+-- One-shot migration: walk each global terminal-state ZSET and add any
+-- entries missing from the per-queue mirror ZSETs (`nq:<q>:completed`,
+-- etc.). Idempotent via `ZADD NX` — re-running re-scans but doesn't
+-- duplicate. Use after upgrading to per-queue mirrors so historical jobs
+-- get attributed to the right queue and stop showing as `_global`.
+--
+-- ARGV: batch_limit (optional, defaults to 5000) per source ZSET. The
+-- function returns the number of mirrors added; caller can invoke again
+-- if work remains (returned count == batch_limit on any source ⇒ more
+-- to do). For typical admin-job backlogs (<10k terminal entries) a
+-- single call suffices.
+--
+-- Returns: total entries newly inserted into per-queue mirrors.
+-- ====================================================================
+local function fn_backfill_nq_states(keys, args)
+  local prefix      = keys[1]
+  local batch_limit = tonumber(args and args[1]) or 5000
+  if batch_limit <= 0 then batch_limit = 5000 end
+
+  local sources = {
+    { delayedkey(prefix),   nqscheduledkey },
+    { completedkey(prefix), nqcompletedkey },
+    { failedkey(prefix),    nqfailedkey    },
+    { cancelledkey(prefix), nqcancelledkey },
+  }
+  local inserted = 0
+  for _, src in ipairs(sources) do
+    local entries = redis.call('ZRANGE', src[1], 0, batch_limit - 1, 'WITHSCORES')
+    for i = 1, #entries, 2 do
+      local id = entries[i]
+      local score = entries[i + 1]
+      local queue = redis.call('HGET', jobkey(prefix, id), 'queue')
+      if queue and queue ~= '' then
+        local added = redis.call('ZADD', src[2](prefix, queue), 'NX', score, id)
+        if added == 1 then inserted = inserted + 1 end
+      end
+    end
+  end
+  return inserted
 end
 
 -- ====================================================================
@@ -1650,3 +1761,4 @@ redis.register_function('eddyq_group_set_rule',        fn_group_set_rule)
 redis.register_function('eddyq_group_remove_rule',     fn_group_remove_rule)
 redis.register_function('eddyq_group_list_rules',      fn_group_list_rules)
 redis.register_function('eddyq_cleanup',               fn_cleanup)
+redis.register_function('eddyq_backfill_nq_states',    fn_backfill_nq_states)

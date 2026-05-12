@@ -30,13 +30,15 @@ pub fn source_sha() -> String {
 
 /// Make sure the library is loaded and matches our embedded source. Safe to
 /// call on every connection — short-circuits when the library is already
-/// loaded with the right code.
-pub async fn ensure_loaded(conn: &mut ConnectionManager) -> Result<(), Error> {
+/// loaded with the right code. Returns `true` if a fresh load happened, so
+/// the caller can fire one-shot migrations (e.g. backfill of newly-added
+/// state ZSETs) that only need to run on actual library upgrades.
+pub async fn ensure_loaded(conn: &mut ConnectionManager) -> Result<bool, Error> {
     if library_matches(conn).await? {
-        return Ok(());
+        return Ok(false);
     }
     load_replace(conn).await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn library_matches(conn: &mut ConnectionManager) -> Result<bool, Error> {
@@ -94,7 +96,7 @@ where
         Ok(v) => Ok(v),
         Err(err) => {
             if is_no_function_err(&err) {
-                ensure_loaded(conn).await?;
+                let _ = ensure_loaded(conn).await?;
                 f(conn.clone()).await.map_err(Into::into)
             } else {
                 Err(err.into())
@@ -116,7 +118,7 @@ fn is_no_function_err(err: &redis::RedisError) -> bool {
 /// `with_retry` handle them on the first FCALL.
 #[allow(dead_code)]
 pub async fn warm_up(conn: &mut ConnectionManager) {
-    let _ = ensure_loaded(conn).await;
+    let _ = ensure_loaded(conn).await.ok();
 }
 
 // Quick sanity: source SHA round-trips.
