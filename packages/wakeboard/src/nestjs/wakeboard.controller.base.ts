@@ -159,3 +159,15 @@ export class WakeboardControllerBase {
     }
   }
 }
+
+// Hide wakeboard routes from any `@nestjs/swagger`-generated OpenAPI doc the
+// host app builds. The SPA catch-all (`@Get('*')`) and `:param` paths trip up
+// codegen tools like orval that consume the spec, and there is no useful
+// schema to publish for an admin UI mount. Setting the metadata key directly
+// avoids adding `@nestjs/swagger` as a dependency — if Swagger is not in use,
+// this key is simply ignored.
+Reflect.defineMetadata(
+  'swagger/apiExcludeController',
+  [{ disable: true }],
+  WakeboardControllerBase,
+);
