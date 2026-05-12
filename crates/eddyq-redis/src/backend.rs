@@ -70,8 +70,27 @@ impl RedisBackend {
     pub async fn connect(config: RedisConfig) -> Result<Self, crate::Error> {
         let client = redis::Client::open(config.url.as_str())?;
         let mut conn = ConnectionManager::new(client).await?;
-        ensure_loaded(&mut conn).await?;
+        let upgraded = ensure_loaded(&mut conn).await?;
         let prefix = keys::prefix(&config.line);
+        // On a fresh library load (first deploy or an upgrade), backfill
+        // historical terminal-state entries from the global ZSETs into the
+        // per-queue mirror ZSETs so dashboard stats are correct
+        // immediately. Idempotent via ZADD NX — concurrent peers won't
+        // double-insert. Best-effort: any failure is logged and ignored
+        // since the global ZSETs remain authoritative for `list_jobs`.
+        if upgraded {
+            let mut c = conn.clone();
+            let p = prefix.clone();
+            if let Err(err) = redis::cmd("FCALL")
+                .arg(crate::functions::FN_BACKFILL_NQ_STATES)
+                .arg(1)
+                .arg(&p)
+                .query_async::<redis::Value>(&mut c)
+                .await
+            {
+                warn!(?err, "eddyq backfill_nq_states failed (non-fatal)");
+            }
+        }
         Ok(Self {
             conn,
             line: config.line,
