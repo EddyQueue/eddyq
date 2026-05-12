@@ -1,6 +1,6 @@
 import { Controller, Get, Inject, Param, Post, Query, Res } from '@nestjs/common';
 import type { Response } from 'express';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WAKEBOARD_OPTIONS } from './wakeboard.constants.js';
@@ -121,22 +121,33 @@ export class WakeboardControllerBase {
     return this.service.removeSchedule(name, pickProvider(provider));
   }
 
-  // --- SPA serving (catch-all, must be last) ---
+  // --- SPA fallback (catch-all, must be last) ---
+  //
+  // Static assets are served outside this controller — see
+  // `EddyqWakeboardModule.onModuleInit`, which registers `@fastify/static`
+  // or `express.static` on the underlying HTTP adapter for the
+  // `${mountPath}/assets/` prefix. Anything that reaches *this* handler
+  // is either the dashboard root or a client-side Svelte route, so we
+  // always respond with `index.html`.
+  //
+  // The wildcard is plain `*` rather than a named param (`*path`) so the
+  // route registers on both adapters. The Express adapter routes through
+  // path-to-regexp v8 which auto-converts `*` via Nest's compatibility
+  // shim; the Fastify adapter routes through find-my-way which only
+  // understands bare `*` as a wildcard. Named-wildcard syntax (`*path`)
+  // breaks Fastify route registration silently.
 
   @Get()
   serveRoot(@Res() res: Response) {
-    return this.serveStatic('', res);
+    return this.sendIndex(res);
   }
 
-  @Get('*path')
-  serveStatic(@Param('path') path: string | string[], @Res() res: Response) {
-    // Serve built assets; fall back to index.html for client-side routes.
-    const resolved = Array.isArray(path) ? path.join('/') : path;
-    const filePath = join(DIST_PUBLIC, resolved);
-    if (resolved && existsSync(filePath) && statSync(filePath).isFile()) {
-      res.sendFile(filePath);
-      return;
-    }
+  @Get('*')
+  serveSpa(@Res() res: Response) {
+    return this.sendIndex(res);
+  }
+
+  private sendIndex(res: Response) {
     if (this.indexHtml) {
       res.type('html').send(this.indexHtml);
     } else {

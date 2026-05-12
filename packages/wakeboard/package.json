@@ -28,6 +28,7 @@
     "@eddyq/queue": "workspace:*"
   },
   "devDependencies": {
+    "@fastify/static": "^8.0.0",
     "@nestjs/common": "^11.0.0",
     "@nestjs/core": "^11.0.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
@@ -45,7 +46,18 @@
   "peerDependencies": {
     "@nestjs/common": ">=10",
     "@nestjs/core": ">=10",
-    "express": ">=4"
+    "@nestjs/platform-express": ">=10",
+    "@nestjs/platform-fastify": ">=10",
+    "@fastify/static": ">=8",
+    "express": ">=4",
+    "fastify": ">=4"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/platform-express": { "optional": true },
+    "@nestjs/platform-fastify": { "optional": true },
+    "@fastify/static": { "optional": true },
+    "express": { "optional": true },
+    "fastify": { "optional": true }
   },
   "engines": {
     "node": ">=20"

@@ -1,5 +1,6 @@
 import { Eddyq, EddyqApp, EddyqRedis } from "@eddyq/queue";
 import {
+  type BeforeApplicationShutdown,
   type DynamicModule,
   Global,
   Inject,
@@ -48,12 +49,25 @@ function isApp(queue: EddyqInstance): queue is EddyqApp {
  * `@Processor()` + `@JobHandler(kind)` annotations at bootstrap, registers
  * each handler with `queue.work()`, and starts the worker runtime.
  *
- * On `onApplicationShutdown`, gracefully stops the worker runtime and closes
- * the Postgres pool.
+ * Shutdown is split across two hooks so in-flight handlers can finish
+ * cleanly even when they depend on resources owned by other modules
+ * (Drizzle, ioredis, etc.):
+ *
+ *   1. `beforeApplicationShutdown` — drain the worker runtime. User
+ *      modules have not yet torn down their pools, so handler code can
+ *      still complete DB writes, cache reads, etc.
+ *   2. `onModuleDestroy` (per user module) — user-owned pools close here.
+ *   3. `onApplicationShutdown` — release the eddyq Postgres pool. Runs
+ *      last; nothing else in the app needs it by this point.
  */
 @Global()
 @Module({})
-export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdown {
+export class EddyqModule
+  implements
+    OnApplicationBootstrap,
+    BeforeApplicationShutdown,
+    OnApplicationShutdown
+{
   private static readonly logger = new Logger(EddyqModule.name);
   private started = false;
 
@@ -291,10 +305,31 @@ export class EddyqModule implements OnApplicationBootstrap, OnApplicationShutdow
     EddyqModule.logger.log("worker runtime started");
   }
 
-  async onApplicationShutdown(signal?: string): Promise<void> {
+  // Drain runs in the *before* phase so user-owned resources (Drizzle,
+  // ioredis, etc.) are still open while in-flight handlers finish. Nest
+  // fires `onModuleDestroy` next, which is where those pools tear down.
+  async beforeApplicationShutdown(signal?: string): Promise<void> {
+    if (!this.started) return;
     const reason = signal ? `signal ${signal}` : "shutdown";
+    EddyqModule.logger.log(`stopping worker runtime (${reason})`);
+    try {
+      await this.queue.shutdown({
+        mode: this.options.shutdownMode ?? "drain",
+        gracefulTimeoutMs: this.options.gracefulShutdownMs ?? 30_000,
+      });
+    } catch (e) {
+      EddyqModule.logger.error(
+        `worker shutdown failed: ${(e as Error).message}`,
+      );
+    }
+    this.started = false;
+  }
+
+  async onApplicationShutdown(): Promise<void> {
+    // Fallback: if Nest skipped `beforeApplicationShutdown` (e.g. user
+    // never called `app.enableShutdownHooks()` before forcing close via
+    // `app.close()`), drain here so we still cleanly release work.
     if (this.started) {
-      EddyqModule.logger.log(`stopping worker runtime (${reason})`);
       try {
         await this.queue.shutdown({
           mode: this.options.shutdownMode ?? "drain",

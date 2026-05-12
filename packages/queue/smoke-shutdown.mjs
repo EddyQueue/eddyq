@@ -25,7 +25,12 @@ const SCENARIOS = [
   { name: "connect+enqueue+close (no worker)", arg: "enqueue-only" },
 ];
 
-const EXIT_BUDGET_MS = 5000;
+// Total budget per scenario, from spawn → exit. Includes sqlx connect, LISTEN
+// setup, napi load, the actual workflow, and the inner shutdown assertion.
+// Generous on purpose — the strict regression catch is each scenario's own
+// internal timing assertion (e.g. abandon shutdown must complete in <2s).
+// This parent budget exists to detect a *hang*, not to gate latency.
+const EXIT_BUDGET_MS = 15000;
 
 let failed = 0;
 for (const s of SCENARIOS) {
