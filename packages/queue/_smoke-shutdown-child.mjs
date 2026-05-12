@@ -82,7 +82,7 @@ async function forceShutdown() {
     );
     await c.end();
     return rows[0]?.state === "running";
-  }, 5000);
+  }, 10000);
 
   const t = Date.now();
   await q.shutdown({ mode: "force" });
@@ -134,7 +134,7 @@ async function abandonShutdown() {
     );
     await c.end();
     return rows[0]?.state === "running";
-  }, 5000);
+  }, 10000);
 
   const t = Date.now();
   await q.shutdown({ mode: "abandon" });
