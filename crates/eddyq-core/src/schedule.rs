@@ -126,11 +126,10 @@ pub async fn upsert_schedule_raw(
     Ok(())
 }
 
-/// Upsert an interval-driven schedule. Fires every `interval_ms` (matches
-/// BullMQ's `upsertJobScheduler(id, { every })` and the Redis backend's
-/// existing inherent method). `interval_ms` must be positive. Skip-missed
-/// semantics: a delayed fire doesn't catch up — the next `next_run_at` is
-/// always `now + interval_ms` from the firing tick.
+/// Upsert an interval-driven schedule. Fires every `interval_ms` (mirrors
+/// the Redis backend's existing inherent method). `interval_ms` must be
+/// positive. Skip-missed semantics: a delayed fire doesn't catch up — the
+/// next `next_run_at` is always `now + interval_ms` from the firing tick.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_interval_schedule_raw(
     pool: &PgPool,

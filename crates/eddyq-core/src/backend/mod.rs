@@ -49,15 +49,15 @@ pub struct BackendCaps {
     pub fast_wakeup: bool,
     /// Soft-cancel of in-flight jobs is supported.
     pub cancel_running: bool,
-    /// Inclusive priority range. Postgres `i16`. BullMQ `(1, 2_097_152)`.
+    /// Inclusive priority range. Postgres `i16`. Redis `(1, 2_097_152)`.
     pub priority_range: (i32, i32),
     /// Safe to run on a Redis Cluster (single-slot per queue via hash-tags).
     pub cluster_safe: bool,
 }
 
 /// Job states that `Backend::clean` can target. Restricted to the three
-/// finalized states — `wait`/`active`/`delayed` cleaning has different
-/// BullMQ semantics and is out of scope for this surface.
+/// finalized states — cleaning `wait`/`active`/`delayed` is out of scope
+/// for this surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanState {
     Completed,
@@ -116,10 +116,10 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
     /// Returns `(completed, failed, cancelled, batches)` deleted counts.
     async fn cleanup(&self, retention: Retention) -> Result<(u64, u64, u64, u64)>;
 
-    /// Ad-hoc retention sweep (BullMQ `queue.clean()`). Deletes up to `limit`
-    /// finalized jobs of the given state that are older than `grace`. Used
-    /// for one-shot pruning from admin/API surfaces. Returns the number of
-    /// rows actually deleted.
+    /// Ad-hoc retention sweep. Deletes up to `limit` finalized jobs of
+    /// the given state that are older than `grace`. Used for one-shot
+    /// pruning from admin/API surfaces. Returns the number of rows
+    /// actually deleted.
     async fn clean(&self, grace: Duration, limit: u32, state: CleanState) -> Result<u64>;
 
     /// Proactively reclaim rows this pod claimed but won't get to finish —
@@ -164,8 +164,8 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
         max_attempts: i32,
         queue: &str,
     ) -> Result<()>;
-    /// Upsert an interval-driven schedule (BullMQ `{ every: ms }`). Fires
-    /// every `interval_ms`; skip-missed semantics match the cron path.
+    /// Upsert an interval-driven schedule (`{ every: ms }`). Fires every
+    /// `interval_ms`; skip-missed semantics match the cron path.
     /// Default implementation returns `Unsupported` — backends that don't
     /// expose intervals can leave it unimplemented.
     #[allow(clippy::too_many_arguments)]

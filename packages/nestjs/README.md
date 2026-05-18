@@ -348,9 +348,8 @@ so they can't drift.
 ## Migrations
 
 Migrations are a **deploy-step concern**, not a runtime one. The default
-`start()` path refuses to boot if any registered migration is unapplied — this
-matches River's model and prevents rolling deploys from running workers
-against a stale schema.
+`start()` path refuses to boot if any registered migration is unapplied —
+this prevents rolling deploys from running workers against a stale schema.
 
 Three ways to apply migrations, in order of recommendation:
 

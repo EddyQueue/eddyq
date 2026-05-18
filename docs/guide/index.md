@@ -10,16 +10,6 @@ eddyq is a job queue for Node and NestJS that uses Postgres as its only dependen
 - **Group concurrency.** Limit concurrent jobs per tenant, per provider, per anything.
 - **Predictable latency.** Rust core means GC pauses don't show up in your job throughput graphs.
 
-## How it compares
-
-| | eddyq | BullMQ | graphile-worker |
-|---|---|---|---|
-| Backend | Postgres | Redis | Postgres |
-| Core language | Rust | Node | Node |
-| Node bindings | First-class | Native | Native |
-| NestJS module | Yes | Community | No |
-| Transactional enqueue | ✅ | ❌ | ✅ |
-
 ## Next steps
 
 - [**Installation**](./installation) — install the npm package and set up your database

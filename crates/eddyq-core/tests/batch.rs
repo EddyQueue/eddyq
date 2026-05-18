@@ -440,13 +440,18 @@ async fn batch_sweep_stale_settles(pool: PgPool) {
     .unwrap();
     assert_eq!(result.inserted, 2);
 
+    // Plant rows at the stall-budget brink: the sweep below should tick
+    // `stalled_count` past `max_stalled_count` and DLQ them so the batch
+    // settles in the same statement.
     sqlx::query(
         r#"
         UPDATE eddyq_jobs
-           SET state        = 'running',
-               attempt      = 1,
-               heartbeat_at = NOW() - INTERVAL '10 seconds',
-               worker_id    = gen_random_uuid()
+           SET state             = 'running',
+               attempt           = 1,
+               stalled_count     = 1,
+               max_stalled_count = 1,
+               heartbeat_at      = NOW() - INTERVAL '10 seconds',
+               worker_id         = gen_random_uuid()
          WHERE batch_id = $1
         "#,
     )

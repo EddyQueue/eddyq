@@ -27,6 +27,6 @@ pub use batch::{BatchEnqueueResult, BatchOptions};
 pub use enqueue::{BulkEnqueueResult, DynEnqueue, EnqueueOptions, EnqueueResult};
 pub use error::{Directive, Error, HandlerFailure, JobResult, Result};
 pub use job::{DEFAULT_QUEUE, Job, JobContext, JobId, JobState};
-pub use queue::{Queue, QueueBuilder, QueueConfig, ShutdownMode};
+pub use queue::{DrainOutcome, Queue, QueueBuilder, QueueConfig, ShutdownMode};
 pub use retention::RetentionRule;
 pub use worker::{Worker, WorkerRegistry};

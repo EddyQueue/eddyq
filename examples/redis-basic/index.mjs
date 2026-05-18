@@ -22,7 +22,7 @@ async function main() {
   // upstream API is per-tenant rate-limited.
   await queue.setGroupConcurrency("tenant-acme", 1);
 
-  // BullMQ-style interval: fires every 1500ms. The `{ every }` shape is
+  // Interval schedule: fires every 1500ms. The `{ every }` shape is
   // sugar that skips cron entirely — leader-driven, fires from now.
   // Equivalent forms accepted:
   //   queue.addSchedule("heartbeat", "*/2 * * * * *", ...)  // cron

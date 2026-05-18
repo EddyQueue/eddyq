@@ -89,7 +89,7 @@ async function forceShutdown() {
   const c = new pg.Client({ connectionString: DB_URL });
   await c.connect();
   const { rows } = await c.query(
-    "SELECT state, attempt FROM eddyq_jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1",
+    "SELECT state, stalled_count FROM eddyq_jobs WHERE kind = $1 ORDER BY id DESC LIMIT 1",
     [KIND],
   );
   await c.end();
@@ -98,8 +98,13 @@ async function forceShutdown() {
       `force-shutdown: row state should be 'pending' (reclaimed); got ${rows[0].state}`,
     );
   }
-  if (rows[0].attempt < 1) {
-    throw new Error(`force-shutdown: attempt should be >= 1; got ${rows[0].attempt}`);
+  // Reclaim mirrors stalled-sweep semantics: stalled_count bumps, attempt is
+  // rolled back (the prior claim didn't reach a verdict). So a fresh job
+  // post-reclaim has attempt=0, stalled_count=1.
+  if (rows[0].stalled_count < 1) {
+    throw new Error(
+      `force-shutdown: stalled_count should be >= 1; got ${rows[0].stalled_count}`,
+    );
   }
 
   await q.close();

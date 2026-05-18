@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     backend::{Backend, CleanState, PgBackend},
@@ -43,7 +43,7 @@ pub struct QueueConfig {
     /// Keep at most this many completed jobs. `None` = no count cap.
     /// Independent of `completed_retention` (age): on each cleanup tick a row
     /// is deleted if it exceeds *either* the age window *or* the count cap
-    /// (BullMQ-style OR semantics). Useful as a hard memory bound on Redis,
+    /// (OR semantics). Useful as a hard memory bound on Redis,
     /// where 24h of completed-job retention can be tens of GB at high
     /// throughput. Default: `None`.
     pub completed_retention_count: Option<i64>,
@@ -435,7 +435,7 @@ impl<B: Backend> Queue<B> {
             .await
     }
 
-    /// Register or update an interval-driven schedule (BullMQ `{ every: ms }`).
+    /// Register or update an interval-driven schedule (`{ every: ms }`).
     /// Fires every `interval_ms` from the moment the previous fire landed.
     /// Skip-missed semantics match `add_schedule`: a delayed leader doesn't
     /// catch up.
@@ -584,7 +584,7 @@ impl<B: Backend> Queue<B> {
         self.backend.queue_set_timeout(name, timeout).await
     }
 
-    /// Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+    /// Ad-hoc retention sweep. Deletes up to `limit`
     /// finalized jobs in `state` that are older than `grace`. Useful for
     /// one-shot pruning from admin tools or scripts; routine retention
     /// should go through the configured cleanup tick instead.
@@ -624,6 +624,64 @@ impl<B: Backend> Queue<B> {
     /// `shutdown_with(ShutdownMode::Drain)`. Kept for back-compat.
     pub async fn shutdown(&self) -> Result<()> {
         self.shutdown_with(ShutdownMode::Drain).await
+    }
+
+    /// Drain with a hard ceiling: wait up to `grace` for in-flight handlers to
+    /// finish, then escalate to force-reclaim (abort runtime tasks + return
+    /// rows to `pending` via stalled-recovery). Returns within `grace`,
+    /// regardless of handler hygiene.
+    ///
+    /// Use this instead of `shutdown_with(Drain)` when you need a bounded
+    /// shutdown — typically on SIGTERM with a fixed k8s `terminationGracePeriod`.
+    /// `Drain` itself remains unbounded for callers that want to wait indefinitely.
+    pub async fn shutdown_drain_bounded(&self, grace: Duration) -> Result<DrainOutcome> {
+        let (shutdown, handles) = {
+            let mut state = self.state.lock().expect("queue state lock poisoned");
+            match std::mem::replace(&mut *state, QueueState::Idle) {
+                QueueState::Idle => return Err(Error::NotRunning),
+                QueueState::Running { shutdown, handles } => (shutdown, handles),
+            }
+        };
+        shutdown.cancel();
+
+        // Snapshot in-flight rows + abort handles BEFORE awaiting. Dropping
+        // a JoinHandle does NOT abort the underlying task; the AbortHandles
+        // are the only way to actually stop the runtime once `await_all` is
+        // dropped on timeout.
+        let in_flight_snapshot: Vec<crate::JobId> = handles
+            .in_flight
+            .lock()
+            .expect("in_flight lock poisoned")
+            .iter()
+            .copied()
+            .collect();
+        let abort_handles = handles.abort_handle_list();
+
+        match tokio::time::timeout(grace, runtime::await_all(handles)).await {
+            Ok(()) => {
+                info!("eddyq queue stopped (drain, clean)");
+                Ok(DrainOutcome::Clean)
+            }
+            Err(_) => {
+                for h in abort_handles {
+                    h.abort();
+                }
+                let reclaimed = match self.backend.reclaim_in_flight(&in_flight_snapshot).await {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(?e, "reclaim_in_flight failed during drain escalation");
+                        0
+                    }
+                };
+                warn!(
+                    grace_ms = grace.as_millis() as u64,
+                    snapshotted = in_flight_snapshot.len(),
+                    reclaimed,
+                    "drain timed out, escalated to force"
+                );
+                Ok(DrainOutcome::Escalated { reclaimed })
+            }
+        }
     }
 
     /// Stop the runtime in one of three modes — see [`ShutdownMode`] for the
@@ -696,6 +754,9 @@ fn build_dyn_enqueue<J: Job>(job: &J, opts: EnqueueOptions) -> Result<crate::enq
     let payload = serde_json::to_value(job)?;
     let mut req = crate::enqueue::DynEnqueue::new(J::KIND, payload);
     req.max_attempts = opts.max_attempts.unwrap_or_else(|| job.max_attempts());
+    req.max_stalled_count = opts
+        .max_stalled_count
+        .unwrap_or_else(|| job.max_stalled_count());
     req.priority = opts.priority.unwrap_or_else(|| job.priority());
     req.scheduled_at = opts.scheduled_at;
     req.unique_key = opts.unique_key.or_else(|| job.unique_key());
@@ -715,14 +776,12 @@ fn build_dyn_enqueue<J: Job>(job: &J, opts: EnqueueOptions) -> Result<crate::enq
 /// choice depends on what's about to happen to the process:
 ///
 /// * `Drain` — graceful. Stop claiming new jobs, fire `AbortSignal` to
-///   in-flight handlers, then wait for them. Modeled on BullMQ's default
-///   `worker.close()`. Use for routine deploys.
+///   in-flight handlers, then wait for them. Use for routine deploys.
 ///
 /// * `Force` — fast. Stop claiming, fire `AbortSignal`, abort runtime
 ///   tasks, then **proactively reclaim** rows this pod claimed (set
 ///   `running` → `pending`, attempt++) so other pods can pick them up
-///   immediately. Modeled on BullMQ's `worker.close({ force: true })`
-///   plus River's `StopAndCancel`. Use when the pod is about to be killed.
+///   immediately. Use when the pod is about to be killed.
 ///
 /// * `Abandon` — last-resort. Drop the runtime without reclaiming. Rows
 ///   stay in `running` until another pod's heartbeat sweep finds them
@@ -733,4 +792,17 @@ pub enum ShutdownMode {
     Drain,
     Force,
     Abandon,
+}
+
+/// Result of a bounded-drain shutdown ([`Queue::shutdown_drain_bounded`]).
+/// Reports whether the runtime drained cleanly inside the grace window or
+/// whether the call escalated to a force reclaim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// All runtime tasks finished within the grace window. No rows reclaimed.
+    Clean,
+    /// Drain hit the grace ceiling. Runtime tasks were aborted and `reclaimed`
+    /// rows were force-returned to `pending` (or `failed` if their stall budget
+    /// was exhausted).
+    Escalated { reclaimed: u64 },
 }

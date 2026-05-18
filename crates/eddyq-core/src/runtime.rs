@@ -60,6 +60,26 @@ impl RuntimeHandles {
         self.heartbeat.abort();
         self.leader.abort();
     }
+
+    /// Snapshot abort handles for every spawned task. Lets a caller initiate
+    /// a graceful `await_all` (which consumes `self`) while keeping the ability
+    /// to forcibly abort the runtime if the await exceeds a deadline.
+    pub fn abort_handle_list(&self) -> Vec<tokio::task::AbortHandle> {
+        let mut v = Vec::with_capacity(7 + self.workers.len());
+        v.push(self.fetcher.abort_handle());
+        v.push(self.sweeper.abort_handle());
+        v.push(self.scheduler.abort_handle());
+        v.push(self.cleanup.abort_handle());
+        v.push(self.heartbeat.abort_handle());
+        v.push(self.leader.abort_handle());
+        if let Some(h) = self.listener.as_ref() {
+            v.push(h.abort_handle());
+        }
+        for h in &self.workers {
+            v.push(h.abort_handle());
+        }
+        v
+    }
 }
 
 pub(crate) fn start<B: Backend>(
@@ -276,6 +296,8 @@ async fn worker_loop<B: Backend>(
             kind: job.kind.clone(),
             attempt: job.attempt,
             max_attempts: job.max_attempts,
+            stalled_count: job.stalled_count,
+            max_stalled_count: job.max_stalled_count,
             worker_id,
         };
 

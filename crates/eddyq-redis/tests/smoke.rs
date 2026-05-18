@@ -1372,7 +1372,7 @@ async fn leader_cleanup_loop_drains_completed_zset() {
     flush_line(&url, &line).await;
 }
 
-/// `Backend::clean(grace, limit, Completed)` is the BullMQ `queue.clean()`
+/// `Backend::clean(grace, limit, Completed)` is the ad-hoc retention sweep
 /// surface. Verifies the per-call `limit` cap by draining a 10-job backlog
 /// in two calls of 5.
 #[tokio::test]
@@ -1575,6 +1575,378 @@ async fn cleanup_count_per_state_isolation_redis() {
     assert_eq!(x, 0, "cancelled ZSET must be untouched");
     assert_eq!(zcard_completed(&url, &line).await, 1);
     assert_eq!(zcard_failed(&url, &line).await, failed_before);
+
+    flush_line(&url, &line).await;
+}
+
+/// Stalled-recovery semantics on Redis. Manually plant a "stale" running
+/// job (no live worker) by writing it directly to the active ZSET with an
+/// old score, then call `sweep_stale` via the backend. First sweep: stalled
+/// recovers free. Second sweep: budget exhausted, row moves to `failed`.
+#[tokio::test]
+async fn stalled_count_recovery_and_dlq() {
+    use eddyq_core::EnqueueOptions;
+    use eddyq_core::backend::Backend;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("stalled");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    // Enqueue with maxAttempts=1, maxStalledCount=1 (one free crash, then fail).
+    let opts = EnqueueOptions {
+        max_attempts: Some(1),
+        max_stalled_count: Some(1),
+        ..Default::default()
+    };
+    let res = queue.enqueue_with(&Count { n: 42 }, opts).await.unwrap();
+    let id = match res {
+        eddyq_core::EnqueueResult::Inserted(id) => id,
+        other => panic!("expected Inserted, got {:?}", other),
+    };
+
+    // Simulate a worker that claimed and then died: move the job to active,
+    // mark it running with an ancient lock so sweep treats it as stale.
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = format!("{{{}}}", line);
+    let job_key = format!("{}:job:{}", prefix, id);
+    let wait_key = format!("{}:wait:default", prefix);
+    let active_key = format!("{}:active", prefix);
+
+    async fn stage_stale_running(
+        conn: &mut redis::aio::MultiplexedConnection,
+        wait_key: &str,
+        active_key: &str,
+        job_key: &str,
+        id: i64,
+    ) {
+        let _: redis::Value = redis::cmd("ZREM")
+            .arg(wait_key)
+            .arg(id)
+            .query_async(conn)
+            .await
+            .unwrap();
+        let _: redis::Value = redis::cmd("ZADD")
+            .arg(active_key)
+            .arg(0_i64)
+            .arg(id)
+            .query_async(conn)
+            .await
+            .unwrap();
+        let _: redis::Value = redis::cmd("HSET")
+            .arg(job_key)
+            .arg("state")
+            .arg("running")
+            .arg("locked_at")
+            .arg("0")
+            .arg("attempt")
+            .arg("1")
+            .query_async(conn)
+            .await
+            .unwrap();
+    }
+
+    stage_stale_running(&mut conn, &wait_key, &active_key, &job_key, id).await;
+
+    // First sweep: stalled_count 0→1 ≤ max=1 → recover.
+    let backend = queue.backend().as_ref();
+    let n = backend.sweep_stale(Duration::from_millis(1)).await.unwrap();
+    assert_eq!(n, 1);
+
+    let fields: Vec<String> = redis::cmd("HMGET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("stalled_count")
+        .arg("attempt")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(fields[0], "pending");
+    assert_eq!(fields[1], "1");
+    assert_eq!(
+        fields[2], "0",
+        "attempt decremented; handler budget preserved"
+    );
+
+    // Re-stage as stale running for the second sweep.
+    stage_stale_running(&mut conn, &wait_key, &active_key, &job_key, id).await;
+
+    // Second sweep: stalled_count 1→2 > max=1 → fail.
+    let n = backend.sweep_stale(Duration::from_millis(1)).await.unwrap();
+    assert_eq!(n, 1);
+
+    let fields: Vec<String> = redis::cmd("HMGET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("stalled_count")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(fields[0], "failed");
+    assert_eq!(fields[1], "2");
+
+    flush_line(&url, &line).await;
+}
+
+/// `reclaim_in_flight` on Redis — new behavior added in the stalled-count
+/// PR (it never had a DLQ branch before). Verify: under cap, the row goes
+/// back to pending; over cap, it moves to failed. Mirrors the PG
+/// `shutdown_force_reclaims_in_flight` test on the Redis backend.
+#[tokio::test]
+async fn reclaim_in_flight_recovers_then_dlqs() {
+    use eddyq_core::EnqueueOptions;
+    use eddyq_core::backend::Backend;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("reclaim");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    let opts = EnqueueOptions {
+        max_attempts: Some(1),
+        max_stalled_count: Some(1),
+        ..Default::default()
+    };
+    let res = queue.enqueue_with(&Count { n: 7 }, opts).await.unwrap();
+    let id = match res {
+        eddyq_core::EnqueueResult::Inserted(id) => id,
+        other => panic!("expected Inserted, got {:?}", other),
+    };
+
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = format!("{{{}}}", line);
+    let job_key = format!("{}:job:{}", prefix, id);
+    let wait_key = format!("{}:wait:default", prefix);
+    let active_key = format!("{}:active", prefix);
+
+    // Stage as in-flight on this pod, then reclaim.
+    let _: redis::Value = redis::cmd("ZREM")
+        .arg(&wait_key)
+        .arg(id)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: redis::Value = redis::cmd("ZADD")
+        .arg(&active_key)
+        .arg(0_i64)
+        .arg(id)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: redis::Value = redis::cmd("HSET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("running")
+        .arg("attempt")
+        .arg("1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    // First reclaim: stalled 0→1 ≤ max=1 → recover.
+    let backend = queue.backend().as_ref();
+    let n = backend.reclaim_in_flight(&[id]).await.unwrap();
+    assert_eq!(n, 1);
+
+    let fields: Vec<String> = redis::cmd("HMGET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("stalled_count")
+        .arg("attempt")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(fields[0], "pending");
+    assert_eq!(fields[1], "1");
+    assert_eq!(fields[2], "0", "attempt decremented on recover");
+
+    // Re-stage as in-flight and reclaim again — now stalled 1→2 > 1 → fail.
+    let _: redis::Value = redis::cmd("ZREM")
+        .arg(&wait_key)
+        .arg(id)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: redis::Value = redis::cmd("ZADD")
+        .arg(&active_key)
+        .arg(0_i64)
+        .arg(id)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: redis::Value = redis::cmd("HSET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("running")
+        .arg("attempt")
+        .arg("1")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let n = backend.reclaim_in_flight(&[id]).await.unwrap();
+    assert_eq!(n, 1);
+
+    let fields: Vec<String> = redis::cmd("HMGET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("stalled_count")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(fields[0], "failed");
+    assert_eq!(fields[1], "2");
+
+    flush_line(&url, &line).await;
+}
+
+/// Per-job `max_stalled_count` override on Redis. The field has to make
+/// it from the Rust `EnqueueOptions` → `DynEnqueue` → Lua ARGV → job hash.
+#[tokio::test]
+async fn per_job_max_stalled_count_override_redis() {
+    use eddyq_core::EnqueueOptions;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("override");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    let opts = EnqueueOptions {
+        max_stalled_count: Some(7),
+        ..Default::default()
+    };
+    let res = queue.enqueue_with(&Count { n: 1 }, opts).await.unwrap();
+    let id = match res {
+        eddyq_core::EnqueueResult::Inserted(id) => id,
+        other => panic!("expected Inserted, got {:?}", other),
+    };
+
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = format!("{{{}}}", line);
+    let job_key = format!("{}:job:{}", prefix, id);
+
+    let stored: String = redis::cmd("HGET")
+        .arg(&job_key)
+        .arg("max_stalled_count")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(stored, "7");
+
+    flush_line(&url, &line).await;
+}
+
+/// Pre-upgrade compatibility on Redis: a job hash written before the
+/// stalled_count fields existed is read with `tonumber(field) or default`
+/// in Lua, so sweep recovers it as if it had stalled_count=0,
+/// max_stalled_count=1 from the start. Defends against the deploy window
+/// where pre-bump pods write hashes and post-bump pods read them.
+#[tokio::test]
+async fn pre_upgrade_hash_recovers_cleanly_redis() {
+    use eddyq_core::backend::Backend;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("preup");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+
+    // Hand-write a job hash WITHOUT stalled_count or max_stalled_count.
+    // Simulates a hash that was enqueued by a pre-upgrade pod.
+    let client = redis::Client::open(url.clone()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let prefix = format!("{{{}}}", line);
+    let id: i64 = redis::cmd("INCR")
+        .arg(format!("{}:idgen", prefix))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let job_key = format!("{}:job:{}", prefix, id);
+    let active_key = format!("{}:active", prefix);
+    let _: redis::Value = redis::cmd("HSET")
+        .arg(&job_key)
+        .arg("id")
+        .arg(id)
+        .arg("kind")
+        .arg("count")
+        .arg("payload")
+        .arg("{\"n\":1}")
+        .arg("priority")
+        .arg("0")
+        .arg("max_attempts")
+        .arg("3")
+        .arg("attempt")
+        .arg("1")
+        .arg("state")
+        .arg("running")
+        .arg("queue")
+        .arg("default")
+        .arg("group_key")
+        .arg("")
+        .arg("unique_key")
+        .arg("")
+        .arg("tags")
+        .arg("[]")
+        .arg("metadata")
+        .arg("{}")
+        .arg("remove_on_complete")
+        .arg("")
+        .arg("remove_on_fail")
+        .arg("")
+        .arg("scheduled_at")
+        .arg("0")
+        .arg("created_at")
+        .arg("0")
+        .arg("locked_at")
+        .arg("0")
+        // Notably: NO `stalled_count`, NO `max_stalled_count`.
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: redis::Value = redis::cmd("ZADD")
+        .arg(&active_key)
+        .arg(0_i64)
+        .arg(id)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let backend = queue.backend().as_ref();
+    let n = backend.sweep_stale(Duration::from_millis(1)).await.unwrap();
+    assert_eq!(n, 1);
+
+    let fields: Vec<String> = redis::cmd("HMGET")
+        .arg(&job_key)
+        .arg("state")
+        .arg("stalled_count")
+        .arg("attempt")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(fields[0], "pending");
+    assert_eq!(
+        fields[1], "1",
+        "Lua's `tonumber(...) or 0` fallback applied; stalled_count now exists"
+    );
+    assert_eq!(fields[2], "0");
 
     flush_line(&url, &line).await;
 }

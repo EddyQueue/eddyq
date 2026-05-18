@@ -12,6 +12,10 @@ pub struct ClaimedJob {
     pub payload: serde_json::Value,
     pub attempt: i32,
     pub max_attempts: i32,
+    /// Number of times this row has been rescued from a stalled (worker-lost)
+    /// state. Distinct from `attempt`, which counts completed handler runs.
+    pub stalled_count: i32,
+    pub max_stalled_count: i32,
     pub group_key: Option<String>,
     pub queue: String,
     pub worker_id: Uuid,
@@ -300,6 +304,8 @@ pub async fn claim_batch(
         serde_json::Value,
         i32,
         i32,
+        i32,
+        i32,
         Option<String>,
         String,
     );
@@ -312,7 +318,7 @@ pub async fn claim_batch(
                    heartbeat_at = NOW(),
                    worker_id    = $2
              WHERE j.id = ANY($1)
-         RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.group_key, j.queue
+         RETURNING j.id, j.kind, j.payload, j.attempt, j.max_attempts, j.stalled_count, j.max_stalled_count, j.group_key, j.queue
             "#,
     )
     .bind(&accepted_ids)
@@ -324,7 +330,7 @@ pub async fn claim_batch(
     // groups, also write back the decremented token balance and refill timestamp.
     let mut group_deltas: HashMap<String, i32> = HashMap::new();
     let mut queue_deltas: HashMap<String, i32> = HashMap::new();
-    for (_, _, _, _, _, group_key, qname) in &claimed {
+    for (_, _, _, _, _, _, _, group_key, qname) in &claimed {
         if let Some(g) = group_key {
             *group_deltas.entry(g.clone()).or_insert(0) += 1;
         }
@@ -386,7 +392,17 @@ pub async fn claim_batch(
     Ok(claimed
         .into_iter()
         .map(
-            |(id, kind, payload, attempt, max_attempts, group_key, queue)| {
+            |(
+                id,
+                kind,
+                payload,
+                attempt,
+                max_attempts,
+                stalled_count,
+                max_stalled_count,
+                group_key,
+                queue,
+            )| {
                 let timeout = queue_timeout.get(&queue).and_then(|o| *o);
                 ClaimedJob {
                     id,
@@ -394,6 +410,8 @@ pub async fn claim_batch(
                     payload,
                     attempt,
                     max_attempts,
+                    stalled_count,
+                    max_stalled_count,
                     group_key,
                     queue,
                     worker_id,
@@ -446,8 +464,8 @@ pub async fn cancel(pool: &PgPool, id: JobId) -> Result<bool> {
 
 /// Per-state retention policy. `*_secs = None` and `*_count = None` together
 /// mean "keep forever." When both are set, OR semantics apply: a row is reaped
-/// if it exceeds *either* the age window *or* the count cap. This matches
-/// BullMQ and gives Redis users a hard memory bound that age alone can't.
+/// if it exceeds *either* the age window *or* the count cap. Gives Redis users
+/// a hard memory bound that age alone can't.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Retention {
     pub completed_secs: Option<u64>,
@@ -763,13 +781,15 @@ pub async fn update_heartbeat_batch(pool: &PgPool, ids: &[i64]) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
-/// Sweep running jobs whose heartbeat is older than `stale_after`. Jobs that have
-/// hit `max_attempts` are marked failed; the rest are returned to `pending` for
-/// another worker to pick up. In both cases the group counter is decremented;
-/// jobs that went terminal-failed also bump their batch's failed counter and
-/// the batch's `on_complete` callback may fire (in this same transaction) if
-/// the sweep was the last terminal transition needed.
-/// Returns the number of rows touched.
+/// Sweep running jobs whose heartbeat is older than `stale_after`. Each swept
+/// row has its `stalled_count` bumped; rows whose new `stalled_count` exceeds
+/// `max_stalled_count` are marked failed, the rest are returned to `pending`
+/// with `attempt` decremented (the prior attempt didn't run to a verdict, so
+/// it shouldn't burn the handler-throw budget). In both branches the group
+/// counter is decremented; rows that went terminal-failed also bump their
+/// batch's failed counter and the batch's `on_complete` callback may fire
+/// (in this same transaction) if the sweep was the last terminal transition
+/// needed. Returns the number of rows touched.
 pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Result<u64> {
     let secs = i64::try_from(stale_after.as_secs()).unwrap_or(i64::MAX);
     let error_entry = serde_json::json!({
@@ -786,11 +806,16 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
         r#"
         WITH swept AS (
             UPDATE eddyq_jobs
-               SET state        = CASE WHEN attempt >= max_attempts THEN 'failed' ELSE 'pending' END,
-                   heartbeat_at = NULL,
-                   worker_id    = NULL,
-                   errors       = errors || $2::jsonb,
-                   finalized_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
+               SET stalled_count = stalled_count + 1,
+                   state         = CASE WHEN stalled_count + 1 > max_stalled_count
+                                        THEN 'failed' ELSE 'pending' END,
+                   attempt       = CASE WHEN stalled_count + 1 > max_stalled_count
+                                        THEN attempt ELSE GREATEST(attempt - 1, 0) END,
+                   heartbeat_at  = NULL,
+                   worker_id     = NULL,
+                   errors        = errors || $2::jsonb,
+                   finalized_at  = CASE WHEN stalled_count + 1 > max_stalled_count
+                                        THEN NOW() ELSE NULL END
              WHERE state = 'running'
                AND heartbeat_at < NOW() - make_interval(secs => $1)
          RETURNING group_key, queue, batch_id, state
@@ -886,11 +911,16 @@ pub async fn reclaim_in_flight(pool: &PgPool, ids: &[JobId]) -> Result<u64> {
         r#"
         WITH swept AS (
             UPDATE eddyq_jobs
-               SET state        = CASE WHEN attempt >= max_attempts THEN 'failed' ELSE 'pending' END,
-                   heartbeat_at = NULL,
-                   worker_id    = NULL,
-                   errors       = errors || $2::jsonb,
-                   finalized_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE NULL END
+               SET stalled_count = stalled_count + 1,
+                   state         = CASE WHEN stalled_count + 1 > max_stalled_count
+                                        THEN 'failed' ELSE 'pending' END,
+                   attempt       = CASE WHEN stalled_count + 1 > max_stalled_count
+                                        THEN attempt ELSE GREATEST(attempt - 1, 0) END,
+                   heartbeat_at  = NULL,
+                   worker_id     = NULL,
+                   errors        = errors || $2::jsonb,
+                   finalized_at  = CASE WHEN stalled_count + 1 > max_stalled_count
+                                        THEN NOW() ELSE NULL END
              WHERE state = 'running'
                AND id = ANY($1)
          RETURNING group_key, queue, batch_id, state
