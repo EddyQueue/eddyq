@@ -37,7 +37,7 @@ out to AOF + replicas without you doing anything.
 
 ## Differentiators
 
-Things you get for free on Redis that BullMQ Pro charges for:
+What the Redis backend ships out of the box:
 
 - **Group concurrency caps + pause + token-bucket rate limits.** Atomically gated inside `eddyq_claim` — no race between cap-check and lease.
 - **Pattern-based group rules.** `setGroupRule("tenant-*", { maxConcurrency: 5 })` and every new `tenant-acme`, `tenant-foo`, … gets the cap on first enqueue.

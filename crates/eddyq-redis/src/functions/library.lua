@@ -253,7 +253,8 @@ end
 --  10  metadata_json       (string; "" => "{}")
 --  11  remove_on_complete  (string JSON; "" => null)
 --  12  remove_on_fail      (string JSON; "" => null)
---  13  now_ms              (int as string)
+--  13  max_stalled_count   (int as string; default 1 if absent)
+--  14  now_ms              (int as string)
 --
 -- Returns: { "inserted", id }  or  { "skipped" }
 -- ====================================================================
@@ -271,7 +272,8 @@ local function fn_enqueue(keys, args)
   local metadata_json       = args[10]
   local remove_on_complete  = args[11]
   local remove_on_fail      = args[12]
-  local now_ms              = tonumber(args[13])
+  local max_stalled_count   = tonumber(args[13]) or 1
+  local now_ms              = tonumber(args[14])
 
   -- Unique-key dedup: SET NX. If the key already maps to a job id, this
   -- enqueue is a no-op.
@@ -297,6 +299,8 @@ local function fn_enqueue(keys, args)
     'priority',            priority,
     'max_attempts',        max_attempts,
     'attempt',             0,
+    'stalled_count',       0,
+    'max_stalled_count',   max_stalled_count,
     'state',               state,
     'queue',               queue,
     'group_key',           group_key,
@@ -346,7 +350,7 @@ end
 -- ARGV layout:
 --   1   n              (count of jobs)
 --   for i in 1..n:
---     base = 1 + (i-1) * 12
+--     base = 1 + (i-1) * 13
 --     args[base+1]  = kind
 --     args[base+2]  = payload_json
 --     args[base+3]  = priority
@@ -359,6 +363,7 @@ end
 --     args[base+10] = metadata_json
 --     args[base+11] = remove_on_complete
 --     args[base+12] = remove_on_fail
+--     args[base+13] = max_stalled_count
 --   final: now_ms
 --
 -- Returns: a flat array length n*2 with pairs ("inserted", id) or ("skipped", "0")
@@ -370,11 +375,12 @@ local function fn_enqueue_many(keys, args)
   local out = {}
 
   for i = 1, n do
-    local base = 1 + (i - 1) * 12
+    local base = 1 + (i - 1) * 13
     local sub_args = {
       args[base + 1],  args[base + 2],  args[base + 3],  args[base + 4],
       args[base + 5],  args[base + 6],  args[base + 7],  args[base + 8],
       args[base + 9],  args[base + 10], args[base + 11], args[base + 12],
+      args[base + 13],
       tostring(now_ms),
     }
     local r = fn_enqueue(keys, sub_args)
@@ -433,7 +439,7 @@ local function fn_claim(keys, args)
       -- Read minimum needed fields. Skip if kind not in subscribed list.
       local fields = redis.call('HMGET', jobkey(prefix, id),
         'kind', 'payload', 'priority', 'max_attempts', 'attempt',
-        'queue', 'group_key', 'state')
+        'queue', 'group_key', 'state', 'stalled_count', 'max_stalled_count')
       local kind = fields[1]
       local gkey = fields[7]
       if kind and kinds_set[kind] and fields[8] == 'pending' then
@@ -500,15 +506,17 @@ local function fn_claim(keys, args)
 
             -- Build the per-job JSON the Rust ClaimedJob constructor expects.
             out[#out + 1] = cjson.encode({
-              id           = tonumber(id),
-              kind         = kind,
-              payload      = fields[2],          -- JSON string; Rust re-parses
-              priority     = tonumber(fields[3]) or 0,
-              max_attempts = tonumber(fields[4]) or 3,
-              attempt      = attempt,
-              queue        = fields[6],
-              group_key    = (gkey ~= '' and gkey) or nil,
-              worker_id    = worker_id,
+              id                = tonumber(id),
+              kind              = kind,
+              payload           = fields[2],          -- JSON string; Rust re-parses
+              priority          = tonumber(fields[3]) or 0,
+              max_attempts      = tonumber(fields[4]) or 3,
+              attempt           = attempt,
+              stalled_count     = tonumber(fields[9]) or 0,
+              max_stalled_count = tonumber(fields[10]) or 1,
+              queue             = fields[6],
+              group_key         = (gkey ~= '' and gkey) or nil,
+              worker_id         = worker_id,
             })
             taken = taken + 1
           end
@@ -544,7 +552,7 @@ local function fn_heartbeat(keys, args)
 end
 
 -- Helper: prune retention ZSET in place, honoring per-job rule JSON
--- (matches BullMQ's removeOnComplete / removeOnFail).
+-- (removeOnComplete / removeOnFail).
 --
 -- rule_json shapes accepted:
 --   ""                     -- nil      => keep, no inline prune
@@ -760,12 +768,15 @@ local function fn_sweep_stale(keys, args)
   local count = 0
   for _, id in ipairs(stale) do
     local fields = redis.call('HMGET', jobkey(prefix, id),
-      'attempt', 'max_attempts', 'priority', 'queue', 'group_key')
+      'attempt', 'max_attempts', 'priority', 'queue', 'group_key',
+      'stalled_count', 'max_stalled_count')
     local attempt = tonumber(fields[1]) or 0
-    local max_attempts = tonumber(fields[2]) or 3
     local priority = tonumber(fields[3]) or 0
     local queue = fields[4]
     local gkey = fields[5]
+    local stalled_count = tonumber(fields[6]) or 0
+    local max_stalled_count = tonumber(fields[7]) or 1
+    local new_stalled = stalled_count + 1
 
     redis.call('ZREM', activekey(prefix), id)
     if gkey and gkey ~= '' then
@@ -774,21 +785,27 @@ local function fn_sweep_stale(keys, args)
     if queue and queue ~= '' then
       redis.call('ZREM', nqrunkey(prefix, queue), id)
     end
-    if attempt >= max_attempts then
-      -- Out of retries. Push to failed ZSET (no per-job retention pruning
-      -- here — sweep is a recovery path, not a normal terminate).
+    if new_stalled > max_stalled_count then
+      -- Stall budget exhausted. Push to failed ZSET (no per-job retention
+      -- pruning here — sweep is a recovery path, not a normal terminate).
       redis.call('HSET', jobkey(prefix, id),
         'state', 'failed',
+        'stalled_count', new_stalled,
         'failed_at', stale_before_ms)
       redis.call('ZADD', failedkey(prefix), stale_before_ms, id)
       if queue and queue ~= '' then
         redis.call('ZADD', nqfailedkey(prefix, queue), stale_before_ms, id)
       end
-      push_error(prefix, id, '{"name":"StaleSweep","message":"worker died, no retries left"}')
+      push_error(prefix, id, '{"name":"StaleSweep","message":"worker lost contact \xe2\x80\x94 job recovered"}')
     else
-      -- Retry: back into wait. Reset the lease so the next claimer wins.
+      -- Stall recovery. Decrement attempt — the prior claim never produced
+      -- a verdict, so it shouldn't burn the handler-throw budget. The next
+      -- claim will re-increment.
       redis.call('HSET', jobkey(prefix, id),
-        'state', 'pending', 'locked_by', '', 'locked_at', 0)
+        'state', 'pending',
+        'stalled_count', new_stalled,
+        'attempt', math.max(attempt - 1, 0),
+        'locked_by', '', 'locked_at', 0)
       redis.call('ZADD', waitkey(prefix, queue), wait_score(priority, stale_before_ms), id)
       redis.call('PUBLISH', wakeupchan(prefix), tostring(id))
     end
@@ -844,10 +861,17 @@ local function fn_reclaim_in_flight(keys, args)
     local id = args[i]
     local state = redis.call('HGET', jobkey(prefix, id), 'state')
     if state == 'running' then
-      local fields = redis.call('HMGET', jobkey(prefix, id), 'priority', 'queue', 'group_key')
+      local fields = redis.call('HMGET', jobkey(prefix, id),
+        'priority', 'queue', 'group_key', 'attempt',
+        'stalled_count', 'max_stalled_count')
       local priority = tonumber(fields[1]) or 0
       local queue = fields[2]
       local gkey = fields[3]
+      local attempt = tonumber(fields[4]) or 0
+      local stalled_count = tonumber(fields[5]) or 0
+      local max_stalled_count = tonumber(fields[6]) or 1
+      local new_stalled = stalled_count + 1
+
       redis.call('ZREM', activekey(prefix), id)
       if gkey and gkey ~= '' then
         redis.call('ZREM', grouprunkey(prefix, gkey), id)
@@ -855,9 +879,24 @@ local function fn_reclaim_in_flight(keys, args)
       if queue and queue ~= '' then
         redis.call('ZREM', nqrunkey(prefix, queue), id)
       end
-      redis.call('HSET', jobkey(prefix, id),
-        'state', 'pending', 'locked_by', '', 'locked_at', 0)
-      redis.call('ZADD', waitkey(prefix, queue), wait_score(priority, now_ms), id)
+      if new_stalled > max_stalled_count then
+        redis.call('HSET', jobkey(prefix, id),
+          'state', 'failed',
+          'stalled_count', new_stalled,
+          'failed_at', now_ms)
+        redis.call('ZADD', failedkey(prefix), now_ms, id)
+        if queue and queue ~= '' then
+          redis.call('ZADD', nqfailedkey(prefix, queue), now_ms, id)
+        end
+        push_error(prefix, id, '{"name":"ForceReclaim","message":"worker shutting down \xe2\x80\x94 stall budget exhausted"}')
+      else
+        redis.call('HSET', jobkey(prefix, id),
+          'state', 'pending',
+          'stalled_count', new_stalled,
+          'attempt', math.max(attempt - 1, 0),
+          'locked_by', '', 'locked_at', 0)
+        redis.call('ZADD', waitkey(prefix, queue), wait_score(priority, now_ms), id)
+      end
       count = count + 1
     end
   end
@@ -1353,6 +1392,8 @@ local function fn_schedule_fire(keys, args)
     'priority',      priority,
     'max_attempts',  max_attempts,
     'attempt',       0,
+    'stalled_count',     0,
+    'max_stalled_count', 1,
     'state',         'pending',
     'queue',         queue,
     'group_key',     '',
@@ -1590,8 +1631,8 @@ end
 -- a per-job rule, plus the `false` opt-out path.
 --
 -- For each state, a row is reaped if it exceeds *either* the age window
--- *or* the count cap (OR semantics, BullMQ-style). Up to `batch_limit`
--- victims per state per call so a backlog can't block the event loop.
+-- *or* the count cap (OR semantics). Up to `batch_limit` victims per
+-- state per call so a backlog can't block the event loop.
 --
 -- ARGV: now_ms,
 --       completed_age_secs, failed_age_secs, cancelled_age_secs,

@@ -41,7 +41,7 @@ Use when you want to bound a workload that you've split onto its own queue. Comm
 
 ## Layer 3 — group concurrency
 
-A fleet-wide cap on how many jobs sharing a `groupKey` can be running at once. The big differentiator vs BullMQ.
+A fleet-wide cap on how many jobs sharing a `groupKey` can be running at once.
 
 ```ts
 await q.setGroupConcurrency('tenant:42', 4)

@@ -288,11 +288,14 @@ async fn sweeper_recovers_stale_running(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn sweeper_gives_up_at_max_attempts(pool: PgPool) {
+async fn sweeper_gives_up_at_max_stalled_count(pool: PgPool) {
+    // Already at max_stalled_count (1, default). The next stall would bump
+    // stalled_count to 2, exceeding the cap, so the row should move to
+    // `failed` regardless of how many `attempt` retries remain.
     sqlx::query(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, heartbeat_at, worker_id)
-        VALUES ('count', '{"n":1}', 'running', 3, 3, NOW() - INTERVAL '10 seconds', gen_random_uuid())
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, stalled_count, max_stalled_count, heartbeat_at, worker_id)
+        VALUES ('count', '{"n":1}', 'running', 1, 3, 1, 1, NOW() - INTERVAL '10 seconds', gen_random_uuid())
         "#,
     )
     .execute(&pool)
@@ -302,11 +305,121 @@ async fn sweeper_gives_up_at_max_attempts(pool: PgPool) {
     let recovered = sweep_stale(&pool, Duration::from_secs(1)).await.unwrap();
     assert_eq!(recovered, 1);
 
-    let state: String = sqlx::query_scalar("SELECT state FROM eddyq_jobs LIMIT 1")
+    let (state, stalled, attempt): (String, i32, i32) =
+        sqlx::query_as("SELECT state, stalled_count, attempt FROM eddyq_jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "failed", "stalled_count + 1 > max → fail");
+    assert_eq!(stalled, 2, "stalled_count bumped on the DLQ branch too");
+    assert_eq!(
+        attempt, 1,
+        "attempt not decremented on the give-up branch (it represents the last real claim)"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sweeper_bumps_stalled_count_and_decrements_attempt(pool: PgPool) {
+    // First-ever stall: stalled_count 0→1 (≤ max=1, recover), attempt 1→0.
+    // The decrement of `attempt` is the headline of the new model — a stall
+    // is not a "completed handler invocation," so it shouldn't charge the
+    // handler-throw budget.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, stalled_count, max_stalled_count, heartbeat_at, worker_id)
+        VALUES ('count', '{"n":7}', 'running', 1, 1, 0, 1, NOW() - INTERVAL '10 seconds', gen_random_uuid())
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let recovered = sweep_stale(&pool, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(recovered, 1);
+
+    let (state, stalled, attempt): (String, i32, i32) =
+        sqlx::query_as("SELECT state, stalled_count, attempt FROM eddyq_jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending", "first stall under cap → recover");
+    assert_eq!(stalled, 1);
+    assert_eq!(
+        attempt, 0,
+        "attempt decremented; handler-throw budget preserved"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn crash_recovery_with_max_attempts_1(pool: PgPool) {
+    // maxAttempts=1 + crash mid-handler used to mean permanent fail. With
+    // stalled_count separated, the crash recovers and the handler gets its
+    // one real attempt. Simulates the email-agent turn-handler scenario.
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    // Seed a "crashed" running job with max_attempts=1, stalled_count=0.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, stalled_count, max_stalled_count, heartbeat_at, worker_id)
+        VALUES ('count', '{"n":42}', 'running', 1, 1, 0, 1, NOW() - INTERVAL '10 seconds', gen_random_uuid())
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let recovered = sweep_stale(&pool, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(recovered, 1);
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(CountWorker {
+            counter: counter.clone(),
+        })
+        .config(fast_config())
+        .build();
+
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counter.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("maxAttempts=1 + crash should recover and run handler once");
+    queue.shutdown().await.unwrap();
+
+    let (state, stalled, attempt): (String, i32, i32) =
+        sqlx::query_as("SELECT state, stalled_count, attempt FROM eddyq_jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "completed");
+    assert_eq!(stalled, 1, "the crash counted as one stall");
+    assert_eq!(attempt, 1, "exactly one real handler invocation");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn per_job_max_stalled_count_override(pool: PgPool) {
+    use eddyq_core::EnqueueOptions;
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(CountWorker {
+            counter: Arc::new(AtomicUsize::new(0)),
+        })
+        .config(fast_config())
+        .build();
+
+    let opts = EnqueueOptions {
+        max_stalled_count: Some(3),
+        ..Default::default()
+    };
+    queue.enqueue_with(&Count { n: 1 }, opts).await.unwrap();
+
+    let stored: i32 = sqlx::query_scalar("SELECT max_stalled_count FROM eddyq_jobs LIMIT 1")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(state, "failed", "already at max_attempts → fail, not retry");
+    assert_eq!(stored, 3);
 }
 
 #[sqlx::test(migrations = "./migrations")]
@@ -687,6 +800,85 @@ impl Worker<Count> for SlowWorker {
     }
 }
 
+/// Bounded drain — handler finishes within the grace window. Should report
+/// `DrainOutcome::Clean` and leave the job `completed`. Mirrors
+/// `shutdown_drain_awaits_in_flight` but via `shutdown_drain_bounded`.
+#[sqlx::test(migrations = "./migrations")]
+async fn drain_bounded_clean_within_grace(pool: PgPool) {
+    use eddyq_core::DrainOutcome;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(SlowWorker {
+            started: started.clone(),
+            hold: Duration::from_millis(200),
+        })
+        .config(fast_config())
+        .build();
+
+    queue.enqueue(&Count { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("worker should start within 2s");
+
+    let outcome = queue
+        .shutdown_drain_bounded(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, DrainOutcome::Clean), "{outcome:?}");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM eddyq_jobs LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "completed");
+}
+
+/// Bounded drain — handler hangs past the grace window. Should escalate to
+/// force-reclaim, report `DrainOutcome::Escalated`, return within `grace`,
+/// and leave the row `pending` with `stalled_count=1`.
+#[sqlx::test(migrations = "./migrations")]
+async fn drain_bounded_escalates_on_timeout(pool: PgPool) {
+    use eddyq_core::DrainOutcome;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(SlowWorker {
+            started: started.clone(),
+            hold: Duration::from_secs(30), // far longer than grace
+        })
+        .config(fast_config())
+        .build();
+
+    queue.enqueue(&Count { n: 1 }).await.unwrap();
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("worker should start within 2s");
+
+    let grace = Duration::from_millis(300);
+    let t = std::time::Instant::now();
+    let outcome = queue.shutdown_drain_bounded(grace).await.unwrap();
+    let elapsed = t.elapsed();
+
+    assert!(
+        elapsed < grace + Duration::from_secs(2),
+        "shutdown must return within grace + slack (took {elapsed:?})"
+    );
+    match outcome {
+        DrainOutcome::Escalated { reclaimed } => assert_eq!(reclaimed, 1),
+        DrainOutcome::Clean => panic!("expected escalation, got clean"),
+    }
+
+    let (state, stalled, attempt): (String, i32, i32) =
+        sqlx::query_as("SELECT state, stalled_count, attempt FROM eddyq_jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending");
+    assert_eq!(stalled, 1, "escalation reclaim ticked stalled_count");
+    assert_eq!(attempt, 0, "and decremented attempt");
+}
+
 /// `Drain` mode: handler runs to completion, queue.shutdown returns after
 /// it does, job ends `completed`.
 #[sqlx::test(migrations = "./migrations")]
@@ -756,8 +948,8 @@ async fn shutdown_force_reclaims_in_flight(pool: PgPool) {
         elapsed
     );
 
-    let (state, attempt): (String, i32) =
-        sqlx::query_as("SELECT state, attempt FROM eddyq_jobs WHERE kind = 'count'")
+    let (state, attempt, stalled): (String, i32, i32) =
+        sqlx::query_as("SELECT state, attempt, stalled_count FROM eddyq_jobs WHERE kind = 'count'")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -765,9 +957,13 @@ async fn shutdown_force_reclaims_in_flight(pool: PgPool) {
         state, "pending",
         "Force should reclaim the in-flight row to pending immediately"
     );
-    assert!(
-        attempt >= 1,
-        "reclaim should bump attempt count (got {attempt})"
+    assert_eq!(
+        stalled, 1,
+        "reclaim should tick stalled_count instead of burning the attempt budget"
+    );
+    assert_eq!(
+        attempt, 0,
+        "reclaim decrements attempt on the recover branch; next claim will re-bump (got {attempt})"
     );
 
     // Group/queue running counter should be back to 0.
@@ -2201,10 +2397,9 @@ async fn cleanup_batch_respects_none_retention(pool: PgPool) {
 // ---- count-cap retention ---------------------------------------------------
 //
 // Age caps a row's max lifetime; count caps the table's max size. We support
-// both, with OR semantics — a row is reaped if it exceeds *either* bound,
-// matching BullMQ's `removeOnComplete: { age, count }`. The count cap is what
-// makes Redis safe under high throughput: 24h of completed at 10K j/s is tens
-// of GB, but `count: 10_000` is bounded.
+// both, with OR semantics — a row is reaped if it exceeds *either* bound.
+// The count cap is what makes Redis safe under high throughput: 24h of
+// completed at 10K j/s is tens of GB, but `count: 10_000` is bounded.
 
 #[sqlx::test(migrations = "./migrations")]
 async fn cleanup_count_only_keeps_newest_n(pool: PgPool) {
@@ -2523,9 +2718,9 @@ fn get_sql_returns_up_and_down() {
     assert!(get_sql(999_999_999, Direction::Up).is_none());
 }
 
-/// The BullMQ-killer: enqueuing inside the user's transaction. If the user's
-/// work rolls back, the job must NOT appear — even though it was "inserted"
-/// earlier in the transaction.
+/// Enqueuing inside the user's transaction. If the user's work rolls back,
+/// the job must NOT appear — even though it was "inserted" earlier in the
+/// transaction.
 #[sqlx::test(migrations = "./migrations")]
 async fn transactional_enqueue_rolls_back_with_user_tx(pool: PgPool) {
     let queue = Queue::builder(pool.clone()).build();
@@ -3949,4 +4144,133 @@ async fn clean_jobs_respects_grace_and_state(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(remaining, vec!["new_ok", "old_fail"]);
+}
+
+/// Crash + handler-throw interaction. Headline claim of the stalled_count
+/// model: `attempt` is reserved for completed handler invocations, so a
+/// crash doesn't eat into the throw-retry budget. `Flaky` is configured to
+/// throw on attempt 1 and succeed on attempt 2 — with maxAttempts=2 and
+/// one prior stall, the job should still succeed.
+#[sqlx::test(migrations = "./migrations")]
+async fn stall_then_handler_throw_preserves_attempt_budget(pool: PgPool) {
+    use eddyq_core::EnqueueOptions;
+
+    // Enqueue a Flaky{fail_until_attempt: 2} — throws once, succeeds the
+    // second time. maxAttempts=2 leaves zero slack for crashes if a stall
+    // also burned the budget.
+    let queue = Queue::builder(pool.clone())
+        .register::<Flaky, _>(FlakyWorker)
+        .config(fast_config())
+        .build();
+    let opts = EnqueueOptions {
+        max_attempts: Some(2),
+        max_stalled_count: Some(1),
+        ..Default::default()
+    };
+    queue
+        .enqueue_with(
+            &Flaky {
+                fail_until_attempt: 2,
+            },
+            opts,
+        )
+        .await
+        .unwrap();
+
+    // Plant a stalled prior claim: state=running, attempt=1, heartbeat old.
+    sqlx::query(
+        r#"
+        UPDATE eddyq_jobs
+           SET state        = 'running',
+               attempt      = 1,
+               heartbeat_at = NOW() - INTERVAL '10 seconds',
+               worker_id    = gen_random_uuid()
+         WHERE kind = 'flaky'
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Sweep recovers (stalled 0→1, attempt 1→0). Now back to pending with
+    // a full maxAttempts=2 budget.
+    let recovered = sweep_stale(&pool, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(recovered, 1);
+
+    // Start the queue. The handler will throw on attempt 1, retry, succeed
+    // on attempt 2. Final state should be `completed`, NOT `failed`.
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM eddyq_jobs WHERE kind = 'flaky'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if state == "completed" || state == "failed" {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("flaky job should reach a terminal state within 5s");
+    queue.shutdown().await.unwrap();
+
+    let (state, stalled, attempt): (String, i32, i32) =
+        sqlx::query_as("SELECT state, stalled_count, attempt FROM eddyq_jobs WHERE kind = 'flaky'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state, "completed",
+        "stall + one throw + one success should succeed (budget preserved)"
+    );
+    assert_eq!(stalled, 1, "one stall recorded");
+    assert_eq!(
+        attempt, 2,
+        "exactly two real handler invocations (the throw + the success)"
+    );
+}
+
+/// Pre-upgrade compatibility: a row inserted via raw SQL that doesn't set
+/// the new columns falls back to their defaults (0 / 1). Simulates the
+/// state immediately after the migration runs — rows enqueued before the
+/// upgrade still recover cleanly. Less of a real bug-hunt and more of a
+/// regression guard against future default changes.
+#[sqlx::test(migrations = "./migrations")]
+async fn pre_upgrade_row_recovers_cleanly_pg(pool: PgPool) {
+    // Insert without specifying stalled_count / max_stalled_count — the
+    // column defaults backfill them as if the row had been there before
+    // the migration ran.
+    sqlx::query(
+        r#"
+        INSERT INTO eddyq_jobs (kind, payload, state, attempt, max_attempts, heartbeat_at, worker_id)
+        VALUES ('count', '{"n":7}', 'running', 1, 3, NOW() - INTERVAL '10 seconds', gen_random_uuid())
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Confirm the defaults landed.
+    let (stalled, max_stalled): (i32, i32) =
+        sqlx::query_as("SELECT stalled_count, max_stalled_count FROM eddyq_jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stalled, 0);
+    assert_eq!(max_stalled, 1);
+
+    let recovered = sweep_stale(&pool, Duration::from_secs(1)).await.unwrap();
+    assert_eq!(recovered, 1);
+
+    let (state, stalled, attempt): (String, i32, i32) =
+        sqlx::query_as("SELECT state, stalled_count, attempt FROM eddyq_jobs LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending");
+    assert_eq!(stalled, 1);
+    assert_eq!(attempt, 0);
 }

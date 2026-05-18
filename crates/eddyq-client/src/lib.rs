@@ -15,9 +15,9 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 
 pub use eddyq_core::{
     BatchEnqueueResult, BatchOptions, BulkEnqueueResult, CleanState, DEFAULT_QUEUE, Directive,
-    DynEnqueue, EnqueueResult, Error, HandlerFailure, JobContext, JobId, JobResult, JobState,
-    Queue as CoreQueue, QueueBuilder as CoreQueueBuilder, QueueConfig, Result, RetentionRule,
-    ShutdownMode,
+    DrainOutcome, DynEnqueue, EnqueueResult, Error, HandlerFailure, JobContext, JobId, JobResult,
+    JobState, Queue as CoreQueue, QueueBuilder as CoreQueueBuilder, QueueConfig, Result,
+    RetentionRule, ShutdownMode,
     group::{Group, GroupRule, StoredRule},
     migrate::{Direction, MigrateReport, MigrationStatus},
     named_queue::NamedQueue,
@@ -147,8 +147,8 @@ impl Client {
         eddyq_core::fetch::cancel(&self.pool, id).await
     }
 
-    /// Ad-hoc retention sweep (BullMQ `queue.clean()`). Deletes up to `limit`
-    /// finalized jobs in `state` older than `grace`. Returns deleted count.
+    /// Ad-hoc retention sweep. Deletes up to `limit` finalized jobs in
+    /// `state` older than `grace`. Returns deleted count.
     pub async fn clean(&self, grace: Duration, limit: u32, state: CleanState) -> Result<u64> {
         eddyq_core::fetch::clean_jobs(&self.pool, state.as_str(), grace.as_secs(), limit).await
     }
@@ -262,7 +262,7 @@ impl Client {
     }
 
     /// Upsert an interval-driven schedule. Fires every `interval_ms`
-    /// (BullMQ `{ every }` shorthand). Skip-missed semantics match cron:
+    /// (the `{ every }` shorthand). Skip-missed semantics match cron:
     /// a delayed fire doesn't catch up. `interval_ms` must be positive.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_interval_schedule(

@@ -12,17 +12,20 @@ use crate::{
 pub struct EnqueueOptions {
     pub scheduled_at: Option<DateTime<Utc>>,
     pub max_attempts: Option<i32>,
+    /// Bound on stall-recovery retries. Defaults to 1 (one free stall before
+    /// the row is moved to `failed`).
+    pub max_stalled_count: Option<i32>,
     pub priority: Option<i16>,
     pub unique_key: Option<String>,
     pub group_key: Option<String>,
     pub tags: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
     pub queue: Option<String>,
-    /// BullMQ-style `removeOnComplete`. Forwarded to `DynEnqueue` and
-    /// honored inline by the Redis backend on `complete`. Postgres ignores
-    /// per-job rules (its cleanup tick handles age-based retention).
+    /// `removeOnComplete`. Forwarded to `DynEnqueue` and honored inline
+    /// by the Redis backend on `complete`. Postgres ignores per-job rules
+    /// (its cleanup tick handles age-based retention).
     pub remove_on_complete: Option<RetentionRule>,
-    /// BullMQ-style `removeOnFail`. Same semantics on `fail`.
+    /// `removeOnFail`. Same semantics on `fail`.
     pub remove_on_fail: Option<RetentionRule>,
 }
 
@@ -41,6 +44,9 @@ async fn insert_job<J: Job>(
 ) -> Result<(EnqueueResult, bool)> {
     let payload = serde_json::to_value(job)?;
     let max_attempts = opts.max_attempts.unwrap_or_else(|| job.max_attempts());
+    let max_stalled_count = opts
+        .max_stalled_count
+        .unwrap_or_else(|| job.max_stalled_count());
     let priority = opts.priority.unwrap_or_else(|| job.priority());
     let unique_key = opts.unique_key.or_else(|| job.unique_key());
     let group_key = opts.group_key.clone().or_else(|| job.group_key());
@@ -56,8 +62,8 @@ async fn insert_job<J: Job>(
 
     let row: Option<(JobId,)> = sqlx::query_as(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
-        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, max_stalled_count, scheduled_at, unique_key, group_key, tags, metadata, queue)
+        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT DO NOTHING
         RETURNING id
         "#,
@@ -66,6 +72,7 @@ async fn insert_job<J: Job>(
     .bind(payload)
     .bind(priority)
     .bind(max_attempts)
+    .bind(max_stalled_count)
     .bind(scheduled_at)
     .bind(unique_key)
     .bind(&group_key)
@@ -180,6 +187,7 @@ async fn insert_many<J: Job>(
     let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(jobs.len());
     let mut priorities: Vec<i16> = Vec::with_capacity(jobs.len());
     let mut max_attempts: Vec<i32> = Vec::with_capacity(jobs.len());
+    let mut max_stalled_counts: Vec<i32> = Vec::with_capacity(jobs.len());
     let mut scheduled_ats: Vec<DateTime<Utc>> = Vec::with_capacity(jobs.len());
     let mut unique_keys: Vec<Option<String>> = Vec::with_capacity(jobs.len());
     let mut group_keys: Vec<Option<String>> = Vec::with_capacity(jobs.len());
@@ -194,6 +202,7 @@ async fn insert_many<J: Job>(
         payloads.push(serde_json::to_value(job)?);
         priorities.push(job.priority());
         max_attempts.push(job.max_attempts());
+        max_stalled_counts.push(job.max_stalled_count());
         scheduled_ats.push(now);
         unique_keys.push(job.unique_key());
         group_keys.push(job.group_key());
@@ -215,12 +224,13 @@ async fn insert_many<J: Job>(
     let rows_inserted: (i64,) = sqlx::query_as(
         r#"
         WITH inserted AS (
-            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, max_stalled_count, scheduled_at, unique_key, group_key, tags, metadata, queue)
             SELECT $1,
                    t.payload,
                    'pending',
                    t.priority,
                    t.max_attempts,
+                   t.max_stalled_count,
                    t.scheduled_at,
                    t.unique_key,
                    t.group_key,
@@ -228,9 +238,9 @@ async fn insert_many<J: Job>(
                    t.metadata,
                    t.queue
               FROM UNNEST(
-                  $2::jsonb[], $3::smallint[], $4::int[],
-                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[]
-              ) AS t(payload, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue)
+                  $2::jsonb[], $3::smallint[], $4::int[], $5::int[],
+                  $6::timestamptz[], $7::text[], $8::text[], $9::jsonb[], $10::jsonb[], $11::text[]
+              ) AS t(payload, priority, max_attempts, max_stalled_count, scheduled_at, unique_key, group_key, tags, metadata, queue)
             ON CONFLICT DO NOTHING
          RETURNING id
         )
@@ -241,6 +251,7 @@ async fn insert_many<J: Job>(
     .bind(&payloads)
     .bind(&priorities)
     .bind(&max_attempts)
+    .bind(&max_stalled_counts)
     .bind(&scheduled_ats)
     .bind(&unique_keys)
     .bind(&group_keys)
@@ -274,6 +285,8 @@ pub struct DynEnqueue {
     pub kind: String,
     pub payload: serde_json::Value,
     pub max_attempts: i32,
+    #[serde(default = "default_max_stalled_count")]
+    pub max_stalled_count: i32,
     pub priority: i16,
     pub queue: String,
     pub scheduled_at: Option<DateTime<Utc>>,
@@ -282,25 +295,31 @@ pub struct DynEnqueue {
     pub tags: Vec<String>,
     pub metadata: serde_json::Value,
     pub batch_id: Option<i64>,
-    /// BullMQ-style `removeOnComplete`. Honored by the Redis backend inline
-    /// on `complete`; Postgres ignores per-job rules and relies on the
+    /// `removeOnComplete`. Honored by the Redis backend inline on
+    /// `complete`; Postgres ignores per-job rules and relies on the
     /// queue-default `cleanup` tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_on_complete: Option<RetentionRule>,
-    /// BullMQ-style `removeOnFail`. Same semantics as `remove_on_complete`
-    /// but applied to the `failed` ZSET on terminal failure.
+    /// `removeOnFail`. Same semantics as `remove_on_complete` but applied
+    /// to the `failed` ZSET on terminal failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_on_fail: Option<RetentionRule>,
 }
 
+fn default_max_stalled_count() -> i32 {
+    1
+}
+
 impl DynEnqueue {
     /// Build a request with the same defaults the `Job` trait provides:
-    /// `max_attempts=3`, `priority=0`, `queue="default"`, empty tags/metadata.
+    /// `max_attempts=3`, `max_stalled_count=1`, `priority=0`, `queue="default"`,
+    /// empty tags/metadata.
     pub fn new(kind: impl Into<String>, payload: serde_json::Value) -> Self {
         Self {
             kind: kind.into(),
             payload,
             max_attempts: 3,
+            max_stalled_count: 1,
             priority: 0,
             queue: crate::job::DEFAULT_QUEUE.to_owned(),
             scheduled_at: None,
@@ -322,8 +341,8 @@ async fn insert_dyn(conn: &mut PgConnection, req: DynEnqueue) -> Result<(Enqueue
 
     let row: Option<(JobId,)> = sqlx::query_as(
         r#"
-        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
-        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, max_stalled_count, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
+        VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT DO NOTHING
         RETURNING id
         "#,
@@ -332,6 +351,7 @@ async fn insert_dyn(conn: &mut PgConnection, req: DynEnqueue) -> Result<(Enqueue
     .bind(&req.payload)
     .bind(req.priority)
     .bind(req.max_attempts)
+    .bind(req.max_stalled_count)
     .bind(scheduled_at)
     .bind(&req.unique_key)
     .bind(&req.group_key)
@@ -399,6 +419,7 @@ async fn insert_many_dyn(
     let mut payloads: Vec<serde_json::Value> = Vec::with_capacity(n);
     let mut priorities: Vec<i16> = Vec::with_capacity(n);
     let mut max_attempts: Vec<i32> = Vec::with_capacity(n);
+    let mut max_stalled_counts: Vec<i32> = Vec::with_capacity(n);
     let mut scheduled_ats: Vec<DateTime<Utc>> = Vec::with_capacity(n);
     let mut unique_keys: Vec<Option<String>> = Vec::with_capacity(n);
     let mut group_keys: Vec<Option<String>> = Vec::with_capacity(n);
@@ -420,6 +441,7 @@ async fn insert_many_dyn(
         payloads.push(req.payload);
         priorities.push(req.priority);
         max_attempts.push(req.max_attempts);
+        max_stalled_counts.push(req.max_stalled_count);
         scheduled_ats.push(scheduled_at);
         unique_keys.push(req.unique_key);
         group_keys.push(req.group_key);
@@ -438,12 +460,13 @@ async fn insert_many_dyn(
     let rows_inserted: (i64,) = sqlx::query_as(
         r#"
         WITH inserted AS (
-            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
+            INSERT INTO eddyq_jobs (kind, payload, state, priority, max_attempts, max_stalled_count, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
             SELECT t.kind,
                    t.payload,
                    'pending',
                    t.priority,
                    t.max_attempts,
+                   t.max_stalled_count,
                    t.scheduled_at,
                    t.unique_key,
                    t.group_key,
@@ -452,9 +475,9 @@ async fn insert_many_dyn(
                    t.queue,
                    t.batch_id
               FROM UNNEST(
-                  $1::text[], $2::jsonb[], $3::smallint[], $4::int[],
-                  $5::timestamptz[], $6::text[], $7::text[], $8::jsonb[], $9::jsonb[], $10::text[], $11::bigint[]
-              ) AS t(kind, payload, priority, max_attempts, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
+                  $1::text[], $2::jsonb[], $3::smallint[], $4::int[], $5::int[],
+                  $6::timestamptz[], $7::text[], $8::text[], $9::jsonb[], $10::jsonb[], $11::text[], $12::bigint[]
+              ) AS t(kind, payload, priority, max_attempts, max_stalled_count, scheduled_at, unique_key, group_key, tags, metadata, queue, batch_id)
             ON CONFLICT DO NOTHING
          RETURNING id
         )
@@ -465,6 +488,7 @@ async fn insert_many_dyn(
     .bind(&payloads)
     .bind(&priorities)
     .bind(&max_attempts)
+    .bind(&max_stalled_counts)
     .bind(&scheduled_ats)
     .bind(&unique_keys)
     .bind(&group_keys)

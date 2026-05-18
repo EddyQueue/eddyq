@@ -8,7 +8,7 @@
 
 - **Two backends, one API.** Postgres for transactional + durable; Redis (via Redis Functions, no Lua eval) for high-throughput ephemeral. Pick per-queue inside one app.
 - **Transactional enqueue (Postgres).** Enqueue a job in the same transaction as your business write. No more "the job ran before the row committed" bugs.
-- **High throughput (Redis).** ~70k jobs/sec bulk ingest, ~19k jobs/sec end-to-end drain at 64 workers — matches or beats BullMQ on the same hardware. See [`benches/README.md`](benches/README.md).
+- **High throughput (Redis).** ~70k jobs/sec bulk ingest, ~19k jobs/sec end-to-end drain at 64 workers. See [`benches/README.md`](benches/README.md).
 - **First-class Node bindings.** `pnpm add @eddyq/queue` and ship from NestJS, Next.js, or any Node app.
 - **Rich scheduling and throttling on either backend.** Group concurrency caps, token-bucket rate limits, pattern-based group rules, cron + `{ every: ms }` schedules, named-queue concurrency, per-job retention.
 - **Native batches (Postgres).** Fan out N jobs and run a callback exactly once when they all settle — no per-app counter table.
@@ -46,7 +46,7 @@ queue.work("send-email", async ({ payload }) => { /* … */ });
 await queue.start();
 await queue.enqueue("send-email", { to: "alice@example.com" });
 
-// BullMQ-style interval schedules:
+// Interval schedules:
 await queue.addSchedule("cron-5min", { every: 5 * 60 * 1000 }, "WorkerJob.Cron5Min", {});
 // Or a cron expression:
 await queue.addSchedule("nightly", "0 0 0 * * *", "WorkerJob.Nightly", {});

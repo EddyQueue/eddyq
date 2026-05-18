@@ -191,7 +191,12 @@ export interface GroupProfile {
  */
 export type QueueDefaults = Pick<
   EnqueueOptions,
-  "maxAttempts" | "priority" | "tags" | "removeOnComplete" | "removeOnFail"
+  | "maxAttempts"
+  | "maxStalledCount"
+  | "priority"
+  | "tags"
+  | "removeOnComplete"
+  | "removeOnFail"
 >;
 
 /** Per-enqueue overrides accepted by `QueueHandle.enqueue`. The `queue` field is bound by the handle and not accepted. */
@@ -230,7 +235,7 @@ export interface QueueHandle {
   enqueueBatch(input: QueueEnqueueBatchInput): Promise<BatchEnqueueOutcome>;
 
   /**
-   * Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+   * Ad-hoc retention sweep. Deletes up to `limit`
    * finalized jobs in `state` older than `graceMs` milliseconds. Useful for
    * one-shot pruning from admin endpoints or maintenance scripts; routine
    * retention should go through the configured cleanup tick instead.

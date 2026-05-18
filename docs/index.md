@@ -32,7 +32,7 @@ features:
     details: The hot path is Rust for predictable latency under load. NAPI-RS bindings keep the JS surface idiomatic — no FFI weirdness.
   - icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>'
     title: Familiar API
-    details: Queues, workers, schedules, retries, cancellation, group concurrency. Patterns you already know from BullMQ and Sidekiq.
+    details: Queues, workers, schedules, retries, cancellation, group concurrency.
   - icon: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 3"/><circle cx="12" cy="12" r="9"/></svg>'
     title: Cron schedules
     details: Declarative, durable cron schedules backed by the same Postgres. Single MAINTENANCE_ROLE picks up missed runs after a deploy.

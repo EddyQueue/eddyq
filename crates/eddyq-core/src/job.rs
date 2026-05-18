@@ -38,6 +38,14 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
         3
     }
 
+    /// Maximum number of stall recoveries (worker-lost rescues) before the job
+    /// is moved to `failed`. Distinct from `max_attempts` so infra failures
+    /// don't burn the handler-throw retry budget. Default 1 (one free recovery,
+    /// then fail).
+    fn max_stalled_count(&self) -> i32 {
+        1
+    }
+
     fn priority(&self) -> i16 {
         0
     }
@@ -84,5 +92,10 @@ pub struct JobContext {
     pub kind: String,
     pub attempt: i32,
     pub max_attempts: i32,
+    /// Stall-recovery count. `> 0` means a prior worker died mid-handler and
+    /// this row was rescued. Handlers can branch on this to resume from a
+    /// checkpoint instead of replaying from scratch.
+    pub stalled_count: i32,
+    pub max_stalled_count: i32,
     pub worker_id: Uuid,
 }

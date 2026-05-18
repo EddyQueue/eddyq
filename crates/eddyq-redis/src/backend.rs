@@ -659,9 +659,13 @@ fn decode_stored(name: &str, raw: &str) -> Option<StoredSchedule> {
 // FCALL helpers
 // ============================================================
 
-/// Wire-format `DynEnqueue` → 12 ARGV strings, in the order the Lua
-/// `fn_enqueue` expects (see library.lua).
-fn dyn_to_argv(req: &DynEnqueue) -> [String; 12] {
+/// Wire-format `DynEnqueue` → 13 ARGV strings, in the order the Lua
+/// `fn_enqueue` expects (see library.lua). `max_stalled_count` is the
+/// last per-job field; for the single-enqueue path the caller appends
+/// `now_ms` after the per-job args, so the on-wire order ends up as the
+/// first 12 fields, `now_ms`, then `max_stalled_count` (positions 13/14
+/// in the Lua ARGV).
+fn dyn_to_argv(req: &DynEnqueue) -> [String; 13] {
     let scheduled_at_ms = req.scheduled_at.map(|t| t.timestamp_millis()).unwrap_or(0);
     [
         req.kind.clone(),
@@ -674,11 +678,12 @@ fn dyn_to_argv(req: &DynEnqueue) -> [String; 12] {
         req.queue.clone(),
         serde_json::to_string(&req.tags).unwrap_or_else(|_| "[]".into()),
         req.metadata.to_string(),
-        // BullMQ-style per-job retention. Empty string = no rule; the
-        // Lua `apply_retention` helper falls back to ZADDing the job into
-        // the finalized ZSET so the queue-default `cleanup` tick can sweep it.
+        // Per-job retention. Empty string = no rule; the Lua
+        // `apply_retention` helper falls back to ZADDing the job into the
+        // finalized ZSET so the queue-default `cleanup` tick can sweep it.
         RetentionRule::to_arg(req.remove_on_complete.as_ref()),
         RetentionRule::to_arg(req.remove_on_fail.as_ref()),
+        req.max_stalled_count.to_string(),
     ]
 }
 
@@ -909,10 +914,18 @@ struct ClaimedJobJson {
     priority: i16,
     max_attempts: i32,
     attempt: i32,
+    #[serde(default)]
+    stalled_count: i32,
+    #[serde(default = "default_max_stalled_count_json")]
+    max_stalled_count: i32,
     queue: String,
     #[serde(default)]
     group_key: Option<String>,
     worker_id: String,
+}
+
+fn default_max_stalled_count_json() -> i32 {
+    1
 }
 
 fn parse_claimed_job(s: &str) -> Result<ClaimedJob, crate::Error> {
@@ -926,6 +939,8 @@ fn parse_claimed_job(s: &str) -> Result<ClaimedJob, crate::Error> {
         payload,
         attempt: raw.attempt,
         max_attempts: raw.max_attempts,
+        stalled_count: raw.stalled_count,
+        max_stalled_count: raw.max_stalled_count,
         group_key: raw.group_key,
         queue: raw.queue,
         worker_id,
@@ -946,7 +961,6 @@ impl Backend for RedisBackend {
             // PR3 wires the cancel_requested heartbeat-poll. Until then
             // `cancel` only handles pending/scheduled jobs.
             cancel_running: false,
-            // BullMQ uses (1, 2_097_152). Match for migration parity.
             priority_range: (1, 2_097_152),
             cluster_safe: true,
         }
@@ -985,8 +999,8 @@ impl Backend for RedisBackend {
                 skipped: 0,
             });
         }
-        // Build the flat ARGV: n, then n × 12 fields, then now_ms.
-        let mut argv: Vec<String> = Vec::with_capacity(2 + reqs.len() * 12);
+        // Build the flat ARGV: n, then n × 13 fields, then now_ms.
+        let mut argv: Vec<String> = Vec::with_capacity(2 + reqs.len() * 13);
         argv.push(reqs.len().to_string());
         for r in &reqs {
             for a in dyn_to_argv(r) {

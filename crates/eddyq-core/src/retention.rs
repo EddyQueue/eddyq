@@ -1,16 +1,14 @@
-//! Per-job retention rule (BullMQ-style `removeOnComplete` /
-//! `removeOnFail`). The shape lives in core so `DynEnqueue` and every
-//! backend reference one definition. `PgBackend` ignores the per-job
-//! fields (its leader-driven `cleanup` tick handles retention from
-//! `QueueConfig`); `RedisBackend` honors them inline in
-//! `eddyq_complete` / `eddyq_fail` and falls back to the queue-default
+//! Per-job retention rule (`removeOnComplete` / `removeOnFail`). The shape
+//! lives in core so `DynEnqueue` and every backend reference one definition.
+//! `PgBackend` ignores the per-job fields (its leader-driven `cleanup` tick
+//! handles retention from `QueueConfig`); `RedisBackend` honors them inline
+//! in `eddyq_complete` / `eddyq_fail` and falls back to the queue-default
 //! sweep for jobs without a per-job rule.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-/// Retention semantics for a finalized job. Mirrors BullMQ's API exactly so
-/// migration from BullMQ doesn't require relearning the knobs.
+/// Retention semantics for a finalized job.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum RetentionRule {

@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{DateTime, TimeZone, Utc};
 use eddyq_client::{
-    CleanState, Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DynEnqueue,
-    HandlerFailure, JobContext, JobResult, JobState, RetentionRule,
+    CleanState, Client, ClientConfig, CoreQueue, CoreQueueBuilder, Directive, DrainOutcome,
+    DynEnqueue, HandlerFailure, JobContext, JobResult, JobState, RetentionRule,
     ScheduleDeclaration as CoreScheduleDeclaration, ShutdownMode,
 };
 use eddyq_core::backend::Backend;
@@ -112,6 +112,11 @@ pub struct ShutdownOptions {
 pub struct EnqueueOptions {
     /// Max total attempts before the job is marked failed. Default 3.
     pub max_attempts: Option<i32>,
+    /// Max number of stall recoveries (worker-lost rescues) before the job is
+    /// moved to `failed`. Distinct from `maxAttempts` so a pod kill mid-handler
+    /// doesn't burn the handler-throw retry budget. Default 1 — one free
+    /// recovery, then fail.
+    pub max_stalled_count: Option<i32>,
     /// Priority (higher runs first). Default 0.
     pub priority: Option<i16>,
     /// Named queue to land this job on. Default "default".
@@ -130,12 +135,12 @@ pub struct EnqueueOptions {
     pub tags: Option<Vec<String>>,
     /// Arbitrary JSON metadata attached to the job (not passed to the handler).
     pub metadata: Option<serde_json::Value>,
-    /// BullMQ-style `removeOnComplete`: `true` (drop on finalize) | `false`
+    /// `removeOnComplete`: `true` (drop on finalize) | `false`
     /// (keep forever) | `number` (keep last N) | `{ age?: seconds; count?: N }`.
     /// Redis-only — Postgres ignores per-job rules and uses its cleanup tick.
     #[napi(ts_type = "boolean | number | { age?: number; count?: number }")]
     pub remove_on_complete: Option<serde_json::Value>,
-    /// BullMQ-style `removeOnFail`. Same shape as `removeOnComplete`.
+    /// `removeOnFail`. Same shape as `removeOnComplete`.
     #[napi(ts_type = "boolean | number | { age?: number; count?: number }")]
     pub remove_on_fail: Option<serde_json::Value>,
 }
@@ -156,6 +161,8 @@ pub struct EnqueueManyItem {
     pub kind: String,
     pub payload: serde_json::Value,
     pub max_attempts: Option<i32>,
+    /// See `EnqueueOptions.maxStalledCount`.
+    pub max_stalled_count: Option<i32>,
     pub priority: Option<i16>,
     pub queue: Option<String>,
     /// Run no earlier than this time (epoch milliseconds). Default now.
@@ -484,6 +491,12 @@ pub struct JobCall {
     pub kind: String,
     pub attempt: i32,
     pub max_attempts: i32,
+    /// Number of times this row has been rescued from a stalled (worker-lost)
+    /// state. `> 0` means a prior worker died mid-handler. Distinct from
+    /// `attempt`, which counts completed handler invocations. Handlers can
+    /// branch on this to resume from a checkpoint instead of replaying.
+    pub stalled_count: i32,
+    pub max_stalled_count: i32,
 }
 
 /// JS side: `async (call: JobCall) => unknown`. Stored Arc-wrapped so the
@@ -642,7 +655,7 @@ impl Queue {
         run(move || do_cancel(client, id)).await
     }
 
-    /// Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+    /// Ad-hoc retention sweep. Deletes up to `limit`
     /// finalized jobs in `state` older than `graceMs` milliseconds. `state` is
     /// one of `"completed" | "failed" | "cancelled"`. Returns the number of
     /// rows actually deleted.
@@ -842,7 +855,7 @@ impl Queue {
         .await
     }
 
-    /// Register a fixed-interval schedule (BullMQ `{ every: ms }`). Fires
+    /// Register a fixed-interval schedule (`{ every: ms }`). Fires
     /// every `intervalMs` milliseconds — no cron expression required.
     /// Skip-missed semantics: a delayed fire doesn't catch up, matching
     /// the cron path and the Redis backend.
@@ -1172,7 +1185,7 @@ impl Queue {
     ///     reclaim rows this pod was processing (set running→pending) so
     ///     other pods pick them up without waiting for heartbeat sweep.
     ///     Use when SIGKILL is imminent (Kubernetes grace period almost
-    ///     up). Modeled on BullMQ's `worker.close({ force: true })`.
+    ///     up).
     ///   - `"abandon"` — last-resort: drop runtime, leave rows alone. The
     ///     heartbeat sweep on another pod will recover after `staleAfter`.
     ///     Use only on panic exits.
@@ -1241,15 +1254,25 @@ impl Queue {
                         .and_then(|o| o.graceful_timeout_ms)
                         .unwrap_or(30_000),
                 ));
-                let fut =
-                    run(move || async move { queue.shutdown_with(core_mode).await.map_err(err) });
-                match tokio::time::timeout(grace, fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(napi::Error::from_reason(format!(
-                        "shutdown exceeded graceful timeout ({grace:?}) — runtime tasks still in flight. \
-                         Re-run with mode=\"force\" if jobs need to be made re-eligible immediately."
-                    ))),
-                }
+                // Drain is bounded by `grace`: on timeout, core internally
+                // aborts the runtime + reclaims in-flight rows so other pods
+                // can pick them up immediately. The returned outcome tells us
+                // which branch ran (for tracing). Either way: shutdown
+                // returns Ok within `grace`, never strands a runtime live.
+                run(move || async move {
+                    match queue.shutdown_drain_bounded(grace).await.map_err(err)? {
+                        DrainOutcome::Clean => {}
+                        DrainOutcome::Escalated { reclaimed } => {
+                            eprintln!(
+                                "[eddyq] drain timed out after {}ms; escalated to force, reclaimed {}",
+                                grace.as_millis(),
+                                reclaimed,
+                            );
+                        }
+                    }
+                    Ok(())
+                })
+                .await
             }
             ShutdownMode::Abandon => {
                 fire_abort_now();
@@ -1346,6 +1369,8 @@ fn dispatcher(
                 kind: ctx.kind,
                 attempt: ctx.attempt,
                 max_attempts: ctx.max_attempts,
+                stalled_count: ctx.stalled_count,
+                max_stalled_count: ctx.max_stalled_count,
             };
             let promise = tsfn.call_async(call).await.map_err(|e| {
                 // This path means "the JS host couldn't even deliver the call"
@@ -1449,6 +1474,9 @@ async fn do_enqueue(
         if let Some(n) = opts.max_attempts {
             req.max_attempts = n;
         }
+        if let Some(n) = opts.max_stalled_count {
+            req.max_stalled_count = n;
+        }
         if let Some(p) = opts.priority {
             req.priority = p;
         }
@@ -1525,6 +1553,9 @@ async fn do_enqueue_many(
         if let Some(n) = item.max_attempts {
             req.max_attempts = n;
         }
+        if let Some(n) = item.max_stalled_count {
+            req.max_stalled_count = n;
+        }
         if let Some(p) = item.priority {
             req.priority = p;
         }
@@ -1577,6 +1608,9 @@ fn item_to_dyn(item: EnqueueManyItem) -> Result<eddyq_client::DynEnqueue> {
     let mut req = eddyq_client::DynEnqueue::new(item.kind, item.payload);
     if let Some(n) = item.max_attempts {
         req.max_attempts = n;
+    }
+    if let Some(n) = item.max_stalled_count {
+        req.max_stalled_count = n;
     }
     if let Some(p) = item.priority {
         req.priority = p;
@@ -1989,7 +2023,7 @@ impl RedisQueue {
         self.backend.cancel(id).await.map_err(rerr)
     }
 
-    /// Ad-hoc retention sweep — BullMQ `queue.clean()`. Deletes up to `limit`
+    /// Ad-hoc retention sweep. Deletes up to `limit`
     /// finalized jobs in `state` older than `graceMs` milliseconds. `state` is
     /// one of `"completed" | "failed" | "cancelled"`. Per-call cap bounds
     /// the Lua function's event-loop hold; call repeatedly to drain a backlog.
@@ -2339,8 +2373,7 @@ impl RedisQueue {
             .map_err(rerr)
     }
     /// Register a fixed-interval schedule. Fires every `intervalMs`
-    /// milliseconds — no cron expression required. Mirrors BullMQ's
-    /// `upsertJobScheduler(id, { every })`.
+    /// milliseconds — no cron expression required.
     ///
     /// `intervalMs` must be positive. The first fire happens after
     /// `intervalMs` from registration; subsequent fires are
@@ -2471,6 +2504,9 @@ fn build_dyn_enqueue_from_opts(
         if let Some(n) = opts.max_attempts {
             req.max_attempts = n;
         }
+        if let Some(n) = opts.max_stalled_count {
+            req.max_stalled_count = n;
+        }
         if let Some(p) = opts.priority {
             req.priority = p;
         }
@@ -2554,9 +2590,9 @@ fn build_dyn_enqueue_from_many_item(it: EnqueueManyItem) -> Result<DynEnqueue> {
 }
 
 /// Normalize a JS-side retention value into the canonical `RetentionRule`.
-/// Accepts BullMQ's three shorthands:
+/// Accepts three shorthands:
 ///   bool   → drop / keep
-///   number → `{ count: N }` (BullMQ "keep last N" shorthand)
+///   number → `{ count: N }` (keep last N)
 ///   object → `{ age?, count? }` deserialized directly
 fn normalize_retention(field: &str, v: serde_json::Value) -> Result<RetentionRule> {
     match v {
@@ -2976,7 +3012,7 @@ impl EddyqApp {
         })
     }
 
-    /// Ad-hoc retention sweep (BullMQ `queue.clean()`). The caller specifies
+    /// Ad-hoc retention sweep. The caller specifies
     /// which provider to clean — retention is a backend-local notion.
     #[napi(
         ts_args_type = "graceMs: number, limit: number, state: \"completed\" | \"failed\" | \"cancelled\", provider: string"
