@@ -4,16 +4,16 @@ Use `enqueueBatch` when you need a fan-in callback — N items of work that shou
 
 ```ts
 import { Body, Controller, Post } from '@nestjs/common'
-import { InjectEddyq, type Eddyq } from '@eddyq/nestjs'
+import { InjectQueue, type QueueHandle } from '@eddyq/nestjs'
 
 @Controller('reports')
 export class ReportsController {
-  constructor(@InjectEddyq() private readonly queue: Eddyq) {}
+  constructor(@InjectQueue('reports') private readonly reports: QueueHandle) {}
 
   @Post('run-shards')
   async runShards(@Body() body: { scope: string; shards: number }) {
     const stamp = Date.now()
-    return this.queue.enqueueBatch({
+    return this.reports.enqueueBatch({
       items: Array.from({ length: body.shards }, (_, i) => ({
         kind: 'report.shard',
         payload: { scope: body.scope, shard: i },
@@ -80,11 +80,13 @@ The callback fires regardless of outcome mix — branch on `failed` / `cancelled
 Drop `onComplete` and the batch row still tracks state for admin visibility — you can query the wakeboard or `eddyq_batches` directly to see progress without coupling to a callback handler.
 
 ```ts
-await this.queue.enqueueBatch({
+await this.reports.enqueueBatch({
   items: [...],
   metadata: { source: 'admin-replay' },
 })
 ```
+
+`enqueueBatch` also lives on the raw `Eddyq` client (via `@InjectEddyq()`) — use that when the target queue is dynamic. With a `QueueHandle`, the queue is bound and `items`/`onComplete` skip the `queue` field.
 
 ## Caps
 

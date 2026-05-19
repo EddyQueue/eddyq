@@ -1,12 +1,15 @@
 # @eddyq/example-nestjs-basic
 
-A minimal NestJS app on top of `@eddyq/nestjs` showing the two patterns
-every real queue-using app needs:
+A minimal NestJS app on top of `@eddyq/nestjs` showing the patterns every
+real queue-using app needs:
 
-- **A controller that enqueues a job** → **a processor that handles it**
+- **A feature module declares its queue with `registerQueue`** → **a
+  controller enqueues via `@InjectQueue`** → **a processor handles it**
   (the `email/` module)
-- **A cron schedule declared in module config** → **a processor that handles
-  the scheduled job** (the `reports/` module)
+- **A cron schedule declared on the queue** → **the same module's
+  processor handles the scheduled job** (the `reports/` module)
+- **Fan-in batches with an `onComplete` callback** (the
+  `reports/run-shards` endpoint)
 
 Wrapped in the Nest feature-module pattern, with separate **API** and
 **worker** entry points so the two can scale independently.
@@ -20,21 +23,22 @@ src/
 ├── app.module.ts               # API root — autoStart: false
 ├── workers.module.ts           # Worker root — runs the job runtime
 │
-├── email/                      # feature: controller enqueues, processor handles
-│   ├── email.module.ts
-│   ├── email.controller.ts     # POST /email/send → queue.enqueue("send.email", ...)
+├── email/                      # feature: enqueue, handle
+│   ├── email.module.ts         # registerQueue({ name: "email", defaults })
+│   ├── email.controller.ts     # @InjectQueue("email") → POST /email/send
 │   └── email.processor.ts      # @JobHandler("send.email")
 │
-└── reports/                    # feature: handler for the cron-scheduled job
-    ├── reports.module.ts
-    └── reports.processor.ts    # @JobHandler("report.generate")
+└── reports/                    # feature: scheduled job + fan-in batch
+    ├── reports.module.ts       # registerQueue({ name: "reports", schedules })
+    ├── reports.controller.ts   # POST /reports/run-shards (enqueueBatch)
+    └── reports.processor.ts    # @JobHandler("report.generate" | "report.shard" | "report.summary")
 ```
 
 Both feature modules are imported by both composition roots. Controllers
 are inert in the worker process (no HTTP listener), processors are inert
-in the API process (`autoStart: false`). Keeping features whole like this
-is cleaner than fragmenting `email.controller.ts` and `email.processor.ts`
-into separate modules.
+in the API process (`autoStart: false`). The worker's `subscribeTo` list
+is derived automatically from each feature's `registerQueue` — the
+composition roots only own the connection and worker tuning.
 
 ## Run it
 
@@ -82,6 +86,12 @@ curl -X POST http://localhost:3000/email/send-bulk \
         {"to":"c@example.com","subject":"#3"}
       ]}'
 # → { "inserted": 3, "skipped": 0 }
+
+# Fan-in batch — enqueue N shards, fire one summary when all terminate.
+curl -X POST http://localhost:3000/reports/run-shards \
+  -H 'content-type: application/json' \
+  -d '{"scope":"daily","shards":4}'
+# → { "batchId": ..., "inserted": 4 }
 ```
 
 Watch the worker terminal — you'll see:
@@ -89,30 +99,41 @@ Watch the worker terminal — you'll see:
 - `EmailProcessor` firing when the enqueued job is picked up
 - `EddyqModule` logging `synced schedules: upserted 1` on boot
 - `ReportsProcessor` firing on the `daily-report` cron — change to `*/10 * * * * *` if you want to watch it locally
+- `report.shard` firing N times then a single `report.summary`
 
 ## The patterns this shows
 
-### 1. Feature module
+### 1. Feature module declares its queue
 
-Everything a feature needs lives in one folder. Both of these modules are
-ordinary Nest modules — nothing eddyq-specific about the structure:
+Everything a feature needs lives in one folder — including the
+`registerQueue` call that declares its queue's defaults and schedules:
 
 ```ts
 // email/email.module.ts
 @Module({
+  imports: [
+    EddyqModule.registerQueue({
+      name: "email",
+      defaults: { maxAttempts: 5 },
+    }),
+  ],
   controllers: [EmailController],
   providers: [EmailProcessor],
 })
 export class EmailModule {}
 ```
 
-### 2. Controller enqueues via `@InjectEddyq()`
+### 2. Controller enqueues via `@InjectQueue(name)`
+
+`@InjectQueue('email')` resolves a `QueueHandle` pre-bound to the queue
+name and its `defaults` from `registerQueue`. Call sites don't restate
+either.
 
 ```ts
 // email/email.controller.ts
 @Controller("email")
 export class EmailController {
-  constructor(@InjectEddyq() private readonly queue: Eddyq) {}
+  constructor(@InjectQueue("email") private readonly queue: QueueHandle) {}
 
   @Post("send")
   async send(@Body() body: { to: string; subject: string }) {
@@ -123,6 +144,11 @@ export class EmailController {
   }
 }
 ```
+
+When the target queue is dynamic (admin tools, generic dispatchers),
+inject the raw client with `@InjectEddyq()` instead — that's what
+`reports.controller.ts` does for `enqueueBatch`, since the shard items
+and the summary callback are different kinds.
 
 ### 3. Processor with `@JobHandler(kind)`
 
@@ -138,31 +164,43 @@ export class EmailProcessor {
 }
 ```
 
-### 4. Cron schedules declared in module config
+### 4. Cron schedules declared on the queue
+
+Schedules belong to the queue they fire onto. Declare them on the same
+`registerQueue` call — `queue` defaults to the enclosing name.
 
 ```ts
-// workers.module.ts
-EddyqModule.forRoot({
-  databaseUrl: process.env.EDDYQ_DATABASE_URL!,
+// reports/reports.module.ts
+EddyqModule.registerQueue({
+  name: "reports",
+  defaults: { priority: 5 },
   schedules: [
-    { name: "daily-report", cronExpr: "0 0 8 * * *", kind: "report.generate", payload: { scope: "daily" } },
+    {
+      name: "daily-report",
+      cronExpr: "0 0 8 * * *",
+      kind: "report.generate",
+      payload: { scope: "daily" },
+    },
   ],
-});
+})
 ```
 
-Reconciled against the DB at boot — added entries are upserted, removed ones deleted.
+The DB schedule table is reconciled at boot against the union of every
+`registerQueue({ schedules })` and `forRoot.schedules` — added entries
+are upserted, removed ones deleted.
 
-### 5. Two processes, one image
+### 5. Two processes, one image — auto-derived subscriptions
 
-The same built code powers both entry points. In production you'd run a
-small number of API pods (for HTTP) and a larger pool of worker pods (for
-throughput), each process connected to the same Postgres. Split worker
-fleets by queue when it matters:
+The same built code powers both entry points. The worker's `subscribeTo`
+list is derived automatically from each feature's `registerQueue` — no
+central queue registry to keep in sync. In production you'd run a small
+number of API pods and a larger pool of worker pods, each connected to
+the same Postgres. Override `subscribeTo` per-fleet to split work:
 
 ```bash
-# AI worker pool (uses a different queue): subscribe only to "ai"
+# AI worker pool (only handles "ai" jobs)
 EDDYQ_SUBSCRIBE_TO=ai  EDDYQ_WORKER_CONCURRENCY=1  pnpm start:worker
 
 # Fast path: subscribe to the general queues
-EDDYQ_SUBSCRIBE_TO=default  EDDYQ_WORKER_CONCURRENCY=40  pnpm start:worker
+EDDYQ_SUBSCRIBE_TO=email,reports  EDDYQ_WORKER_CONCURRENCY=40  pnpm start:worker
 ```

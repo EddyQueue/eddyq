@@ -4,8 +4,8 @@ A complete, runnable NestJS app using `@eddyq/nestjs` lives at [`examples/nestjs
 
 It demonstrates the patterns every queue-using app needs:
 
-- **A controller enqueues a job → a processor handles it** (the `email/` module)
-- **A cron schedule declared in module config → a processor handles the scheduled job** (the `reports/` module)
+- **A feature module declares its queue with `registerQueue`, a controller enqueues via `@InjectQueue`, and a processor handles it** (the `email/` module)
+- **A queue-scoped cron schedule fires a job that the same module's processor handles** (the `reports/` module)
 - **Fan-in batches with an `onComplete` callback** (the `reports/run-shards` endpoint)
 
 The app also splits **API** and **worker** entry points so they can scale independently.
@@ -42,9 +42,15 @@ src/
 
 <<< ../../examples/nestjs-basic/src/worker.ts{ts}
 
+## Declaring a queue in a feature module
+
+`EddyqModule.registerQueue` lives in the feature module that owns the queue. Per-queue `defaults` (and `schedules`, `groups`) ride along here — no central queue registry.
+
+<<< ../../examples/nestjs-basic/src/email/email.module.ts{ts}
+
 ## Enqueueing from a controller
 
-`@InjectEddyq()` gives you the queue. Use `uniqueKey` to dedupe replays. `enqueueMany` is one round-trip for an entire batch.
+`@InjectQueue('email')` returns a `QueueHandle` pre-bound to the queue name + its defaults. Use `uniqueKey` to dedupe replays. `enqueueMany` is one round-trip for an entire batch.
 
 <<< ../../examples/nestjs-basic/src/email/email.controller.ts{ts}
 
@@ -56,13 +62,15 @@ src/
 
 ## Cron-scheduled jobs
 
-Declare schedules in `EddyqModule.forRoot` — eddyq inserts the job at the right time, and your processor handles it like any other.
+Declare schedules on the owning queue via `registerQueue({ schedules })` — eddyq inserts the job at the right time, and your processor handles it like any other. The schedule's `queue` defaults to the enclosing `registerQueue` name.
+
+<<< ../../examples/nestjs-basic/src/reports/reports.module.ts{ts}
 
 <<< ../../examples/nestjs-basic/src/reports/reports.processor.ts{ts}
 
 ## Batches with a fan-in callback
 
-`enqueueBatch` enqueues N items and fires a single callback when every item terminates. The summary handler reads counts under `_eddyq_batch` in its payload — see the [Batches page](/nestjs/batch) for the envelope shape.
+`enqueueBatch` enqueues N items and fires a single callback when every item terminates. The reports controller injects the raw client with `@InjectEddyq()` because the batch spans multiple kinds — a `QueueHandle` works too when every item lands on the same queue. The summary handler reads counts under `_eddyq_batch` in its payload — see the [Batches page](/nestjs/batch) for the envelope shape.
 
 <<< ../../examples/nestjs-basic/src/reports/reports.controller.ts{ts}
 

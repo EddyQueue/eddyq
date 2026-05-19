@@ -1,45 +1,73 @@
 # Schedules
 
-Declare cron schedules in `EddyqModule.forRoot` — same shape as the Node API.
+A schedule fires a job on a cron expression. The module reconciles declared schedules against the DB on boot — adding, removing, or editing a schedule in code propagates automatically. See the [Node schedules page](/node/schedules) for the full mechanics.
+
+## Declaring schedules on a queue
+
+The common case: a schedule belongs to a specific queue. Declare it on that queue's `registerQueue`:
+
+```ts
+@Module({
+  imports: [
+    EddyqModule.registerQueue({
+      name: 'reports',
+      schedules: [
+        {
+          name: 'daily-report',
+          cronExpr: '0 0 8 * * *',  // sec min hour dom month dow — 08:00 UTC
+          kind: 'report.generate',
+          payload: { scope: 'daily' },
+          // queue defaults to the enclosing registerQueue's name ("reports")
+        },
+      ],
+    }),
+  ],
+  providers: [ReportsProcessor],
+})
+export class ReportsModule {}
+```
+
+The processor handles the fired job like any other:
+
+```ts
+@Processor()
+export class ReportsProcessor {
+  @JobHandler('report.generate')
+  async generate({ payload }: JobCall) {
+    const { scope } = payload as { scope: string }
+    // ...
+  }
+}
+```
+
+## Declaring schedules at the root
+
+Schedules that aren't tied to a single feature module can go on `forRoot`. They're unioned with the per-queue schedules and reconciled together:
 
 ```ts
 EddyqModule.forRoot({
   databaseUrl: process.env.DATABASE_URL!,
   schedules: [
     {
-      name: 'nightly.cleanup',
-      cron: '0 3 * * *',
-      timezone: 'America/Los_Angeles',
+      name: 'nightly-cleanup',
+      cronExpr: '0 0 3 * * *',
+      kind: 'cleanup.run',
       payload: { keepDays: 30 },
-    },
-    {
-      name: 'send.daily.digest',
-      cron: '0 9 * * *',
-      catchup: false, // skip missed runs after a deploy
+      queue: 'maintenance',
     },
   ],
 })
 ```
 
-The schedules table is reconciled on app boot — adding, removing, or editing a schedule in code propagates to the database. See the [Node schedules page](/node/schedules) for the full mechanics.
+`queue` is required at the root since there's no enclosing `registerQueue` to default to.
 
-## Handling scheduled jobs
+## Reconciliation
 
-A schedule just enqueues a job with the given `name` and `payload`. Define the worker normally:
-
-```ts
-@EddyqWorker()
-export class CleanupWorker {
-  @EddyqProcess('nightly.cleanup')
-  async clean(ctx: JobContext<{ keepDays: number }>) {
-    await this.repo.deleteOlderThan(ctx.payload.keepDays)
-  }
-}
-```
+The DB is reconciled against the union of `forRoot.schedules` and every `registerQueue({ schedules })`. Entries in the DB that aren't in the union are **deleted**. Omit `schedules` everywhere if you're managing them imperatively via `eddyq.addSchedule(...)`.
 
 ## Async config
 
-Schedules can come from `useFactory` too:
+Schedules can come from a factory:
 
 ```ts
 EddyqModule.forRootAsync({
