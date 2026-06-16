@@ -32,17 +32,19 @@ pub struct ClaimedJob {
 /// priority:
 ///
 ///   1. Lock ungrouped candidates up to the full `batch_size` (fastlane).
-///   2. Find groups with pending work; lock their rows (serializes same-group
-///      claims between concurrent fetchers); compute per-group slots =
+///   2. Find groups with pending work (loose index scan); lock their rows
+///      with SKIP LOCKED; compute per-group slots =
 ///      min(concurrency remaining, floor(refilled tokens)).
 ///   3. For each group with slots > 0, lock up to `slots` candidates from
 ///      that group specifically.
 ///   4. UPDATE the accepted jobs to 'running', bump running_count + token
 ///      balances on their groups.
 ///
-/// All phases share one transaction: another concurrent fetcher that tries to
-/// touch the same groups blocks on the `eddyq_groups` FOR UPDATE until we
-/// commit, then sees the updated counters.
+/// All phases share one transaction. Group rows are taken with `FOR UPDATE
+/// SKIP LOCKED`, so two concurrent fetchers *partition* the active groups
+/// instead of queueing on each other's commits — a group whose row is held by
+/// a peer is simply served on the next poll. Counter updates stay correct
+/// because only the lock holder claims from (and bumps counters for) a group.
 pub async fn claim_batch(
     pool: &PgPool,
     worker_id: Uuid,
@@ -146,18 +148,42 @@ pub async fn claim_batch(
 
     // Phase 2 — find which groups have pending work right now, lock their
     // rows, read their caps/tokens.
+    //
+    // The distinct-key walk is a recursive "loose index scan": Postgres has
+    // no native skip-scan, so a plain SELECT DISTINCT walks every pending
+    // grouped index entry on every fetch — O(pending jobs) instead of
+    // O(groups). Each recursive step seeks the next group_key past the
+    // current one via eddyq_jobs_group, so a deep backlog in one group costs
+    // one index seek, not one scan per row.
     let active_group_keys: Vec<String> = if remaining == 0 {
         vec![]
     } else {
         let rows: Vec<(String,)> = sqlx::query_as(
             r#"
-            SELECT DISTINCT j.group_key
-              FROM eddyq_jobs j
-             WHERE j.state = 'pending'
-               AND j.scheduled_at <= NOW()
-               AND j.group_key IS NOT NULL
-               AND j.kind = ANY($1)
-               AND j.queue = ANY($2)
+            WITH RECURSIVE walk AS (
+                (SELECT j.group_key AS key
+                   FROM eddyq_jobs j
+                  WHERE j.state = 'pending'
+                    AND j.scheduled_at <= NOW()
+                    AND j.group_key IS NOT NULL
+                    AND j.kind = ANY($1)
+                    AND j.queue = ANY($2)
+               ORDER BY j.group_key
+                  LIMIT 1)
+              UNION ALL
+                SELECT (SELECT j.group_key
+                          FROM eddyq_jobs j
+                         WHERE j.state = 'pending'
+                           AND j.scheduled_at <= NOW()
+                           AND j.group_key > w.key
+                           AND j.kind = ANY($1)
+                           AND j.queue = ANY($2)
+                      ORDER BY j.group_key
+                         LIMIT 1)
+                  FROM walk w
+                 WHERE w.key IS NOT NULL
+            )
+            SELECT key FROM walk WHERE key IS NOT NULL
             "#,
         )
         .bind(&kinds_vec)
@@ -203,7 +229,7 @@ pub async fn claim_batch(
               FROM eddyq_groups
              WHERE key = ANY($1)
          ORDER BY key
-               FOR UPDATE
+               FOR UPDATE SKIP LOCKED
             "#,
         )
         .bind(&group_keys)

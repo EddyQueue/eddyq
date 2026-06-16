@@ -1200,6 +1200,117 @@ async fn group_concurrency_cap_is_enforced(pool: PgPool) {
     assert_eq!(g.max_concurrency, 3);
 }
 
+/// The decisive test for `FOR UPDATE SKIP LOCKED` on `eddyq_groups` rows.
+/// `group_concurrency_cap_is_enforced` runs a single fetcher, so it never
+/// creates contention on the group row — it passes identically under plain
+/// `FOR UPDATE` or `SKIP LOCKED`. Here FIVE independent fetcher processes race
+/// the SAME capped group row. If `SKIP LOCKED` ever let two fetchers both read
+/// `running_count` and both claim against it, peak concurrency would exceed the
+/// cap. It must stay ≤ 3.
+#[sqlx::test(migrations = "./migrations")]
+async fn group_cap_holds_across_many_worker_processes(pool: PgPool) {
+    let current = Arc::new(AtomicUsize::new(0));
+    let max_observed = Arc::new(AtomicUsize::new(0));
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    // Spin up FIVE independent "processes" — each its own PgPool, simulating
+    // separate ECS tasks all fetching the same group concurrently.
+    let connect_opts = pool.connect_options();
+    let mut process_pools: Vec<sqlx::PgPool> = Vec::new();
+    let mut processes: Vec<Queue> = Vec::new();
+    for _ in 0..5 {
+        let p = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with((*connect_opts).clone())
+            .await
+            .unwrap();
+        let q = Queue::builder(p.clone())
+            .register::<Probe, _>(ProbeWorker {
+                group: Some("provider:openai".into()),
+                current: current.clone(),
+                max_observed: max_observed.clone(),
+                completed: completed.clone(),
+                pool: None,
+            })
+            .config(QueueConfig {
+                worker_concurrency: 4,
+                poll_only: true, // simulate transaction-pooled PgBouncer mode
+                ..fast_config()
+            })
+            .build();
+        process_pools.push(p);
+        processes.push(q);
+    }
+
+    // Cap the group at 3 BEFORE any fetcher starts.
+    processes[0]
+        .set_group_concurrency("provider:openai", 3)
+        .await
+        .unwrap();
+
+    // 50 jobs, all in the one capped group — plenty to saturate every fetcher.
+    let enqueuer = &processes[0];
+    for n in 0..50 {
+        enqueuer
+            .enqueue(&Probe {
+                n,
+                group: Some("provider:openai".into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    for q in &processes {
+        q.start().unwrap();
+    }
+
+    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if completed.load(Ordering::SeqCst) >= 50 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+
+    if outcome.is_err() {
+        let g: Vec<(String, i32, i32)> =
+            sqlx::query_as("SELECT key, running_count, max_concurrency FROM eddyq_groups")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        panic!(
+            "timed out: completed={} group={:?}",
+            completed.load(Ordering::SeqCst),
+            g
+        );
+    }
+
+    for q in &processes {
+        q.shutdown().await.unwrap();
+    }
+
+    let peak = max_observed.load(Ordering::SeqCst);
+    assert!(
+        peak <= 3,
+        "cross-process GROUP cap=3 was violated: observed peak={peak} (5 processes × worker_concurrency=4 = up to 20 without the cap)"
+    );
+    assert!(
+        peak >= 2,
+        "should have actually run ≥2 at once to be a real test; peak was {peak}"
+    );
+
+    // Counter settles back to 0 once every fetcher has drained.
+    let g = enqueuer
+        .get_group("provider:openai")
+        .await
+        .unwrap()
+        .expect("group row should exist");
+    assert_eq!(g.running_count, 0);
+    assert_eq!(g.max_concurrency, 3);
+}
+
 #[sqlx::test(migrations = "./migrations")]
 async fn groups_are_independent(pool: PgPool) {
     // Group A has a huge cap, group B has cap=1. Both sets of jobs should

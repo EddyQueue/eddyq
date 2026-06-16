@@ -36,16 +36,20 @@ fn err(e: eddyq_client::Error) -> napi::Error {
     napi::Error::from_reason(e.to_string())
 }
 
-/// Run a sqlx-touching future via `spawn_blocking` + `Handle::block_on`.
+/// Run a non-`Send` future via `spawn_blocking` + `Handle::block_on`.
 ///
 /// Why: sqlx's `Executor` impl for `&mut PgConnection` is not HRTB, so rustc
-/// cannot prove an async fn that touches sqlx is `Send`-for-all-lifetimes —
-/// the bound the `#[napi]` macro's generated wrapper demands. `spawn_blocking`
-/// requires only the outer *closure* to be `Send` (not the future it builds),
-/// and `Handle::block_on` has no `Send` bound on the future it polls.
+/// cannot prove an async fn that drives a sqlx *transaction* is
+/// `Send`-for-all-lifetimes — the bound the `#[napi]` macro's generated
+/// wrapper demands. `spawn_blocking` requires only the outer *closure* to be
+/// `Send` (not the future it builds), and `Handle::block_on` has no `Send`
+/// bound on the future it polls.
 ///
-/// This costs one blocking-pool slot per call but keeps the rest of the
-/// binding simple.
+/// This costs one blocking-pool OS thread per call, so it is reserved for the
+/// paths that actually need it: migrations and runtime lifecycle
+/// (connect/start/shutdown/close). Pool-based futures (enqueue, stats, admin,
+/// schedules) are `Send` and are awaited directly in their `#[napi]` methods —
+/// no thread parked per call.
 async fn run<F, Fut, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -607,8 +611,7 @@ impl Queue {
         payload: serde_json::Value,
         options: Option<EnqueueOptions>,
     ) -> Result<EnqueueOutcome> {
-        let client = self.client.clone();
-        run(move || do_enqueue(client, kind, payload, options)).await
+        do_enqueue(self.client.clone(), kind, payload, options).await
     }
 
     /// Enqueue a batch of jobs in a single round-trip. Uses a Postgres
@@ -624,8 +627,7 @@ impl Queue {
     /// client-side.
     #[napi]
     pub async fn enqueue_many(&self, items: Vec<EnqueueManyItem>) -> Result<BulkEnqueueOutcome> {
-        let client = self.client.clone();
-        run(move || do_enqueue_many(client, items)).await
+        do_enqueue_many(self.client.clone(), items).await
     }
 
     /// Enqueue a batch of jobs and (optionally) a callback that fires when
@@ -642,8 +644,7 @@ impl Queue {
     /// returned `skipped` reports the count for the caller's logging.
     #[napi]
     pub async fn enqueue_batch(&self, input: EnqueueBatchInput) -> Result<BatchEnqueueOutcome> {
-        let client = self.client.clone();
-        run(move || do_enqueue_batch(client, input)).await
+        do_enqueue_batch(self.client.clone(), input).await
     }
 
     /// Cancel a pending job. Returns `true` if cancelled, `false` if the job
@@ -651,8 +652,7 @@ impl Queue {
     /// cooperate to stop a running job — eddyq can't abort it for you).
     #[napi]
     pub async fn cancel(&self, id: i64) -> Result<bool> {
-        let client = self.client.clone();
-        run(move || do_cancel(client, id)).await
+        do_cancel(self.client.clone(), id).await
     }
 
     /// Ad-hoc retention sweep. Deletes up to `limit`
@@ -663,17 +663,13 @@ impl Queue {
         ts_args_type = "graceMs: number, limit: number, state: \"completed\" | \"failed\" | \"cancelled\""
     )]
     pub async fn clean(&self, grace_ms: i64, limit: u32, state: String) -> Result<u32> {
-        let client = self.client.clone();
         let st = parse_clean_state(&state)?;
         let grace = Duration::from_millis(u64::try_from(grace_ms.max(0)).unwrap_or(0));
-        run(move || async move {
-            client
-                .clean(grace, limit, st)
-                .await
-                .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
-                .map_err(err)
-        })
-        .await
+        self.client
+            .clean(grace, limit, st)
+            .await
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .map_err(err)
     }
 
     // --- Group admin ------------------------------------------------------
@@ -682,26 +678,20 @@ impl Queue {
     /// `enqueue(..., { groupKey })` respect this cap across all workers.
     #[napi]
     pub async fn set_group_concurrency(&self, group_key: String, max: i32) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move {
-            client
-                .set_group_concurrency(&group_key, max)
-                .await
-                .map_err(err)
-        })
-        .await
+        self.client
+            .set_group_concurrency(&group_key, max)
+            .await
+            .map_err(err)
     }
 
     #[napi]
     pub async fn pause_group(&self, group_key: String) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move { client.pause_group(&group_key).await.map_err(err) }).await
+        self.client.pause_group(&group_key).await.map_err(err)
     }
 
     #[napi]
     pub async fn resume_group(&self, group_key: String) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move { client.resume_group(&group_key).await.map_err(err) }).await
+        self.client.resume_group(&group_key).await.map_err(err)
     }
 
     /// Token-bucket rate limit: at most `count` jobs may *start* per
@@ -713,21 +703,16 @@ impl Queue {
         count: u32,
         period_ms: u32,
     ) -> Result<()> {
-        let client = self.client.clone();
         let period = Duration::from_millis(u64::from(period_ms));
-        run(move || async move {
-            client
-                .set_group_rate(&group_key, count, period)
-                .await
-                .map_err(err)
-        })
-        .await
+        self.client
+            .set_group_rate(&group_key, count, period)
+            .await
+            .map_err(err)
     }
 
     #[napi]
     pub async fn clear_group_rate(&self, group_key: String) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move { client.clear_group_rate(&group_key).await.map_err(err) }).await
+        self.client.clear_group_rate(&group_key).await.map_err(err)
     }
 
     // --- Named-queue admin ------------------------------------------------
@@ -735,31 +720,31 @@ impl Queue {
     /// Cap total running jobs on a named queue across **all worker processes**.
     #[napi]
     pub async fn set_queue_concurrency(&self, queue: String, max: i32) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move { client.set_queue_concurrency(&queue, max).await.map_err(err) })
+        self.client
+            .set_queue_concurrency(&queue, max)
             .await
+            .map_err(err)
     }
 
     #[napi]
     pub async fn pause_queue(&self, queue: String) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move { client.pause_queue(&queue).await.map_err(err) }).await
+        self.client.pause_queue(&queue).await.map_err(err)
     }
 
     #[napi]
     pub async fn resume_queue(&self, queue: String) -> Result<()> {
-        let client = self.client.clone();
-        run(move || async move { client.resume_queue(&queue).await.map_err(err) }).await
+        self.client.resume_queue(&queue).await.map_err(err)
     }
 
     /// Set a default per-job timeout (milliseconds) for this named queue.
     /// Pass `null` to clear.
     #[napi]
     pub async fn set_queue_timeout(&self, queue: String, timeout_ms: Option<u32>) -> Result<()> {
-        let client = self.client.clone();
         let timeout = timeout_ms.map(|ms| Duration::from_millis(u64::from(ms)));
-        run(move || async move { client.set_queue_timeout(&queue, timeout).await.map_err(err) })
+        self.client
+            .set_queue_timeout(&queue, timeout)
             .await
+            .map_err(err)
     }
 
     // --- Dashboard / list queries -----------------------------------------
@@ -768,8 +753,7 @@ impl Queue {
     /// landing query for a dashboard.
     #[napi]
     pub async fn get_stats(&self) -> Result<JobStats> {
-        let client = self.client.clone();
-        run(move || do_get_stats(client)).await
+        do_get_stats(self.client.clone()).await
     }
 
     /// Paginated job listing with optional filters. Defaults: limit=50,
@@ -780,8 +764,7 @@ impl Queue {
         filter: Option<ListJobsFilter>,
         pagination: Option<Pagination>,
     ) -> Result<JobList> {
-        let client = self.client.clone();
-        run(move || do_list_jobs(client, filter, pagination)).await
+        do_list_jobs(self.client.clone(), filter, pagination).await
     }
 
     /// Every named queue that has an explicit row (concurrency cap, pause
@@ -789,22 +772,19 @@ impl Queue {
     /// returned here — use `getStats()` to see all queues with live jobs.
     #[napi]
     pub async fn list_named_queues(&self) -> Result<Vec<NamedQueue>> {
-        let client = self.client.clone();
-        run(move || do_list_named_queues(client)).await
+        do_list_named_queues(self.client.clone()).await
     }
 
     /// Every group that has an explicit row (cap, pause, rate-limit state).
     #[napi]
     pub async fn list_groups(&self) -> Result<Vec<Group>> {
-        let client = self.client.clone();
-        run(move || do_list_groups(client)).await
+        do_list_groups(self.client.clone()).await
     }
 
     /// Every registered cron schedule.
     #[napi]
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
-        let client = self.client.clone();
-        run(move || do_list_schedules(client)).await
+        do_list_schedules(self.client.clone()).await
     }
 
     /// Upsert a cron schedule. Jobs of `kind` with the given `payload` will
@@ -832,27 +812,23 @@ impl Queue {
         payload: serde_json::Value,
         options: Option<ScheduleOptions>,
     ) -> Result<()> {
-        let client = self.client.clone();
         let priority = options.as_ref().and_then(|o| o.priority).unwrap_or(0);
         let max_attempts = options.as_ref().and_then(|o| o.max_attempts).unwrap_or(3);
         let queue = options
             .and_then(|o| o.queue)
             .unwrap_or_else(|| eddyq_client::DEFAULT_QUEUE.to_string());
-        run(move || async move {
-            client
-                .add_schedule(
-                    &name,
-                    &cron_expr,
-                    &kind,
-                    payload,
-                    priority,
-                    max_attempts,
-                    &queue,
-                )
-                .await
-                .map_err(err)
-        })
-        .await
+        self.client
+            .add_schedule(
+                &name,
+                &cron_expr,
+                &kind,
+                payload,
+                priority,
+                max_attempts,
+                &queue,
+            )
+            .await
+            .map_err(err)
     }
 
     /// Register a fixed-interval schedule (`{ every: ms }`). Fires
@@ -868,34 +844,29 @@ impl Queue {
         payload: serde_json::Value,
         options: Option<ScheduleOptions>,
     ) -> Result<()> {
-        let client = self.client.clone();
         let priority = options.as_ref().and_then(|o| o.priority).unwrap_or(0);
         let max_attempts = options.as_ref().and_then(|o| o.max_attempts).unwrap_or(3);
         let queue = options
             .and_then(|o| o.queue)
             .unwrap_or_else(|| eddyq_client::DEFAULT_QUEUE.to_string());
-        run(move || async move {
-            client
-                .add_interval_schedule(
-                    &name,
-                    interval_ms,
-                    &kind,
-                    payload,
-                    priority,
-                    max_attempts,
-                    &queue,
-                )
-                .await
-                .map_err(err)
-        })
-        .await
+        self.client
+            .add_interval_schedule(
+                &name,
+                interval_ms,
+                &kind,
+                payload,
+                priority,
+                max_attempts,
+                &queue,
+            )
+            .await
+            .map_err(err)
     }
 
     /// Remove a schedule. Returns `true` if a row was deleted.
     #[napi]
     pub async fn remove_schedule(&self, name: String) -> Result<bool> {
-        let client = self.client.clone();
-        run(move || async move { client.remove_schedule(&name).await.map_err(err) }).await
+        self.client.remove_schedule(&name).await.map_err(err)
     }
 
     /// Reconcile DB schedules against a code-declared list. Each entry is
@@ -907,7 +878,6 @@ impl Queue {
         &self,
         declared: Vec<ScheduleDeclaration>,
     ) -> Result<SyncSchedulesReport> {
-        let client = self.client.clone();
         let mapped: Vec<CoreScheduleDeclaration> = declared
             .into_iter()
             .map(|d| CoreScheduleDeclaration {
@@ -922,28 +892,21 @@ impl Queue {
                     .unwrap_or_else(|| eddyq_client::DEFAULT_QUEUE.to_string()),
             })
             .collect();
-        run(move || async move {
-            let report = client.sync_schedules(&mapped).await.map_err(err)?;
-            Ok(SyncSchedulesReport {
-                upserted: report.upserted as u32,
-                deleted: report.deleted,
-            })
+        let report = self.client.sync_schedules(&mapped).await.map_err(err)?;
+        Ok(SyncSchedulesReport {
+            upserted: report.upserted as u32,
+            deleted: report.deleted,
         })
-        .await
     }
 
     /// Toggle a schedule on or off without deleting it. Returns `true` if a
     /// row was updated.
     #[napi]
     pub async fn set_schedule_enabled(&self, name: String, enabled: bool) -> Result<bool> {
-        let client = self.client.clone();
-        run(move || async move {
-            client
-                .set_schedule_enabled(&name, enabled)
-                .await
-                .map_err(err)
-        })
-        .await
+        self.client
+            .set_schedule_enabled(&name, enabled)
+            .await
+            .map_err(err)
     }
 
     // --- Worker registration ----------------------------------------------

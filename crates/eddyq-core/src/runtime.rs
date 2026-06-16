@@ -213,7 +213,6 @@ async fn fetch_loop<B: Backend>(
         }
 
         let batch_size = config.fetch_batch_size.min(capacity);
-        let kinds = registry.kinds();
         let claimed = match backend
             .claim_batch(worker_id, batch_size, &kinds, &queues)
             .await
@@ -235,6 +234,15 @@ async fn fetch_loop<B: Backend>(
                 debug!("worker channel closed, fetcher exiting");
                 return;
             }
+        }
+
+        // A full batch signals a deep backlog — re-fetch immediately instead
+        // of sleeping, otherwise throughput caps at batch_size / cooldown
+        // (~100 jobs/s at defaults). The bounded channel above already
+        // applies backpressure, and the capacity==0 check at the top of the
+        // loop falls back to the cooldown once workers are saturated.
+        if got == batch_size && got > 0 {
+            continue;
         }
 
         let sleep = if got == 0 {
@@ -283,7 +291,7 @@ async fn worker_loop<B: Backend>(
             }
         };
 
-        let Some(job) = job else { break };
+        let Some(mut job) = job else { break };
 
         // Register this job as in-flight for the shared heartbeat loop.
         {
@@ -325,7 +333,9 @@ async fn worker_loop<B: Backend>(
             }
         };
 
-        let inner = handler(job.payload.clone(), ctx.clone());
+        // Hand the payload to the handler without a deep clone — it isn't
+        // read again on this code path.
+        let inner = handler(std::mem::take(&mut job.payload), ctx);
         let caught_fut = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(inner));
 
         // If the queue has a configured default timeout, wrap the handler in
