@@ -24,3 +24,14 @@ ALTER TABLE eddyq_groups SET (fillfactor = 70);
 ALTER TABLE eddyq_leader SET (fillfactor = 70);
 ALTER TABLE eddyq_queues SET (fillfactor = 70);
 ALTER TABLE eddyq_jobs   SET (fillfactor = 90);
+
+-- Leader election state is pure transient coordination (same pattern as
+-- River's river_leader): heartbeats rewrite the row every few seconds, and
+-- losing it just triggers a re-election -- claim_leadership() upserts with
+-- ON CONFLICT, so an empty table is a normal cold start. UNLOGGED skips WAL
+-- for those heartbeats entirely. Caveats by design: unlogged tables are
+-- truncated on crash recovery and not visible on streaming/Aurora read
+-- replicas -- both fine for a single-row election token that only the
+-- writer touches. The rewrite this ALTER performs is one row.
+
+ALTER TABLE eddyq_leader SET UNLOGGED;
