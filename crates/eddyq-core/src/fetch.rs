@@ -363,37 +363,46 @@ pub async fn claim_batch(
         *queue_deltas.entry(qname.clone()).or_insert(0) += 1;
     }
     for (key, delta) in &group_deltas {
-        sqlx::query(
-            r#"
-            INSERT INTO eddyq_groups (key, running_count)
-            VALUES ($1, $2)
-            ON CONFLICT (key) DO UPDATE
-               SET running_count = eddyq_groups.running_count + EXCLUDED.running_count,
-                   updated_at    = NOW()
-            "#,
-        )
-        .bind(key)
-        .bind(delta)
-        .execute(&mut *tx)
-        .await?;
-
-        if let Some(state) = group_slots.get(key) {
-            if state.rate_limited {
-                let remaining = (state.refilled_tokens - f64::from(*delta)).max(0.0);
-                sqlx::query(
-                    r#"
-                    UPDATE eddyq_groups
-                       SET tokens             = $2,
-                           tokens_refilled_at = $3
-                     WHERE key = $1
-                    "#,
-                )
-                .bind(key)
-                .bind(remaining)
-                .bind(now_utc)
-                .execute(&mut *tx)
-                .await?;
-            }
+        // Single statement per group: the token balance is folded into the
+        // running_count upsert rather than issued as a second UPDATE. Every
+        // rate-limited claim used to rewrite the (hot, shared) group row
+        // twice per batch — on a busy throttled lane that doubled the row
+        // versions, WAL, and vacuum work for no behavioral difference.
+        let rate_limited = group_slots.get(key).is_some_and(|s| s.rate_limited);
+        if rate_limited {
+            let state = group_slots.get(key).expect("checked above");
+            let remaining = (state.refilled_tokens - f64::from(*delta)).max(0.0);
+            sqlx::query(
+                r#"
+                INSERT INTO eddyq_groups (key, running_count, tokens, tokens_refilled_at)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (key) DO UPDATE
+                   SET running_count      = eddyq_groups.running_count + EXCLUDED.running_count,
+                       tokens             = EXCLUDED.tokens,
+                       tokens_refilled_at = EXCLUDED.tokens_refilled_at,
+                       updated_at         = NOW()
+                "#,
+            )
+            .bind(key)
+            .bind(delta)
+            .bind(remaining)
+            .bind(now_utc)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO eddyq_groups (key, running_count)
+                VALUES ($1, $2)
+                ON CONFLICT (key) DO UPDATE
+                   SET running_count = eddyq_groups.running_count + EXCLUDED.running_count,
+                       updated_at    = NOW()
+                "#,
+            )
+            .bind(key)
+            .bind(delta)
+            .execute(&mut *tx)
+            .await?;
         }
     }
     // Queue counter upserts — only bump rows that already exist; queues with
