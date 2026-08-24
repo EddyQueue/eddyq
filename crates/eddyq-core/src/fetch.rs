@@ -263,6 +263,41 @@ pub async fn claim_batch(
                 },
             );
         }
+
+        // A group key with pending work but no `eddyq_groups` row is uncapped,
+        // and until now it was also unclaimable: the row is only materialized
+        // when some group rule matches the key (`group::materialize_from_rule`),
+        // so a group with no cap and no matching rule never appeared here and
+        // its jobs sat pending forever.
+        //
+        // "No row" has to be told apart from "row held by a peer fetcher",
+        // which the locking read above cannot do -- SKIP LOCKED returns neither.
+        // Conflating them would be worse than the bug: a capped group whose row
+        // is momentarily locked would be treated as unlimited and two fetchers
+        // would both claim from it, blowing past its cap. Hence this second,
+        // non-locking read; it is a primary-key lookup and only ever finds
+        // anything for genuinely new groups, since phase 4 creates the row on
+        // first claim.
+        let existing: Vec<(String,)> =
+            sqlx::query_as("SELECT key FROM eddyq_groups WHERE key = ANY($1)")
+                .bind(&group_keys)
+                .fetch_all(&mut *tx)
+                .await?;
+        let existing: std::collections::HashSet<String> =
+            existing.into_iter().map(|(k,)| k).collect();
+
+        for key in &group_keys {
+            if !existing.contains(key) {
+                group_slots.insert(
+                    key.clone(),
+                    GroupState {
+                        slots: i32::MAX,
+                        refilled_tokens: 0.0,
+                        rate_limited: false,
+                    },
+                );
+            }
+        }
     }
 
     // Phase 3 — for each group with slots > 0, fetch up to `min(group_slots,

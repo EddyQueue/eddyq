@@ -4385,3 +4385,60 @@ async fn pre_upgrade_row_recovers_cleanly_pg(pool: PgPool) {
     assert_eq!(stalled, 1);
     assert_eq!(attempt, 0);
 }
+
+/// A grouped job whose group has no cap and matches no rule must still run.
+///
+/// `eddyq_groups` rows are materialized from group *rules*, so a key with
+/// neither an explicit cap nor a matching rule had no row -- and the claim
+/// builds its candidate set from the rows that exist, so those jobs were never
+/// picked up at all. Every other grouped test in this file happens to set a cap
+/// or a rule first, which is why it stayed hidden.
+#[sqlx::test(migrations = "./migrations")]
+async fn uncapped_group_is_still_claimed(pool: PgPool) {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Uncapped {
+        n: u64,
+    }
+    impl Job for Uncapped {
+        const KIND: &'static str = "uncapped";
+        fn group_key(&self) -> Option<String> {
+            Some("no_cap_and_no_rule".into())
+        }
+    }
+
+    let done = Arc::new(AtomicUsize::new(0));
+
+    #[derive(Clone)]
+    struct W(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Worker<Uncapped> for W {
+        async fn perform(&self, _: Uncapped, _: JobContext) -> JobResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Uncapped, _>(W(done.clone()))
+        .config(fast_config())
+        .build();
+
+    // Deliberately no set_group_concurrency and no set_group_rule.
+    for n in 0..5 {
+        queue.enqueue(&Uncapped { n }).await.unwrap();
+    }
+    queue.start().unwrap();
+
+    tokio::time::timeout(Duration::from_millis(3000), async {
+        loop {
+            if done.load(Ordering::SeqCst) >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a group with no cap and no rule was never claimed");
+
+    queue.shutdown().await.unwrap();
+}
