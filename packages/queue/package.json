@@ -43,7 +43,7 @@
     "prepublishOnly": "napi prepublish -t npm",
     "typecheck": "tsc --noEmit lib.d.ts",
     "smoke": "node smoke.mjs && node smoke-bulk.mjs && node smoke-batch.mjs && node smoke-batch-retention.mjs && node smoke-cancel.mjs && node smoke-errors.mjs && node smoke-migrate-guard.mjs && node smoke-schedule.mjs && node smoke-schedule-queue.mjs && node smoke-shutdown.mjs && node smoke-stats.mjs && node smoke-worker.mjs",
-    "test": "node smoke.mjs && node smoke-schedule-queue.mjs && node smoke-shutdown.mjs",
+    "test": "node smoke.mjs && node smoke-schedule-queue.mjs && node smoke-abort-late-dispatch.mjs && node smoke-shutdown.mjs",
     "lint": "echo \"no lint yet\" && exit 0",
     "docs": "typedoc"
   },
