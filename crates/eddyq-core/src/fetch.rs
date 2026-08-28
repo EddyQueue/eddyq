@@ -24,6 +24,18 @@ pub struct ClaimedJob {
     pub timeout: Option<std::time::Duration>,
 }
 
+/// Whether a queue's row can ever refuse a claim, and therefore whether its
+/// budget has to be read under `FOR UPDATE`.
+///
+/// `max_concurrency` defaults to i32::MAX, and a row is materialised by any
+/// queue-level setting at all — a timeout, or a pause since lifted. Such a row
+/// exists but cannot constrain anything: `running_count` is bounded by the
+/// number of jobs in flight and will never approach i32::MAX. Locking it
+/// serialises every fetcher of that queue for no purpose.
+fn queue_row_binds(max_concurrency: i32, paused: bool) -> bool {
+    paused || max_concurrency < i32::MAX
+}
+
 /// Claim up to `batch_size` pending jobs, respecting per-group concurrency
 /// caps and per-group token-bucket rate limits.
 ///
@@ -59,10 +71,33 @@ pub async fn claim_batch(
 
     let mut tx = pool.begin().await?;
 
-    // Phase 0 — lock + read cross-process queue caps + default timeouts. For
-    // any subscribed queue with a row in eddyq_queues, compute available
-    // slots and pick up its default_timeout_ms. Queues without a row are
-    // unlimited (i32::MAX) with no timeout.
+    // Phase 0 — read cross-process queue caps + default timeouts. For any
+    // subscribed queue with a row in eddyq_queues, compute available slots and
+    // pick up its default_timeout_ms. Queues without a row are unlimited
+    // (i32::MAX) with no timeout.
+    //
+    // The lock is taken only over the rows that can actually constrain this
+    // claim, and skipped entirely when none can.
+    //
+    // `FOR UPDATE` here is what serialises the read-budget / claim / increment
+    // sequence, so two fetchers cannot both see the last free slot. It is
+    // therefore held for the whole claim transaction, on a single row per
+    // queue that every fetcher of that queue shares. That makes it a global
+    // mutex on the hot path: its cost scales with processes times poll rate,
+    // and in one production deployment this statement alone was 40% of total
+    // database load.
+    //
+    // Most of that was paid for nothing. `max_concurrency` defaults to
+    // i32::MAX and a row is created by any queue-level setting -- a timeout,
+    // a pause that was later lifted -- so the overwhelmingly common row cannot
+    // constrain anything, and neither can a queue with no row at all. Only a
+    // paused queue or one with a real cap needs the serialisation.
+    //
+    // So: read unlocked first, and re-read under lock only what binds. A cap
+    // added between the two reads is treated as unlimited for this one batch,
+    // which can transiently over-admit on the single tick where an operator
+    // introduces a cap. That is the same bound every queue with cross-process
+    // limits lives with, and it is bounded by one fetch.
     let mut queue_budget: HashMap<String, i32> = HashMap::new();
     let mut queue_timeout: HashMap<String, Option<std::time::Duration>> = HashMap::new();
     {
@@ -72,24 +107,50 @@ pub async fn claim_batch(
               FROM eddyq_queues
              WHERE name = ANY($1)
           ORDER BY name
-               FOR UPDATE
             "#,
         )
         .bind(queues)
         .fetch_all(&mut *tx)
         .await?;
-        for (name, running, max, paused, timeout_ms) in rows {
-            let slots = if paused { 0 } else { (max - running).max(0) };
+
+        let binding: Vec<String> = rows
+            .iter()
+            .filter(|(_, _, max, paused, _)| queue_row_binds(*max, *paused))
+            .map(|(name, ..)| name.clone())
+            .collect();
+
+        // Timeouts are configuration, not capacity — they never need the lock.
+        for (name, running, max, paused, timeout_ms) in &rows {
+            let slots = if *paused { 0 } else { (*max - *running).max(0) };
             queue_budget.insert(name.clone(), slots);
             if let Some(ms) = timeout_ms {
-                if ms > 0 {
+                if *ms > 0 {
                     queue_timeout.insert(
-                        name,
+                        name.clone(),
                         Some(std::time::Duration::from_millis(
-                            u64::try_from(ms).unwrap_or(0),
+                            u64::try_from(*ms).unwrap_or(0),
                         )),
                     );
                 }
+            }
+        }
+
+        if !binding.is_empty() {
+            let locked: Vec<(String, i32, i32, bool)> = sqlx::query_as(
+                r#"
+                SELECT name, running_count, max_concurrency, paused
+                  FROM eddyq_queues
+                 WHERE name = ANY($1)
+              ORDER BY name
+                   FOR UPDATE
+                "#,
+            )
+            .bind(&binding)
+            .fetch_all(&mut *tx)
+            .await?;
+            for (name, running, max, paused) in locked {
+                let slots = if paused { 0 } else { (max - running).max(0) };
+                queue_budget.insert(name, slots);
             }
         }
     }
@@ -887,7 +948,13 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
                    finalized_at  = CASE WHEN stalled_count + 1 > max_stalled_count
                                         THEN NOW() ELSE NULL END
              WHERE state = 'running'
-               AND heartbeat_at < NOW() - make_interval(secs => $1)
+               -- `heartbeat_at < ...` alone is NULL-false, so a running row
+               -- with no heartbeat is invisible to this sweep forever: never
+               -- recovered, and its group and queue counters never given back.
+               -- Claiming always stamps a heartbeat, so a running row without
+               -- one is already an anomaly and belongs in the sweep.
+               AND (heartbeat_at IS NULL
+                    OR heartbeat_at < NOW() - make_interval(secs => $1))
          RETURNING group_key, queue, batch_id, state
         ),
         group_decrements AS (
@@ -952,6 +1019,85 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
 
     tx.commit().await?;
     Ok(u64::try_from(recovered).unwrap_or(0))
+}
+
+/// Correct concurrency counters that have drifted from the jobs they claim to
+/// describe. Returns `(groups_fixed, queues_fixed)`.
+///
+/// `eddyq_groups.running_count` and `eddyq_queues.running_count` are
+/// materialised integers: incremented when a batch is claimed, decremented on
+/// each of several terminal paths. Every one of those decrements is correct
+/// today, but the shape has no self-correction — any future path that moves a
+/// row out of `running` without going through them leaks a slot, and a leaked
+/// slot is permanent. On a group whose `max_concurrency` is small, leaking that
+/// many slots stops the lane forever while every dashboard still looks healthy:
+/// jobs pending, nothing running, no errors, no stale heartbeats to sweep.
+///
+/// So this does not attempt to know *how* drift happens. It periodically
+/// restates the invariant — a counter equals the number of rows actually in
+/// `running` — which turns any such bug, present or future, from a permanent
+/// wedge into a blip that lasts at most one sweep interval.
+///
+/// Deliberately only ever lowers a counter (`LEAST`). A claim committing
+/// between the count and the update would otherwise be erased, handing out a
+/// slot twice; under-counting is self-correcting, because the next claim
+/// increments from wherever it lands and the terminal paths floor at zero.
+pub async fn reconcile_counters(pool: &PgPool) -> Result<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+
+    let groups: i64 = sqlx::query_scalar(
+        r#"
+        WITH actual AS (
+            SELECT g.key,
+                   (SELECT COUNT(*) FROM eddyq_jobs j
+                     WHERE j.group_key = g.key AND j.state = 'running')::int AS n
+              FROM eddyq_groups g
+             WHERE g.running_count > 0
+        ),
+        fixed AS (
+            UPDATE eddyq_groups g
+               SET running_count = LEAST(g.running_count, a.n),
+                   updated_at    = NOW()
+              FROM actual a
+             WHERE g.key = a.key
+               AND g.running_count > a.n
+            RETURNING g.key
+        )
+        SELECT COUNT(*)::bigint FROM fixed
+        "#,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let queues: i64 = sqlx::query_scalar(
+        r#"
+        WITH actual AS (
+            SELECT q.name,
+                   (SELECT COUNT(*) FROM eddyq_jobs j
+                     WHERE j.queue = q.name AND j.state = 'running')::int AS n
+              FROM eddyq_queues q
+             WHERE q.running_count > 0
+        ),
+        fixed AS (
+            UPDATE eddyq_queues q
+               SET running_count = LEAST(q.running_count, a.n),
+                   updated_at    = NOW()
+              FROM actual a
+             WHERE q.name = a.name
+               AND q.running_count > a.n
+            RETURNING q.name
+        )
+        SELECT COUNT(*)::bigint FROM fixed
+        "#,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok((
+        u64::try_from(groups).unwrap_or(0),
+        u64::try_from(queues).unwrap_or(0),
+    ))
 }
 
 /// Proactively reclaim a known list of in-flight jobs — used by force-mode
@@ -1144,4 +1290,31 @@ pub async fn mark_failed(
     }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod queue_lock_tests {
+    use super::*;
+
+    /// The common row cannot constrain a claim, and locking it is what made
+    /// the fetch path a global mutex. `setQueueTimeout` alone materialises a
+    /// row with the default cap, so "has a row" is not the same question as
+    /// "has a limit".
+    #[test]
+    fn a_default_row_does_not_bind() {
+        assert!(!queue_row_binds(i32::MAX, false));
+    }
+
+    #[test]
+    fn a_real_cap_binds() {
+        assert!(queue_row_binds(15, false));
+        assert!(queue_row_binds(0, false));
+    }
+
+    /// Paused is a cap of zero however high `max_concurrency` reads, so it has
+    /// to be serialised like any other refusal.
+    #[test]
+    fn a_paused_queue_binds_even_at_the_default_cap() {
+        assert!(queue_row_binds(i32::MAX, true));
+    }
 }

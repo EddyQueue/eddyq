@@ -176,6 +176,10 @@ impl Backend for PgBackend {
         fetch::sweep_stale(&self.pool, stale_after).await
     }
 
+    async fn reconcile_counters(&self) -> Result<(u64, u64)> {
+        fetch::reconcile_counters(&self.pool).await
+    }
+
     async fn cleanup(&self, retention: Retention) -> Result<(u64, u64, u64, u64)> {
         fetch::cleanup(&self.pool, retention).await
     }
