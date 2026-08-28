@@ -74,7 +74,15 @@ const instanceState = new WeakMap();
 function stateFor(q) {
   let s = instanceState.get(q);
   if (!s) {
-    s = { controllers: new Set(), abortRegistered: false };
+    // `abortedWith` makes shutdown sticky rather than a one-shot broadcast.
+    // The broadcast can only abort controllers that exist when it fires, so a
+    // job already claimed in Rust but dispatched into JS a moment later used to
+    // build a fresh, never-aborted controller and run its handler to
+    // completion. A handler that waits on a signal it will never receive keeps
+    // an active libuv timer, and Node cannot exit while one is pending — the
+    // process hangs for as long as the handler's own timeout, whatever
+    // shutdown mode was requested.
+    s = { controllers: new Set(), abortRegistered: false, abortedWith: null };
     instanceState.set(q, s);
   }
   return s;
@@ -86,6 +94,9 @@ function ensureAbortHandler(q) {
   q.setAbortHandler((reason) => {
     const err = new Error(String(reason ?? "shutdown"));
     err.name = "AbortError";
+    // Recorded before the fan-out so anything dispatched from here on refuses
+    // to start, rather than racing the loop below.
+    s.abortedWith = err;
     for (const c of s.controllers) {
       try {
         c.abort(err);
@@ -101,6 +112,16 @@ function ensureAbortHandler(q) {
 function wrapHandler(handler, q) {
   const s = stateFor(q);
   return async (call) => {
+    // Shutdown already broadcast: don't start. Aborting the controller is not
+    // enough on its own, because `addEventListener("abort", ...)` on an
+    // already-aborted signal never fires — a handler that only listens would
+    // still arm its timer and still hold the process open. Refusing outright is
+    // also the honest answer: the job has not run, so failing it here lets it
+    // be retried by a process that intends to finish it.
+    if (s.abortedWith) {
+      const envelope = formatError(s.abortedWith);
+      throw new Error(`${ENVELOPE_PREFIX}${JSON.stringify(envelope)}`);
+    }
     const controller = new AbortController();
     s.controllers.add(controller);
     const callWithSignal = Object.assign({}, call, { signal: controller.signal });
