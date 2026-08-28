@@ -62,6 +62,25 @@ pub struct QueueConfig {
     /// Leader election lease duration in seconds. The elected leader refreshes
     /// its lease every `leader_lease_secs / 3` seconds. Default: 30.
     pub leader_lease_secs: u64,
+    /// Backstop timeout for a handler on a queue that sets none of its own.
+    /// A queue's `default_timeout_ms` still wins where it is set. Default: 6h.
+    ///
+    /// The default exists because unbounded is the wrong failure mode for a
+    /// queue. A handler that never returns — an HTTP call with no deadline is
+    /// the usual way — holds its concurrency slot forever. Nothing recovers it:
+    /// the heartbeat keeps reporting healthy, because the process really is
+    /// alive, so `sweep_stale` is blind to it by construction. One such handler
+    /// per slot silently stops a lane for good. That is not hypothetical; it
+    /// cost a production deployment two days of stale data before anyone
+    /// noticed, and the only reason it was possible is that the default here
+    /// used to be "wait forever".
+    ///
+    /// Six hours rather than something tight: orchestration jobs that fan out
+    /// large backfills legitimately run for hours, and a backstop that trips on
+    /// healthy work is worse than none. It is meant to catch the wedge, not to
+    /// police runtime. Set a per-queue `default_timeout_ms` for anything that
+    /// wants a real deadline, and `None` here to opt back out entirely.
+    pub default_job_timeout: Option<Duration>,
 }
 
 impl Default for QueueConfig {
@@ -88,6 +107,7 @@ impl Default for QueueConfig {
             batch_retention_count: None,
             poll_only: false,
             leader_lease_secs: 30,
+            default_job_timeout: Some(Duration::from_secs(6 * 60 * 60)), // 6h
         }
     }
 }
@@ -191,6 +211,13 @@ impl<B: Backend> QueueBuilder<B> {
 
     pub fn stale_after(mut self, d: Duration) -> Self {
         self.config.stale_after = d;
+        self
+    }
+
+    /// Backstop timeout for handlers on queues that set none of their own.
+    /// `None` restores the pre-0.2 behaviour of waiting forever.
+    pub fn default_job_timeout(mut self, d: Option<Duration>) -> Self {
+        self.config.default_job_timeout = d;
         self
     }
 

@@ -3186,6 +3186,28 @@ impl EddyqApp {
         }
     }
 
+    /// Set a default per-job timeout (milliseconds) for a named queue on one
+    /// provider. Pass `null` to clear.
+    ///
+    /// Present on `Eddyq` and `EddyqRedis` since the beginning, and missing
+    /// here until 2026-08-27 — so an application on the hybrid client had no
+    /// way to bound a handler at all, and every queue it created ran with no
+    /// timeout whether or not its authors wanted one. That gap is how ten
+    /// hung handlers came to hold a lane for two days: the team had not
+    /// declined to set a timeout, they had no method to call.
+    #[napi]
+    pub async fn set_queue_timeout(
+        &self,
+        provider: String,
+        queue: String,
+        timeout_ms: Option<u32>,
+    ) -> Result<()> {
+        match parse_provider(&provider)? {
+            BackendKind::Pg => self.pg_ref()?.set_queue_timeout(queue, timeout_ms).await,
+            BackendKind::Redis => self.redis_ref()?.set_queue_timeout(queue, timeout_ms).await,
+        }
+    }
+
     #[napi]
     pub async fn pause_queue(&self, provider: String, queue: String) -> Result<()> {
         match parse_provider(&provider)? {

@@ -24,6 +24,29 @@ use crate::{
 
 pub(crate) const NOTIFY_CHANNEL: &str = "eddyq_job";
 
+/// How far an idle fetcher may back off, as a multiple of the configured
+/// `fetch_poll_interval`. Expressed as a multiple so that shortening the
+/// interval to tighten delayed-job latency still tightens the worst case.
+const IDLE_BACKOFF_MAX_FACTOR: u32 = 8;
+
+/// Hard ceiling on the idle backoff regardless of the configured interval.
+/// A queue that has been quiet for a while should still notice a job whose
+/// `scheduled_at` has just passed within a reasonable time, and nothing
+/// publishes a wakeup at that moment.
+const IDLE_BACKOFF_ABSOLUTE_MAX: Duration = Duration::from_secs(30);
+
+/// The furthest an idle fetcher will back off for a given poll interval.
+fn idle_ceiling(poll_interval: Duration) -> Duration {
+    poll_interval
+        .saturating_mul(IDLE_BACKOFF_MAX_FACTOR)
+        .min(IDLE_BACKOFF_ABSOLUTE_MAX)
+}
+
+/// One step of the idle escalation, clamped to `ceiling`.
+fn escalate_idle(current: Duration, ceiling: Duration) -> Duration {
+    current.saturating_mul(2).min(ceiling)
+}
+
 /// Shared set of in-flight job IDs for the batch heartbeat task. Also read
 /// by `Queue::shutdown_with(ShutdownMode::Force)` so we can proactively
 /// reclaim jobs this pod has claimed but won't get to finish.
@@ -198,6 +221,25 @@ async fn fetch_loop<B: Backend>(
     info!(%worker_id, ?kinds, ?queues, "eddyq fetcher started");
     let _ = registry; // keep registry alive only for kinds snapshot
 
+    // Backoff for an idle queue, reset the moment there is work again.
+    //
+    // Every empty poll still costs a full claim transaction, and on Postgres
+    // that transaction opens by taking `FOR UPDATE` on the subscribed queues'
+    // rows. In a deployment with several worker services that statement was
+    // measured at 40% of total database load -- paid almost entirely by
+    // fetchers finding nothing. The cost scales with processes times poll
+    // rate, so it grows every time a service scales out.
+    //
+    // Backing off does not delay new work: an enqueue publishes a wakeup
+    // (LISTEN/NOTIFY on Postgres, pubsub on Redis) and the select! below
+    // treats that as a reset. What it does delay, by at most the ceiling, is
+    // noticing that a job's `scheduled_at` has passed, since nothing notifies
+    // at that moment. The ceiling is therefore expressed as a multiple of the
+    // operator's configured interval rather than an absolute -- whoever
+    // shortened the interval for delayed-job latency keeps that guarantee.
+    let ceiling = idle_ceiling(config.fetch_poll_interval);
+    let mut idle_backoff = config.fetch_poll_interval;
+
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -246,8 +288,12 @@ async fn fetch_loop<B: Backend>(
         }
 
         let sleep = if got == 0 {
-            jitter(config.fetch_poll_interval)
+            let s = jitter(idle_backoff);
+            idle_backoff = escalate_idle(idle_backoff, ceiling);
+            s
         } else {
+            // Work exists: forget the queue was ever quiet.
+            idle_backoff = config.fetch_poll_interval;
             config.fetch_cooldown
         };
 
@@ -255,6 +301,11 @@ async fn fetch_loop<B: Backend>(
             biased;
             () = shutdown.cancelled() => break,
             () = wakeup.notified() => {
+                // A notify means work arrived, so the backoff is stale
+                // regardless of what the last fetch returned -- reset before
+                // re-polling or the first job after a quiet spell would be
+                // claimed at the ceiling's pace.
+                idle_backoff = config.fetch_poll_interval;
                 // Immediate re-poll after a notify, but respect fetch_cooldown so a
                 // notify storm can't trigger back-to-back fetches.
                 tokio::select! {
@@ -341,7 +392,11 @@ async fn worker_loop<B: Backend>(
         // If the queue has a configured default timeout, wrap the handler in
         // `tokio::time::timeout`. On timeout, synthesize a JobResult::Err so
         // the downstream retry/fail plumbing treats it like any other failure.
-        let result = match job.timeout {
+        // The queue's own timeout wins; the runtime default is only a backstop
+        // against a handler that never returns at all, which would otherwise
+        // hold its concurrency slot for as long as the process lives.
+        let effective_timeout = job.timeout.or(config.default_job_timeout);
+        let result = match effective_timeout {
             Some(t) => match tokio::time::timeout(t, caught_fut).await {
                 Ok(caught) => caught,
                 Err(_elapsed) => Ok(Err(anyhow::anyhow!(format!("job timed out after {:?}", t)))),
@@ -547,6 +602,19 @@ async fn sweeper_loop<B: Backend>(
                     Ok(n) => info!(recovered = n, "sweeper recovered stale jobs"),
                     Err(err) => error!(?err, "sweeper failed"),
                 }
+                // Runs after the sweep, so counters the sweep just gave back
+                // are already reflected and this only sees genuine drift.
+                // Warn rather than info: a counter that disagrees with its own
+                // jobs is a bug somewhere, and silently repairing it every
+                // minute would hide that.
+                match backend.reconcile_counters().await {
+                    Ok((0, 0)) => {}
+                    Ok((groups, queues)) => warn!(
+                        groups, queues,
+                        "reconciled concurrency counters that had drifted above their running jobs"
+                    ),
+                    Err(err) => error!(?err, "counter reconcile failed"),
+                }
             }
         }
     }
@@ -682,3 +750,61 @@ pub(crate) async fn await_all(handles: RuntimeHandles) {
 // JobId import so the `id = job_id` tracing field resolves cleanly.
 #[allow(dead_code)]
 fn _assert_job_id_type(_: JobId) {}
+
+#[cfg(test)]
+mod idle_backoff_tests {
+    use super::*;
+
+    /// The point of the escalation is that an idle fleet stops paying for
+    /// empty polls. Each of those polls opens a claim transaction, and on
+    /// Postgres that transaction locks the queue row, so the cost is borne by
+    /// the database rather than the worker.
+    #[test]
+    fn escalates_from_the_configured_interval_up_to_the_ceiling() {
+        let interval = Duration::from_secs(1);
+        let ceiling = idle_ceiling(interval);
+        assert_eq!(
+            ceiling,
+            Duration::from_secs(8),
+            "8x the configured interval"
+        );
+
+        let mut d = interval;
+        let steps: Vec<u64> = (0..5)
+            .map(|_| {
+                d = escalate_idle(d, ceiling);
+                d.as_secs()
+            })
+            .collect();
+        assert_eq!(
+            steps,
+            vec![2, 4, 8, 8, 8],
+            "doubles, then holds at the ceiling"
+        );
+    }
+
+    /// Delayed jobs are the case with no wakeup: nothing publishes when a
+    /// `scheduled_at` passes, so the backoff is the worst-case latency for
+    /// noticing one. Shortening the interval has to shorten that worst case,
+    /// which is why the ceiling is a multiple rather than an absolute.
+    #[test]
+    fn a_shorter_interval_buys_a_shorter_worst_case() {
+        assert_eq!(
+            idle_ceiling(Duration::from_millis(250)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(idle_ceiling(Duration::from_secs(1)), Duration::from_secs(8));
+    }
+
+    /// ...but a long interval must not push the worst case out indefinitely.
+    #[test]
+    fn the_absolute_ceiling_still_applies_to_a_long_interval() {
+        let ceiling = idle_ceiling(Duration::from_secs(60));
+        assert_eq!(ceiling, IDLE_BACKOFF_ABSOLUTE_MAX);
+        assert_eq!(
+            escalate_idle(Duration::from_secs(60), ceiling),
+            IDLE_BACKOFF_ABSOLUTE_MAX,
+            "an interval already past the ceiling is clamped, never doubled"
+        );
+    }
+}

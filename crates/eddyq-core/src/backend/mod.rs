@@ -113,6 +113,20 @@ pub trait Backend: Send + Sync + std::fmt::Debug + 'static {
 
     async fn sweep_stale(&self, stale_after: Duration) -> Result<u64>;
 
+    /// Restate the invariant that a concurrency counter equals the number of
+    /// jobs actually running under it, returning `(groups_fixed,
+    /// queues_fixed)`. Runs on the maintenance leader beside `sweep_stale`.
+    ///
+    /// `sweep_stale` recovers from one failure — a worker that stopped
+    /// heartbeating — and correctly gives its counters back. This covers the
+    /// complement: counters that drifted for any other reason, which nothing
+    /// else in the system would ever notice or repair. A backend whose
+    /// counters cannot drift (because it mutates them atomically alongside the
+    /// job) has nothing to do here.
+    async fn reconcile_counters(&self) -> Result<(u64, u64)> {
+        Ok((0, 0))
+    }
+
     /// Returns `(completed, failed, cancelled, batches)` deleted counts.
     async fn cleanup(&self, retention: Retention) -> Result<(u64, u64, u64, u64)>;
 

@@ -114,6 +114,7 @@ fn fast_config() -> QueueConfig {
         batch_retention_count: None,
         poll_only: false,
         leader_lease_secs: 30,
+        ..Default::default()
     }
 }
 
