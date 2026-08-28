@@ -42,22 +42,18 @@ function waitsForAbort() {
   };
 }
 
-// Capture the wrapped handler and the abort broadcast the way the runtime does,
-// without starting one: `work()` installs both.
+// Stand in for a queue instance: the wrapper only ever needs `setAbortHandler`
+// and identity, so this avoids a live native handle (and a database).
 function harness() {
-  const q = Object.create(native.Eddyq.prototype);
+  const { wrapHandler, ensureAbortHandler } = lib.__internals;
   let broadcast;
-  let wrapped;
-  q.setAbortHandler = (fn) => {
-    broadcast = fn;
+  const q = {
+    setAbortHandler: (fn) => {
+      broadcast = fn;
+    },
   };
-  const origWork = Object.getPrototypeOf(q).work;
-  q.work = (kind, handler) => {
-    wrapped = handler;
-  };
-  void origWork;
-  native.Eddyq.prototype.work.call(q, "late-dispatch", waitsForAbort());
-  return { broadcast, wrapped };
+  ensureAbortHandler(q);
+  return { broadcast, wrapped: wrapHandler(waitsForAbort(), q) };
 }
 
 const { broadcast, wrapped } = harness();

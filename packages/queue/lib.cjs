@@ -253,4 +253,10 @@ module.exports = {
   ...native,
   CancelError,
   RetryError,
+  // Not public API. The handler wrapper and the shutdown broadcast are plain
+  // JS with a genuine ordering hazard between them, and reaching them through
+  // the patched prototype requires a live native instance — which is exactly
+  // what makes that hazard hard to test. Exposed so it can be exercised
+  // directly, deterministically, without a database.
+  __internals: { wrapHandler, ensureAbortHandler, stateFor },
 };
