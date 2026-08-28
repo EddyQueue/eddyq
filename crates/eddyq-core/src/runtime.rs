@@ -35,6 +35,18 @@ const IDLE_BACKOFF_MAX_FACTOR: u32 = 8;
 /// publishes a wakeup at that moment.
 const IDLE_BACKOFF_ABSOLUTE_MAX: Duration = Duration::from_secs(30);
 
+/// How often the leader reconciles concurrency counters, independent of
+/// `sweep_interval`.
+///
+/// Counter drift is a bug, not a routine event, and repairing it is never
+/// urgent — a lane that has lost a slot stays wrong for minutes at worst.
+/// Deliberately decoupled from the sweep: `sweep_interval` is tuned for how
+/// fast a dead worker's jobs come back (500ms in the test suite), and opening a
+/// transaction that often to look for damage that is almost never there wastes
+/// a connection every tick and puts the maintenance loop in contention with
+/// shutdown's own reclaim.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
 /// The furthest an idle fetcher will back off for a given poll interval.
 fn idle_ceiling(poll_interval: Duration) -> Duration {
     poll_interval
@@ -587,6 +599,12 @@ async fn sweeper_loop<B: Backend>(
     is_leader: Arc<AtomicBool>,
 ) {
     info!("eddyq sweeper started");
+    // `None` means due, so a process that boots into already-drifted counters
+    // repairs them on its first sweep rather than five minutes in. Deliberately
+    // not `Instant::now() - RECONCILE_INTERVAL`: Instant is CLOCK_MONOTONIC on
+    // Linux and starts at zero at boot, so that subtraction panics on a host
+    // that came up less than RECONCILE_INTERVAL ago.
+    let mut last_reconcile: Option<std::time::Instant> = None;
     let mut interval = tokio::time::interval(config.sweep_interval);
     interval.tick().await; // immediate
     loop {
@@ -605,15 +623,18 @@ async fn sweeper_loop<B: Backend>(
                 // Runs after the sweep, so counters the sweep just gave back
                 // are already reflected and this only sees genuine drift.
                 // Warn rather than info: a counter that disagrees with its own
-                // jobs is a bug somewhere, and silently repairing it every
-                // minute would hide that.
-                match backend.reconcile_counters().await {
-                    Ok((0, 0)) => {}
-                    Ok((groups, queues)) => warn!(
-                        groups, queues,
-                        "reconciled concurrency counters that had drifted above their running jobs"
-                    ),
-                    Err(err) => error!(?err, "counter reconcile failed"),
+                // jobs is a bug somewhere, and silently repairing it on a timer
+                // would hide that.
+                if last_reconcile.is_none_or(|t| t.elapsed() >= RECONCILE_INTERVAL) {
+                    last_reconcile = Some(std::time::Instant::now());
+                    match backend.reconcile_counters().await {
+                        Ok((0, 0)) => {}
+                        Ok((groups, queues)) => warn!(
+                            groups, queues,
+                            "reconciled concurrency counters that had drifted above their running jobs"
+                        ),
+                        Err(err) => error!(?err, "counter reconcile failed"),
+                    }
                 }
             }
         }
