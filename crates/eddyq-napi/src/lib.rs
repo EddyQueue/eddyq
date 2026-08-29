@@ -321,6 +321,22 @@ pub struct StartOptions {
     /// Default 1_000 (1s). Ignored when LISTEN is enabled.
     pub fetch_poll_interval_ms: Option<u32>,
 
+    /// Backstop timeout for handlers on queues that set no
+    /// `default_timeout_ms` of their own. Default 21_600_000 (6h); pass `0`
+    /// to disable it and wait forever, which is the pre-0.1.4 behaviour.
+    ///
+    /// It exists because a handler that never returns holds its concurrency
+    /// slot for the life of the process, and nothing recovers it — the worker
+    /// keeps heartbeating, since the process is healthy and only one future is
+    /// stuck, so the stale-job sweeper cannot see it. Six hours is chosen to be
+    /// far outside any real handler while still bounding that.
+    ///
+    /// Configurable because the right ceiling is a property of the workload,
+    /// not of the queue, and a backstop set below a legitimate runtime is worse
+    /// than none: it converts work that would have finished into a
+    /// timeout-and-retry loop that never can.
+    pub default_job_timeout_ms: Option<u32>,
+
     /// How often the leader scheduler loop fires due schedules + promotes
     /// delayed jobs. Default 5_000 (5s). Lower values make `{ every: ms }`
     /// interval schedules feel more responsive at the cost of more leader
@@ -1094,6 +1110,16 @@ impl Queue {
             }
             if let Some(ms) = o.fetch_poll_interval_ms {
                 builder = builder.fetch_poll_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.default_job_timeout_ms {
+                // 0 means "no backstop" -- the pre-0.1.4 behaviour, kept
+                // reachable for workloads whose handlers legitimately outlive
+                // any fixed ceiling.
+                builder = builder.default_job_timeout(if ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(u64::from(ms)))
+                });
             }
             if let Some(ms) = o.scheduler_interval_ms {
                 builder = builder.scheduler_interval(Duration::from_millis(u64::from(ms)));
@@ -2146,6 +2172,16 @@ impl RedisQueue {
             }
             if let Some(ms) = o.fetch_poll_interval_ms {
                 builder = builder.fetch_poll_interval(Duration::from_millis(u64::from(ms)));
+            }
+            if let Some(ms) = o.default_job_timeout_ms {
+                // 0 means "no backstop" -- the pre-0.1.4 behaviour, kept
+                // reachable for workloads whose handlers legitimately outlive
+                // any fixed ceiling.
+                builder = builder.default_job_timeout(if ms == 0 {
+                    None
+                } else {
+                    Some(Duration::from_millis(u64::from(ms)))
+                });
             }
             if let Some(ms) = o.scheduler_interval_ms {
                 builder = builder.scheduler_interval(Duration::from_millis(u64::from(ms)));
@@ -3387,6 +3423,7 @@ fn clone_start_options(o: &StartOptions) -> StartOptions {
         batch_retention_count: o.batch_retention_count,
         leader_lease_secs: o.leader_lease_secs,
         fetch_poll_interval_ms: o.fetch_poll_interval_ms,
+        default_job_timeout_ms: o.default_job_timeout_ms,
         scheduler_interval_ms: o.scheduler_interval_ms,
     }
 }
