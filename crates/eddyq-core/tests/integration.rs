@@ -4443,3 +4443,166 @@ async fn uncapped_group_is_still_claimed(pool: PgPool) {
 
     queue.shutdown().await.unwrap();
 }
+
+/// `errors` keeps only the newest `MAX_ERROR_ENTRIES` entries. Every append
+/// trims the oldest: both `mark_failed` branches, `sweep_stale`, and
+/// `reclaim_in_flight`.
+#[sqlx::test(migrations = "./migrations")]
+async fn error_log_keeps_newest_entries(pool: PgPool) {
+    use eddyq_core::{
+        error::MAX_ERROR_ENTRIES,
+        fetch::{mark_failed, reclaim_in_flight},
+    };
+
+    async fn messages(pool: &PgPool, id: i64) -> Vec<String> {
+        let errors: serde_json::Value =
+            sqlx::query_scalar("SELECT errors FROM eddyq_jobs WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        errors
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["message"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    // Put the row back in a claimed state so the next write path applies.
+    async fn stage_running(pool: &PgPool, id: i64, worker_id: uuid::Uuid) {
+        sqlx::query(
+            "UPDATE eddyq_jobs
+                SET state = 'running', worker_id = $1, heartbeat_at = NULL,
+                    stalled_count = 0, max_stalled_count = 100
+              WHERE id = $2",
+        )
+        .bind(worker_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Count, _>(CountWorker {
+            counter: Arc::new(AtomicUsize::new(0)),
+        })
+        .config(fast_config())
+        .build();
+    let eddyq_core::EnqueueResult::Inserted(id) = queue.enqueue(&Count { n: 1 }).await.unwrap()
+    else {
+        panic!("expected Inserted");
+    };
+    let worker_id = uuid::Uuid::new_v4();
+
+    let appends = MAX_ERROR_ENTRIES + 5;
+    for attempt in 1..=appends {
+        stage_running(&pool, id, worker_id).await;
+        // Retry branch until the last append, which takes the terminal branch.
+        let retry_at = (attempt < appends).then(|| chrono::Utc::now() + chrono::Duration::hours(1));
+        let entry = serde_json::json!({ "message": format!("attempt {attempt}") });
+        mark_failed(&pool, id, worker_id, entry, retry_at)
+            .await
+            .unwrap();
+    }
+    let expected: Vec<String> = (appends - MAX_ERROR_ENTRIES + 1..=appends)
+        .map(|a| format!("attempt {a}"))
+        .collect();
+    assert_eq!(messages(&pool, id).await, expected);
+
+    stage_running(&pool, id, worker_id).await;
+    assert_eq!(sweep_stale(&pool, Duration::ZERO).await.unwrap(), 1);
+    stage_running(&pool, id, worker_id).await;
+    assert_eq!(reclaim_in_flight(&pool, &[id]).await.unwrap(), 1);
+
+    let log = messages(&pool, id).await;
+    assert_eq!(log.len(), MAX_ERROR_ENTRIES);
+    assert_eq!(
+        log[..MAX_ERROR_ENTRIES - 2],
+        expected[2..],
+        "sweep and reclaim each trim the oldest entry"
+    );
+    assert!(log[MAX_ERROR_ENTRIES - 2].contains("lost contact"));
+    assert!(log[MAX_ERROR_ENTRIES - 1].contains("shutting down"));
+}
+
+/// A handler failure with an oversized message and stack lands in `errors`
+/// with both fields capped and marked as truncated.
+#[sqlx::test(migrations = "./migrations")]
+async fn error_entry_fields_are_truncated(pool: PgPool) {
+    use eddyq_core::error::{MAX_ERROR_MESSAGE_BYTES, MAX_ERROR_STACK_BYTES};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Loud;
+    impl Job for Loud {
+        const KIND: &'static str = "loud";
+        fn max_attempts(&self) -> i32 {
+            1
+        }
+    }
+    struct LoudWorker;
+    #[async_trait]
+    impl Worker<Loud> for LoudWorker {
+        async fn perform(&self, _: Loud, _: JobContext) -> JobResult {
+            Err(anyhow::Error::from(eddyq_core::HandlerFailure {
+                message: "m".repeat(10_000),
+                name: Some("LoudError".into()),
+                stack: Some("s".repeat(50_000)),
+                directive: None,
+            }))
+        }
+    }
+
+    let queue = Queue::builder(pool.clone())
+        .register::<Loud, _>(LoudWorker)
+        .config(fast_config())
+        .build();
+    queue.enqueue(&Loud).await.unwrap();
+    queue.start().unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let failed: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM eddyq_jobs WHERE state = 'failed'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if failed == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("job should fail within 5s");
+    queue.shutdown().await.unwrap();
+
+    let errors: serde_json::Value =
+        sqlx::query_scalar("SELECT errors FROM eddyq_jobs WHERE state = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let entry = &errors.as_array().unwrap()[0];
+    assert_eq!(entry["name"], "LoudError");
+
+    let message = entry["message"].as_str().unwrap();
+    assert!(message.len() <= MAX_ERROR_MESSAGE_BYTES);
+    assert!(
+        message.len() > MAX_ERROR_MESSAGE_BYTES - 32,
+        "cap is filled"
+    );
+    let kept = message.bytes().take_while(|&b| b == b'm').count();
+    assert_eq!(
+        &message[kept..],
+        format!("...[truncated {} bytes]", 10_000 - kept)
+    );
+
+    let stack = entry["stack"].as_str().unwrap();
+    assert!(stack.len() <= MAX_ERROR_STACK_BYTES);
+    let kept = stack.bytes().take_while(|&b| b == b's').count();
+    assert_eq!(
+        &stack[kept..],
+        format!("...[truncated {} bytes]", 50_000 - kept)
+    );
+}
