@@ -14,12 +14,16 @@ use std::time::Duration;
 pub enum RetentionRule {
     /// `true` => drop immediately on finalize, `false` => keep forever.
     Bool(bool),
-    /// Structured rule with optional age-based and count-based caps.
+    /// Structured rule with optional age-based and count-based caps. Applied
+    /// when the job finalizes, and scoped to the job's own queue: it prunes
+    /// that queue's finalized jobs in the same state, never another queue's.
+    /// Pruned jobs are deleted outright (row, error log, unique key).
     Rule {
         /// Drop entries older than this many seconds.
         #[serde(skip_serializing_if = "Option::is_none")]
         age: Option<u64>,
-        /// Keep at most the most recent N entries.
+        /// Keep at most the most recent N entries, counting the finalizing
+        /// job. `0` keeps nothing, so the finalizing job is dropped as well.
         #[serde(skip_serializing_if = "Option::is_none")]
         count: Option<u32>,
     },

@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::{error::Result, job::JobId};
+use crate::{
+    error::{MAX_ERROR_ENTRIES, Result},
+    job::JobId,
+};
 
 #[derive(Debug, Clone)]
 pub struct ClaimedJob {
@@ -912,6 +915,14 @@ pub async fn update_heartbeat_batch(pool: &PgPool, ids: &[i64]) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
+/// jsonpath variables that trim `eddyq_jobs.errors` to its newest
+/// [`MAX_ERROR_ENTRIES`] entries as part of each append:
+/// `jsonb_path_query_array(errors || <entry>, '$[last - $back to last]', <vars>)`.
+/// Lax mode clamps the lower subscript at 0, so shorter logs pass through whole.
+fn error_log_trim_vars() -> serde_json::Value {
+    serde_json::json!({ "back": MAX_ERROR_ENTRIES - 1 })
+}
+
 /// Sweep running jobs whose heartbeat is older than `stale_after`. Each swept
 /// row has its `stalled_count` bumped; rows whose new `stalled_count` exceeds
 /// `max_stalled_count` are marked failed, the rest are returned to `pending`
@@ -944,7 +955,7 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
                                         THEN attempt ELSE GREATEST(attempt - 1, 0) END,
                    heartbeat_at  = NULL,
                    worker_id     = NULL,
-                   errors        = errors || $2::jsonb,
+                   errors        = jsonb_path_query_array(errors || $2::jsonb, '$[last - $back to last]', $3::jsonb),
                    finalized_at  = CASE WHEN stalled_count + 1 > max_stalled_count
                                         THEN NOW() ELSE NULL END
              WHERE state = 'running'
@@ -1008,6 +1019,7 @@ pub async fn sweep_stale(pool: &PgPool, stale_after: std::time::Duration) -> Res
     )
     .bind(secs)
     .bind(error_entry)
+    .bind(error_log_trim_vars())
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1134,7 +1146,7 @@ pub async fn reclaim_in_flight(pool: &PgPool, ids: &[JobId]) -> Result<u64> {
                                         THEN attempt ELSE GREATEST(attempt - 1, 0) END,
                    heartbeat_at  = NULL,
                    worker_id     = NULL,
-                   errors        = errors || $2::jsonb,
+                   errors        = jsonb_path_query_array(errors || $2::jsonb, '$[last - $back to last]', $3::jsonb),
                    finalized_at  = CASE WHEN stalled_count + 1 > max_stalled_count
                                         THEN NOW() ELSE NULL END
              WHERE state = 'running'
@@ -1192,6 +1204,7 @@ pub async fn reclaim_in_flight(pool: &PgPool, ids: &[JobId]) -> Result<u64> {
     )
     .bind(ids)
     .bind(error_entry)
+    .bind(error_log_trim_vars())
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1229,7 +1242,7 @@ pub async fn mark_failed(
                    heartbeat_at = NULL,
                    worker_id    = NULL,
                    scheduled_at = $2,
-                   errors       = errors || $3::jsonb
+                   errors       = jsonb_path_query_array(errors || $3::jsonb, '$[last - $back to last]', $5::jsonb)
              WHERE id = $1
                AND state = 'running'
                AND worker_id = $4
@@ -1240,6 +1253,7 @@ pub async fn mark_failed(
         .bind(at)
         .bind(error_entry)
         .bind(worker_id)
+        .bind(error_log_trim_vars())
         .fetch_optional(&mut *tx)
         .await?
     } else {
@@ -1249,7 +1263,7 @@ pub async fn mark_failed(
                SET state        = 'failed',
                    heartbeat_at = NULL,
                    worker_id    = NULL,
-                   errors       = errors || $2::jsonb,
+                   errors       = jsonb_path_query_array(errors || $2::jsonb, '$[last - $back to last]', $4::jsonb),
                    finalized_at = NOW()
              WHERE id = $1
                AND state = 'running'
@@ -1260,6 +1274,7 @@ pub async fn mark_failed(
         .bind(id)
         .bind(error_entry)
         .bind(worker_id)
+        .bind(error_log_trim_vars())
         .fetch_optional(&mut *tx)
         .await?;
         r.map(|(g, q, b)| {

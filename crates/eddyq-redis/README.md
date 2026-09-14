@@ -43,7 +43,7 @@ What the Redis backend ships out of the box:
 - **Pattern-based group rules.** `setGroupRule("tenant-*", { maxConcurrency: 5 })` and every new `tenant-acme`, `tenant-foo`, … gets the cap on first enqueue.
 - **Cron schedules + `{ every: ms }` interval schedules.** Leader-fenced, skip-missed semantics.
 - **Named-queue concurrency caps.** Cross-process limit per queue, not just per worker pool.
-- **Per-job retention** (`removeOnComplete` / `removeOnFail`) — drop, keep N, keep age, or both.
+- **Per-job retention** (`removeOnComplete` / `removeOnFail`) — drop, keep N, keep age, or both. A rule prunes only its own queue's finalized jobs, deleting each victim outright, and at most 500 per finalize; the remainder stays indexed for the next finalize or `cleanup`.
 - **`list_jobs` + `get_stats`.** Dashboard renders against Redis with the same shape as the Postgres backend.
 
 ## Cluster / hash-tag layout

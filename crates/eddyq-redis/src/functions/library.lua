@@ -63,10 +63,17 @@ local function wait_score(priority, scheduled_at_ms)
   return (-priority) * 1e13 + scheduled_at_ms
 end
 
--- Append an entry to the per-job error list. We store as a JSON string per
--- entry so dashboards can render the structured fields.
+-- Most recent entries kept in a job's error list. Must equal
+-- `eddyq_core::error::MAX_ERROR_ENTRIES`; a test in eddyq-redis pins it.
+local MAX_ERROR_ENTRIES = 10
+
+-- Append an entry to the per-job error list, trimming it to the newest
+-- MAX_ERROR_ENTRIES. We store as a JSON string per entry so dashboards can
+-- render the structured fields.
 local function push_error(prefix, id, error_json)
-  redis.call('RPUSH', errkey(prefix, id), error_json)
+  local key = errkey(prefix, id)
+  redis.call('RPUSH', key, error_json)
+  redis.call('LTRIM', key, -MAX_ERROR_ENTRIES, -1)
 end
 
 -- Decode a JSON arg (Lua's cjson is loaded by Redis).
@@ -551,69 +558,9 @@ local function fn_heartbeat(keys, args)
   return count
 end
 
--- Helper: prune retention ZSET in place, honoring per-job rule JSON
--- (removeOnComplete / removeOnFail).
---
--- rule_json shapes accepted:
---   ""                     -- nil      => keep, no inline prune
---   "true"                 -- boolean  => drop (no ZADD)
---   "false"                -- boolean  => keep, no inline prune
---   "{\"count\":N}"        -- count    => keep last N (ZREMRANGEBYRANK)
---   "{\"age\":S}"          -- age secs => prune older than (now - age)
---   "{\"age\":S,\"count\":N}" -- both
---
--- Returns true if the job HASH should be deleted (rule == drop). `nqkey`
--- is the per-queue mirror ZSET (`nq:<q>:completed` etc.); when set, every
--- ZADD/ZREM/prune operation on `zsetkey` is mirrored to it so dashboards
--- can render per-queue counts. `nqkey` may be nil for code paths that
--- don't know the queue (shouldn't happen today — kept tolerant).
-local function apply_retention(prefix, id, zsetkey, nqkey, rule_json, now_ms)
-  local function add_both()
-    redis.call('ZADD', zsetkey, now_ms, id)
-    if nqkey then redis.call('ZADD', nqkey, now_ms, id) end
-  end
-  if rule_json == nil or rule_json == '' then
-    add_both(); return false
-  end
-  local ok, rule = pcall(cjson.decode, rule_json)
-  if not ok or rule == nil then
-    add_both(); return false
-  end
-  -- Boolean shorthand
-  if rule == true then
-    return true
-  end
-  if rule == false then
-    add_both(); return false
-  end
-  -- Object with age/count
-  add_both()
-  if rule.age and tonumber(rule.age) then
-    local cutoff = now_ms - (tonumber(rule.age) * 1000)
-    redis.call('ZREMRANGEBYSCORE', zsetkey, '-inf', '(' .. cutoff)
-    if nqkey then redis.call('ZREMRANGEBYSCORE', nqkey, '-inf', '(' .. cutoff) end
-  end
-  if rule.count and tonumber(rule.count) then
-    -- Keep newest N. Pruned independently per ZSET — global count keeps
-    -- newest N across all queues; per-queue keeps newest N within the
-    -- queue. Both are valid views, just scoped differently.
-    local keep = tonumber(rule.count)
-    local total = redis.call('ZCARD', zsetkey)
-    if total > keep then
-      redis.call('ZREMRANGEBYRANK', zsetkey, 0, total - keep - 1)
-    end
-    if nqkey then
-      local ntotal = redis.call('ZCARD', nqkey)
-      if ntotal > keep then
-        redis.call('ZREMRANGEBYRANK', nqkey, 0, ntotal - keep - 1)
-      end
-    end
-  end
-  return false
-end
-
--- Tear down a job's metadata after a `drop` retention. Removes the HASH,
--- error log, queue/kind/tag set memberships, and unique-key reservation.
+-- Tear down a job's metadata after a `drop` retention or a prune. Removes
+-- the HASH, error log, queue/kind/tag set memberships, and unique-key
+-- reservation. Does not touch the state ZSETs; callers ZREM those.
 local function delete_job(prefix, id)
   -- Read the index keys before we delete the HASH so we know what to clean.
   local fields = redis.call('HMGET', jobkey(prefix, id),
@@ -635,6 +582,113 @@ local function delete_job(prefix, id)
   if uniq and uniq ~= '' then redis.call('DEL', uniquekey(prefix, uniq)) end
   redis.call('DEL', errkey(prefix, id))
   redis.call('DEL', jobkey(prefix, id))
+end
+
+-- Most jobs one `apply_retention` call deletes. Bounds how long a single
+-- complete/fail holds the Redis event loop when a rule makes a large backlog
+-- eligible at once (e.g. a queue's first finalize after its age window
+-- lapsed). Victims past the cap stay indexed in both the global and
+-- per-queue ZSETs, so the queue's next finalize or `eddyq_cleanup` reaps
+-- them; nothing is orphaned.
+local RETENTION_PRUNE_CAP = 500
+
+-- Helper: record a finalized job in its state ZSETs and apply its per-job
+-- rule JSON (removeOnComplete / removeOnFail).
+--
+-- rule_json shapes accepted:
+--   ""                     -- nil      => keep, no inline prune
+--   "true"                 -- boolean  => drop (no ZADD)
+--   "false"                -- boolean  => keep, no inline prune
+--   "{\"count\":N}"        -- count    => keep the queue's newest N
+--   "{\"age\":S}"          -- age secs => prune the queue's entries older than (now - age)
+--   "{\"age\":S,\"count\":N}" -- both; an entry matching either is pruned
+--
+-- `zsetkey` is the global state ZSET (`:completed` / `:failed`) and `nqkey`
+-- the per-queue mirror (`nq:<q>:completed` etc.) of the finalizing job's
+-- queue. Pruning is scoped to that queue: the global ZSET holds every
+-- queue's jobs, and one queue's rule must never delete another queue's
+-- jobs, so victims are selected from `nqkey` only. Each victim is torn down
+-- with `delete_job` (HASH, error log, unique key, set memberships) and
+-- ZREMed from both ZSETs. Dropping an id from the ZSETs without `delete_job`
+-- would orphan its keys where no sweep can ever find them again.
+--
+-- The finalizing job is never its own victim, so `count: N` leaves exactly
+-- N entries including it. `count: 0` keeps nothing: the queue's other
+-- entries are pruned and the job itself is dropped via the return value.
+-- When `nqkey` is nil (queue unknown) the job is recorded but nothing is
+-- pruned, since victims could not be scoped to its queue.
+--
+-- Returns true if the caller should delete the finalizing job.
+local function apply_retention(prefix, id, zsetkey, nqkey, rule_json, now_ms)
+  local function add_both()
+    redis.call('ZADD', zsetkey, now_ms, id)
+    if nqkey then redis.call('ZADD', nqkey, now_ms, id) end
+  end
+  if rule_json == nil or rule_json == '' then
+    add_both(); return false
+  end
+  local ok, rule = pcall(cjson.decode, rule_json)
+  if not ok or rule == nil then
+    add_both(); return false
+  end
+  -- Boolean shorthand
+  if rule == true then
+    return true
+  end
+  -- `false`, and any shape that isn't an object, keeps without pruning.
+  if type(rule) ~= 'table' then
+    add_both(); return false
+  end
+
+  local age = tonumber(rule.age)
+  local keep = tonumber(rule.count)
+  local drop_self = keep ~= nil and keep <= 0
+  if not drop_self then add_both() end
+  if nqkey == nil or (age == nil and keep == nil) then
+    return drop_self
+  end
+
+  local self_id = tostring(id)
+  local victims = {}
+  local seen = {}
+  local function take(v)
+    if v ~= self_id and not seen[v] then
+      seen[v] = true
+      victims[#victims + 1] = v
+    end
+  end
+
+  if age then
+    local cutoff = now_ms - (age * 1000)
+    local ids = redis.call('ZRANGEBYSCORE', nqkey, '-inf', '(' .. cutoff,
+                           'LIMIT', 0, RETENTION_PRUNE_CAP)
+    for _, v in ipairs(ids) do take(v) end
+  end
+  if keep and #victims < RETENTION_PRUNE_CAP then
+    -- Everything but the newest `keep`, oldest first. The finalizing job is
+    -- skipped rather than counted as surplus, so read one extra entry to
+    -- still find `want` others if it sorts into the range (clock skew).
+    local excess = redis.call('ZCARD', nqkey) - math.max(keep, 0)
+    if excess > 0 then
+      local want = math.min(excess, RETENTION_PRUNE_CAP)
+      local ids = redis.call('ZRANGE', nqkey, 0, want)
+      local counted = 0
+      for _, v in ipairs(ids) do
+        if counted >= want or #victims >= RETENTION_PRUNE_CAP then break end
+        if v ~= self_id then
+          counted = counted + 1
+          take(v)
+        end
+      end
+    end
+  end
+
+  for _, v in ipairs(victims) do
+    delete_job(prefix, v)
+    redis.call('ZREM', zsetkey, v)
+    redis.call('ZREM', nqkey, v)
+  end
+  return drop_self
 end
 
 -- ====================================================================

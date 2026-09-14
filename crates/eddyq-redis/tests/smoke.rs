@@ -1950,3 +1950,596 @@ async fn pre_upgrade_hash_recovers_cleanly_redis() {
 
     flush_line(&url, &line).await;
 }
+
+// ====================================================================
+// Per-job retention: prune teardown + queue scoping
+// ====================================================================
+
+async fn redis_conn(url: &str) -> redis::aio::MultiplexedConnection {
+    redis::Client::open(url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap()
+}
+
+async fn zcard(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> i64 {
+    redis::cmd("ZCARD")
+        .arg(key)
+        .query_async(conn)
+        .await
+        .unwrap()
+}
+
+async fn scard(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> i64 {
+    redis::cmd("SCARD")
+        .arg(key)
+        .query_async(conn)
+        .await
+        .unwrap()
+}
+
+/// Like `build_queue`, but the workers only pull from `queues`, and no
+/// queue-default cleanup is configured, so per-job rules are the only thing
+/// that can delete a finalized job.
+async fn build_queue_on(
+    url: &str,
+    line: &str,
+    counter: Arc<AtomicUsize>,
+    queues: &[&str],
+) -> Queue<RedisBackend> {
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.to_owned(),
+        line: line.to_owned(),
+    })
+    .await
+    .expect("redis backend connect");
+
+    QueueBuilder::with_backend(backend)
+        .register::<Count, _>(CountWorker { counter })
+        .config(QueueConfig {
+            completed_retention: None,
+            failed_retention: None,
+            cancelled_retention: None,
+            batch_retention: None,
+            completed_retention_count: None,
+            failed_retention_count: None,
+            cancelled_retention_count: None,
+            batch_retention_count: None,
+            ..fast_config()
+        })
+        .subscribe_to(queues.iter().copied())
+        .line(line.to_owned())
+        .build()
+}
+
+/// Wait until nothing on `line` is running: every claimed job has been
+/// finalized and its retention rule applied.
+async fn wait_idle(conn: &mut redis::aio::MultiplexedConnection, line: &str) {
+    let active = format!("{{{}}}:active", line);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while zcard(conn, &active).await > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("running jobs should finalize within 5s");
+}
+
+/// A job enqueued by `enqueue_tracked`, with the keys it owns.
+#[derive(Debug)]
+struct Tracked {
+    id: i64,
+    queue: String,
+    unique_key: String,
+}
+
+/// Enqueue `n` jobs on `queue_name`, each with a unique key, a tag, and a
+/// seeded error-log entry, so every key a prune must tear down exists.
+async fn enqueue_tracked(
+    queue: &Queue<RedisBackend>,
+    url: &str,
+    line: &str,
+    queue_name: &str,
+    n: u64,
+    rule: Option<eddyq_core::RetentionRule>,
+) -> Vec<Tracked> {
+    use eddyq_core::{EnqueueOptions, EnqueueResult};
+    let mut conn = redis_conn(url).await;
+    let mut jobs = Vec::new();
+    for i in 0..n {
+        let unique_key = format!("{}-{}", queue_name, uuid::Uuid::new_v4().simple());
+        let opts = EnqueueOptions {
+            queue: Some(queue_name.to_owned()),
+            unique_key: Some(unique_key.clone()),
+            tags: Some(vec![format!("tag-{}", queue_name)]),
+            remove_on_complete: rule.clone(),
+            ..Default::default()
+        };
+        let EnqueueResult::Inserted(id) = queue.enqueue_with(&Count { n: i }, opts).await.unwrap()
+        else {
+            panic!("expected Inserted");
+        };
+        let _: redis::Value = redis::cmd("RPUSH")
+            .arg(format!("{{{}}}:job:{}:errors", line, id))
+            .arg(r#"{"message":"seeded"}"#)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        jobs.push(Tracked {
+            id,
+            queue: queue_name.to_owned(),
+            unique_key,
+        });
+    }
+    jobs
+}
+
+/// Every key and index entry a completed job owns, and whether it exists.
+async fn completed_footprint(
+    conn: &mut redis::aio::MultiplexedConnection,
+    line: &str,
+    job: &Tracked,
+) -> Vec<(&'static str, bool)> {
+    let p = format!("{{{}}}", line);
+    let (id, q) = (job.id, &job.queue);
+    #[allow(clippy::type_complexity)]
+    let (hash, errors, unique, queue_set, kind_set, tag_set, global, per_queue): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<f64>,
+        Option<f64>,
+    ) = redis::pipe()
+        .cmd("EXISTS")
+        .arg(format!("{}:job:{}", p, id))
+        .cmd("EXISTS")
+        .arg(format!("{}:job:{}:errors", p, id))
+        .cmd("EXISTS")
+        .arg(format!("{}:unique:{}", p, job.unique_key))
+        .cmd("SISMEMBER")
+        .arg(format!("{}:queue:{}", p, q))
+        .arg(id)
+        .cmd("SISMEMBER")
+        .arg(format!("{}:kind:count", p))
+        .arg(id)
+        .cmd("SISMEMBER")
+        .arg(format!("{}:tag:tag-{}", p, q))
+        .arg(id)
+        .cmd("ZSCORE")
+        .arg(format!("{}:completed", p))
+        .arg(id)
+        .cmd("ZSCORE")
+        .arg(format!("{}:nq:{}:completed", p, q))
+        .arg(id)
+        .query_async(conn)
+        .await
+        .unwrap();
+    vec![
+        ("job hash", hash == 1),
+        ("error log", errors == 1),
+        ("unique key", unique == 1),
+        ("queue set", queue_set == 1),
+        ("kind set", kind_set == 1),
+        ("tag set", tag_set == 1),
+        ("global completed zset", global.is_some()),
+        ("per-queue completed zset", per_queue.is_some()),
+    ]
+}
+
+async fn assert_kept(conn: &mut redis::aio::MultiplexedConnection, line: &str, job: &Tracked) {
+    let fp = completed_footprint(conn, line, job).await;
+    assert!(
+        fp.iter().all(|(_, present)| *present),
+        "job {} ({}) should be fully kept: {:?}",
+        job.id,
+        job.queue,
+        fp
+    );
+}
+
+async fn assert_pruned(conn: &mut redis::aio::MultiplexedConnection, line: &str, job: &Tracked) {
+    let fp = completed_footprint(conn, line, job).await;
+    assert!(
+        fp.iter().all(|(_, present)| !*present),
+        "job {} ({}) should be fully torn down: {:?}",
+        job.id,
+        job.queue,
+        fp
+    );
+}
+
+/// `removeOnComplete: { count: K }` prunes the surplus of the finalizing
+/// job's own queue by deleting those jobs outright: HASH, error log, unique
+/// key, and every index entry. Another queue's jobs on the same line are
+/// never victims, even though they are older and share the global ZSET.
+#[tokio::test]
+async fn per_job_retention_count_prunes_own_queue_and_deletes_victims() {
+    use eddyq_core::RetentionRule;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retcq");
+    flush_line(&url, &line).await;
+    let p = format!("{{{}}}", line);
+
+    // Queue qb finalizes first, without a rule, so its jobs are the oldest
+    // entries in the global completed ZSET.
+    let b_done = Arc::new(AtomicUsize::new(0));
+    let qb = build_queue_on(&url, &line, b_done.clone(), &["qb"]).await;
+    let b_jobs = enqueue_tracked(&qb, &url, &line, "qb", 4, None).await;
+    run_until(&qb, &b_done, 4).await;
+
+    let keep: u32 = 3;
+    let a_done = Arc::new(AtomicUsize::new(0));
+    let qa = build_queue_on(&url, &line, a_done.clone(), &["qa"]).await;
+    let rule = Some(RetentionRule::keep_count(keep));
+    let a_jobs = enqueue_tracked(&qa, &url, &line, "qa", 8, rule).await;
+    run_until(&qa, &a_done, 8).await;
+
+    let mut conn = redis_conn(&url).await;
+    wait_idle(&mut conn, &line).await;
+
+    let mut kept = 0;
+    for job in &a_jobs {
+        let fp = completed_footprint(&mut conn, &line, job).await;
+        if fp.iter().all(|(_, present)| *present) {
+            kept += 1;
+        } else {
+            assert!(
+                fp.iter().all(|(_, present)| !*present),
+                "pruned job {} left keys behind: {:?}",
+                job.id,
+                fp
+            );
+        }
+    }
+    assert_eq!(
+        kept, keep,
+        "count rule keeps exactly the newest {keep} of qa"
+    );
+    for job in &b_jobs {
+        assert_kept(&mut conn, &line, job).await;
+    }
+
+    let keep = i64::from(keep);
+    assert_eq!(
+        zcard(&mut conn, &format!("{}:nq:qa:completed", p)).await,
+        keep
+    );
+    assert_eq!(zcard(&mut conn, &format!("{}:nq:qb:completed", p)).await, 4);
+    assert_eq!(
+        zcard_completed(&url, &line).await,
+        keep + 4,
+        "global ZSET holds qa's kept jobs plus every qb job"
+    );
+    assert_eq!(scard(&mut conn, &format!("{}:queue:qa", p)).await, keep);
+    assert_eq!(
+        scard(&mut conn, &format!("{}:kind:count", p)).await,
+        keep + 4
+    );
+
+    flush_line(&url, &line).await;
+}
+
+/// `removeOnComplete: { age }` deletes the finalizing queue's entries older
+/// than the window, with full teardown. Another queue's entries past the
+/// same cutoff are left alone.
+#[tokio::test]
+async fn per_job_retention_age_prunes_own_queue_and_deletes_victims() {
+    use eddyq_core::RetentionRule;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retaq");
+    flush_line(&url, &line).await;
+    let p = format!("{{{}}}", line);
+    let rule = Some(RetentionRule::keep_age(Duration::from_secs(60)));
+
+    let b_done = Arc::new(AtomicUsize::new(0));
+    let qb = build_queue_on(&url, &line, b_done.clone(), &["qb"]).await;
+    let b_jobs = enqueue_tracked(&qb, &url, &line, "qb", 3, None).await;
+    run_until(&qb, &b_done, 3).await;
+
+    let a_done = Arc::new(AtomicUsize::new(0));
+    let qa = build_queue_on(&url, &line, a_done.clone(), &["qa"]).await;
+    let old_a = enqueue_tracked(&qa, &url, &line, "qa", 5, rule.clone()).await;
+    run_until(&qa, &a_done, 5).await;
+
+    let mut conn = redis_conn(&url).await;
+    wait_idle(&mut conn, &line).await;
+    for job in &old_a {
+        assert_kept(&mut conn, &line, job).await;
+    }
+
+    // Backdate every finalized entry of both queues past the 60s window.
+    for job in b_jobs.iter().chain(&old_a) {
+        let _: redis::Value = redis::pipe()
+            .cmd("ZADD")
+            .arg(format!("{}:completed", p))
+            .arg("XX")
+            .arg(0)
+            .arg(job.id)
+            .cmd("ZADD")
+            .arg(format!("{}:nq:{}:completed", p, job.queue))
+            .arg("XX")
+            .arg(0)
+            .arg(job.id)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+    }
+
+    // One fresh qa finalize applies the rule.
+    let a2_done = Arc::new(AtomicUsize::new(0));
+    let qa2 = build_queue_on(&url, &line, a2_done.clone(), &["qa"]).await;
+    let new_a = enqueue_tracked(&qa2, &url, &line, "qa", 1, rule).await;
+    run_until(&qa2, &a2_done, 1).await;
+    wait_idle(&mut conn, &line).await;
+
+    for job in &old_a {
+        assert_pruned(&mut conn, &line, job).await;
+    }
+    assert_kept(&mut conn, &line, &new_a[0]).await;
+    for job in &b_jobs {
+        assert_kept(&mut conn, &line, job).await;
+    }
+    assert_eq!(zcard(&mut conn, &format!("{}:nq:qa:completed", p)).await, 1);
+    assert_eq!(zcard(&mut conn, &format!("{}:nq:qb:completed", p)).await, 3);
+    assert_eq!(zcard_completed(&url, &line).await, 4);
+    assert_eq!(scard(&mut conn, &format!("{}:queue:qa", p)).await, 1);
+    assert_eq!(scard(&mut conn, &format!("{}:kind:count", p)).await, 4);
+
+    flush_line(&url, &line).await;
+}
+
+/// One finalize deletes at most `RETENTION_PRUNE_CAP` (500) victims. The
+/// rest stay indexed in both ZSETs, so the next finalize reaps them rather
+/// than leaking them.
+#[tokio::test]
+async fn per_job_retention_prune_is_capped_per_finalize() {
+    use eddyq_core::RetentionRule;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retcap");
+    flush_line(&url, &line).await;
+    let p = format!("{{{}}}", line);
+    const STAGED: i64 = 600;
+    const CAP: i64 = 500;
+
+    // Stage a backlog of long-finalized qa jobs, far outside the age window.
+    let mut conn = redis_conn(&url).await;
+    let staged: Vec<i64> = (0..STAGED).map(|i| 1_000_000 + i).collect();
+    let mut pipe = redis::pipe();
+    for id in &staged {
+        pipe.cmd("HSET")
+            .arg(format!("{}:job:{}", p, id))
+            .arg("id")
+            .arg(id)
+            .arg("kind")
+            .arg("count")
+            .arg("queue")
+            .arg("qa")
+            .arg("state")
+            .arg("completed")
+            .arg("tags")
+            .arg("[]")
+            .arg("unique_key")
+            .arg("")
+            .ignore()
+            .cmd("RPUSH")
+            .arg(format!("{}:job:{}:errors", p, id))
+            .arg(r#"{"message":"seeded"}"#)
+            .ignore()
+            .cmd("SADD")
+            .arg(format!("{}:queue:qa", p))
+            .arg(id)
+            .ignore()
+            .cmd("SADD")
+            .arg(format!("{}:kind:count", p))
+            .arg(id)
+            .ignore()
+            .cmd("ZADD")
+            .arg(format!("{}:completed", p))
+            .arg(0)
+            .arg(id)
+            .ignore()
+            .cmd("ZADD")
+            .arg(format!("{}:nq:qa:completed", p))
+            .arg(0)
+            .arg(id)
+            .ignore();
+    }
+    let _: () = pipe.query_async(&mut conn).await.unwrap();
+
+    /// Count of staged job HASHes plus error logs still present.
+    async fn staged_keys_left(
+        conn: &mut redis::aio::MultiplexedConnection,
+        p: &str,
+        staged: &[i64],
+    ) -> i64 {
+        let mut pipe = redis::pipe();
+        for id in staged {
+            pipe.cmd("EXISTS")
+                .arg(format!("{}:job:{}", p, id))
+                .arg(format!("{}:job:{}:errors", p, id));
+        }
+        let counts: Vec<i64> = pipe.query_async(conn).await.unwrap();
+        counts.iter().sum()
+    }
+
+    let rule = Some(RetentionRule::keep_age(Duration::from_secs(60)));
+    let first_done = Arc::new(AtomicUsize::new(0));
+    let q1 = build_queue_on(&url, &line, first_done.clone(), &["qa"]).await;
+    let first = enqueue_tracked(&q1, &url, &line, "qa", 1, rule.clone()).await;
+    run_until(&q1, &first_done, 1).await;
+    wait_idle(&mut conn, &line).await;
+
+    assert_eq!(
+        staged_keys_left(&mut conn, &p, &staged).await,
+        (STAGED - CAP) * 2,
+        "first finalize tears down exactly CAP staged jobs"
+    );
+    let remaining = STAGED - CAP + 1;
+    assert_eq!(
+        zcard(&mut conn, &format!("{}:nq:qa:completed", p)).await,
+        remaining,
+        "victims past the cap stay indexed for the next prune"
+    );
+    assert_eq!(zcard_completed(&url, &line).await, remaining);
+    assert_eq!(
+        scard(&mut conn, &format!("{}:queue:qa", p)).await,
+        remaining
+    );
+
+    let second_done = Arc::new(AtomicUsize::new(0));
+    let q2 = build_queue_on(&url, &line, second_done.clone(), &["qa"]).await;
+    let second = enqueue_tracked(&q2, &url, &line, "qa", 1, rule).await;
+    run_until(&q2, &second_done, 1).await;
+    wait_idle(&mut conn, &line).await;
+
+    assert_eq!(staged_keys_left(&mut conn, &p, &staged).await, 0);
+    assert_eq!(zcard(&mut conn, &format!("{}:nq:qa:completed", p)).await, 2);
+    assert_eq!(zcard_completed(&url, &line).await, 2);
+    assert_eq!(scard(&mut conn, &format!("{}:queue:qa", p)).await, 2);
+    assert_eq!(scard(&mut conn, &format!("{}:kind:count", p)).await, 2);
+    assert_kept(&mut conn, &line, &first[0]).await;
+    assert_kept(&mut conn, &line, &second[0]).await;
+
+    flush_line(&url, &line).await;
+}
+
+/// `count: 0` keeps nothing: the queue's earlier jobs are pruned and the
+/// finalizing job is dropped too, while other queues are untouched.
+#[tokio::test]
+async fn per_job_retention_count_zero_drops_self_and_prunes_own_queue() {
+    use eddyq_core::RetentionRule;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("retc0");
+    flush_line(&url, &line).await;
+    let p = format!("{{{}}}", line);
+
+    let b_done = Arc::new(AtomicUsize::new(0));
+    let qb = build_queue_on(&url, &line, b_done.clone(), &["qb"]).await;
+    let b_jobs = enqueue_tracked(&qb, &url, &line, "qb", 2, None).await;
+    run_until(&qb, &b_done, 2).await;
+
+    let a_done = Arc::new(AtomicUsize::new(0));
+    let qa = build_queue_on(&url, &line, a_done.clone(), &["qa"]).await;
+    let old_a = enqueue_tracked(&qa, &url, &line, "qa", 3, None).await;
+    run_until(&qa, &a_done, 3).await;
+
+    let a2_done = Arc::new(AtomicUsize::new(0));
+    let qa2 = build_queue_on(&url, &line, a2_done.clone(), &["qa"]).await;
+    let rule = Some(RetentionRule::keep_count(0));
+    let dropper = enqueue_tracked(&qa2, &url, &line, "qa", 1, rule).await;
+    run_until(&qa2, &a2_done, 1).await;
+
+    let mut conn = redis_conn(&url).await;
+    wait_idle(&mut conn, &line).await;
+    for job in old_a.iter().chain(&dropper) {
+        assert_pruned(&mut conn, &line, job).await;
+    }
+    for job in &b_jobs {
+        assert_kept(&mut conn, &line, job).await;
+    }
+    assert_eq!(zcard(&mut conn, &format!("{}:nq:qa:completed", p)).await, 0);
+    assert_eq!(zcard_completed(&url, &line).await, 2);
+    assert_eq!(scard(&mut conn, &format!("{}:queue:qa", p)).await, 0);
+
+    flush_line(&url, &line).await;
+}
+
+/// The Redis error log keeps only the newest `MAX_ERROR_ENTRIES` entries,
+/// and each stored entry has its `message` / `stack` capped.
+#[tokio::test]
+async fn error_log_is_capped_and_truncated_redis() {
+    use eddyq_core::backend::Backend;
+    use eddyq_core::error::{
+        HandlerFailure, MAX_ERROR_ENTRIES, MAX_ERROR_MESSAGE_BYTES, MAX_ERROR_STACK_BYTES,
+    };
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("errcap");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter).await;
+    let eddyq_core::EnqueueResult::Inserted(id) = queue.enqueue(&Count { n: 1 }).await.unwrap()
+    else {
+        panic!("expected Inserted");
+    };
+
+    let mut conn = redis_conn(&url).await;
+    let job_key = format!("{{{}}}:job:{}", line, id);
+    let err_key = format!("{}:errors", job_key);
+    let worker_id = uuid::Uuid::new_v4();
+    let backend = queue.backend().as_ref();
+
+    let appends = MAX_ERROR_ENTRIES + 5;
+    for attempt in 1..=appends {
+        // Hand the job to `worker_id` so `eddyq_fail` accepts the verdict.
+        let _: redis::Value = redis::cmd("HSET")
+            .arg(&job_key)
+            .arg("state")
+            .arg("running")
+            .arg("locked_by")
+            .arg(worker_id.to_string())
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let failure = HandlerFailure {
+            message: format!("attempt {} {}", attempt, "x".repeat(10_000)),
+            name: Some("BigError".into()),
+            stack: Some("s".repeat(20_000)),
+            directive: None,
+        };
+        let retry_at = chrono::Utc::now() + chrono::Duration::hours(1);
+        backend
+            .mark_failed(id, worker_id, failure.as_error_entry(), Some(retry_at))
+            .await
+            .unwrap();
+    }
+
+    let raw: Vec<String> = redis::cmd("LRANGE")
+        .arg(&err_key)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.len(),
+        MAX_ERROR_ENTRIES,
+        "LTRIM keeps the newest entries"
+    );
+    for (i, entry) in raw.iter().enumerate() {
+        let entry: serde_json::Value = serde_json::from_str(entry).unwrap();
+        let message = entry["message"].as_str().unwrap();
+        let stack = entry["stack"].as_str().unwrap();
+        let attempt = appends - MAX_ERROR_ENTRIES + 1 + i;
+        assert!(
+            message.starts_with(&format!("attempt {} x", attempt)),
+            "entry {i} should be attempt {attempt}, got {:?}",
+            &message[..20]
+        );
+        assert!(message.len() <= MAX_ERROR_MESSAGE_BYTES);
+        assert!(message.contains("...[truncated "));
+        assert!(stack.len() <= MAX_ERROR_STACK_BYTES);
+        assert!(stack.contains("...[truncated "));
+    }
+
+    flush_line(&url, &line).await;
+}
