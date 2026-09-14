@@ -520,13 +520,16 @@ async fn backoff_delays_retries(pool: PgPool) {
     //   attempt 2 fails → wait ~40-50ms
     //   attempt 3 succeeds
     // Minimum total: ~60ms of backoff + execution/poll overhead.
-    // We assert >=60ms to prove backoff actually happened, and <500ms to prove it's not immediate-retry or runaway.
+    // We assert >=60ms to prove backoff actually happened. The upper bound only
+    // guards against runaway delays: uncontended this finishes in well under
+    // 500ms, but CPU starvation from parallel tests on CI has pushed it to ~1s,
+    // so it sits just under the 2s wait above.
     assert!(
         elapsed >= Duration::from_millis(60),
         "backoff should add at least ~60ms of delay across 2 retries, got {elapsed:?}"
     );
     assert!(
-        elapsed < Duration::from_millis(800),
+        elapsed < Duration::from_millis(1500),
         "total time unexpectedly long: {elapsed:?}"
     );
 }
