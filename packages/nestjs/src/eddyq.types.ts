@@ -110,7 +110,7 @@ export interface EddyqModuleOptions {
   gracefulShutdownMs?: number;
 
   /**
-   * How `onApplicationShutdown` releases the worker pool.
+   * How shutdown stops the worker runtime.
    *   - `"drain"` (default) — wait up to `gracefulShutdownMs` for in-flight
    *     handlers to finish. Best for routine deploys.
    *   - `"force"` — abort the runtime immediately and proactively reclaim

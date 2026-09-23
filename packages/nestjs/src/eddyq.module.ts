@@ -1,6 +1,5 @@
 import { Eddyq, EddyqApp, EddyqRedis } from "@eddyq/queue";
 import {
-  type BeforeApplicationShutdown,
   type DynamicModule,
   Global,
   Inject,
@@ -21,6 +20,7 @@ import {
 import { EddyqExplorer } from "./eddyq.explorer.js";
 import { QueueHandleImpl } from "./eddyq-queue.handle.js";
 import { EddyqQueueAggregator } from "./eddyq-queue.aggregator.js";
+import { EDDYQ_DRAIN_MODULES, EddyqWorkerRuntime } from "./eddyq.shutdown.js";
 import type {
   EddyqInstance,
   EddyqModuleAsyncOptions,
@@ -49,13 +49,12 @@ function isApp(queue: EddyqInstance): queue is EddyqApp {
  * `@Processor()` + `@JobHandler(kind)` annotations at bootstrap, registers
  * each handler with `queue.work()`, and starts the worker runtime.
  *
- * Shutdown is split across two hooks so in-flight handlers can finish
- * cleanly even when they depend on resources owned by other modules
- * (Drizzle, ioredis, etc.):
+ * Shutdown is split so in-flight handlers can finish cleanly even when
+ * they depend on resources owned by other modules (Drizzle, ioredis, etc.):
  *
- *   1. `beforeApplicationShutdown` — drain the worker runtime. User
- *      modules have not yet torn down their pools, so handler code can
- *      still complete DB writes, cache reads, etc.
+ *   1. `EddyqDrainModule.onModuleDestroy` — drain the worker runtime.
+ *      Runs before every other module's `onModuleDestroy`, so user pools
+ *      are still open while handlers finish. See `eddyq.shutdown.ts`.
  *   2. `onModuleDestroy` (per user module) — user-owned pools close here.
  *   3. `onApplicationShutdown` — release the eddyq Postgres pool. Runs
  *      last; nothing else in the app needs it by this point.
@@ -63,39 +62,39 @@ function isApp(queue: EddyqInstance): queue is EddyqApp {
 @Global()
 @Module({})
 export class EddyqModule
-  implements
-    OnApplicationBootstrap,
-    BeforeApplicationShutdown,
-    OnApplicationShutdown
+  implements OnApplicationBootstrap, OnApplicationShutdown
 {
   private static readonly logger = new Logger(EddyqModule.name);
-  private started = false;
 
   constructor(
     @Inject(EDDYQ_OPTIONS) private readonly options: EddyqModuleOptions,
     @Inject(EDDYQ_INSTANCE) private readonly queue: EddyqInstance,
     private readonly explorer: EddyqExplorer,
     private readonly aggregator: EddyqQueueAggregator,
+    private readonly runtime: EddyqWorkerRuntime,
   ) {}
 
   static forRoot(options: EddyqModuleOptions): DynamicModule {
     return {
       module: EddyqModule,
-      imports: [DiscoveryModule],
+      imports: [DiscoveryModule, ...EDDYQ_DRAIN_MODULES],
       providers: [
         { provide: EDDYQ_OPTIONS, useValue: options },
         eddyqInstanceProvider(),
         EddyqExplorer,
         EddyqQueueAggregator,
+        EddyqWorkerRuntime,
       ],
-      exports: [EDDYQ_INSTANCE, EDDYQ_OPTIONS],
+      // EddyqWorkerRuntime is exported only so the drain modules can inject
+      // it; it is not part of the public API.
+      exports: [EDDYQ_INSTANCE, EDDYQ_OPTIONS, EddyqWorkerRuntime],
     };
   }
 
   static forRootAsync(options: EddyqModuleAsyncOptions): DynamicModule {
     return {
       module: EddyqModule,
-      imports: [DiscoveryModule, ...(options.imports ?? [])],
+      imports: [DiscoveryModule, ...EDDYQ_DRAIN_MODULES, ...(options.imports ?? [])],
       providers: [
         {
           provide: EDDYQ_OPTIONS,
@@ -105,8 +104,9 @@ export class EddyqModule
         eddyqInstanceProvider(),
         EddyqExplorer,
         EddyqQueueAggregator,
+        EddyqWorkerRuntime,
       ],
-      exports: [EDDYQ_INSTANCE, EDDYQ_OPTIONS],
+      exports: [EDDYQ_INSTANCE, EDDYQ_OPTIONS, EddyqWorkerRuntime],
     };
   }
 
@@ -301,47 +301,14 @@ export class EddyqModule
       // migrations). Pass only the shared tuning knobs.
       await this.queue.start(this.options.tuning ?? undefined);
     }
-    this.started = true;
+    this.runtime.markStarted();
     EddyqModule.logger.log("worker runtime started");
   }
 
-  // Drain runs in the *before* phase so user-owned resources (Drizzle,
-  // ioredis, etc.) are still open while in-flight handlers finish. Nest
-  // fires `onModuleDestroy` next, which is where those pools tear down.
-  async beforeApplicationShutdown(signal?: string): Promise<void> {
-    if (!this.started) return;
-    const reason = signal ? `signal ${signal}` : "shutdown";
-    EddyqModule.logger.log(`stopping worker runtime (${reason})`);
-    try {
-      await this.queue.shutdown({
-        mode: this.options.shutdownMode ?? "drain",
-        gracefulTimeoutMs: this.options.gracefulShutdownMs ?? 30_000,
-      });
-    } catch (e) {
-      EddyqModule.logger.error(
-        `worker shutdown failed: ${(e as Error).message}`,
-      );
-    }
-    this.started = false;
-  }
-
   async onApplicationShutdown(): Promise<void> {
-    // Fallback: if Nest skipped `beforeApplicationShutdown` (e.g. user
-    // never called `app.enableShutdownHooks()` before forcing close via
-    // `app.close()`), drain here so we still cleanly release work.
-    if (this.started) {
-      try {
-        await this.queue.shutdown({
-          mode: this.options.shutdownMode ?? "drain",
-          gracefulTimeoutMs: this.options.gracefulShutdownMs ?? 30_000,
-        });
-      } catch (e) {
-        EddyqModule.logger.error(
-          `worker shutdown failed: ${(e as Error).message}`,
-        );
-      }
-      this.started = false;
-    }
+    // Normally a no-op: a drain module already drained in the destroy
+    // phase. Awaited here so the pool never closes under a running drain.
+    await this.runtime.stop();
     if (hasPgPath(this.queue)) {
       try {
         // `Eddyq.close()` closes the PG pool; `EddyqApp.close()` does the

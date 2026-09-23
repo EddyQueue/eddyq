@@ -7,7 +7,7 @@ import {
   type MiddlewareConsumer,
   type NestModule,
   type OnModuleInit,
-  RequestMethod,
+  type Type,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import { existsSync } from 'node:fs';
@@ -27,10 +27,12 @@ export class EddyqWakeboardModule implements NestModule, OnModuleInit {
   // Stored at forRoot() time so configure() and onModuleInit() can read it
   // without DI gymnastics.
   private static _mountPath = '/wakeboard';
+  private static _controller: Type<WakeboardControllerBase>;
 
   constructor(
     private readonly adapterHost: HttpAdapterHost,
     @Inject(WAKEBOARD_OPTIONS) private readonly options: EddyqWakeboardOptions,
+    private readonly auth: WakeboardAuthMiddleware,
   ) {}
 
   static forRoot(options: EddyqWakeboardOptions = {}): DynamicModule {
@@ -40,6 +42,7 @@ export class EddyqWakeboardModule implements NestModule, OnModuleInit {
     // Create a controller subclass with the configured path prefix applied.
     @Controller(mountPath)
     class MountedWakeboardController extends WakeboardControllerBase {}
+    EddyqWakeboardModule._controller = MountedWakeboardController;
 
     return {
       module: EddyqWakeboardModule,
@@ -52,10 +55,19 @@ export class EddyqWakeboardModule implements NestModule, OnModuleInit {
     };
   }
 
-  configure(consumer: MiddlewareConsumer) {
-    consumer
-      .apply(WakeboardAuthMiddleware)
-      .forRoutes({ path: `${EddyqWakeboardModule._mountPath}*path`, method: RequestMethod.ALL });
+  async configure(consumer: MiddlewareConsumer): Promise<void> {
+    // Bind to the controller rather than a wildcard path: wildcard syntax
+    // differs between Nest 10 (`(.*)`) and 11+ (`*path`), and a path the
+    // router doesn't understand leaves every route unauthenticated.
+    consumer.apply(WakeboardAuthMiddleware).forRoutes(EddyqWakeboardModule._controller);
+
+    // Express runs handlers in registration order and Nest registers
+    // controller routes after `configure()` but before `onModuleInit()`.
+    // Registered any later, `express.static` would sit behind the SPA
+    // catch-all and every asset request would get `index.html`.
+    if (this.adapterHost.httpAdapter?.getType() === 'express') {
+      await this.registerExpressAssets();
+    }
   }
 
   // Static asset serving is delegated to the underlying HTTP adapter rather
@@ -75,15 +87,6 @@ export class EddyqWakeboardModule implements NestModule, OnModuleInit {
   //      and a `@Get('*path')`-style decorator that works on Express will
   //      silently fail to register on Fastify.
   async onModuleInit(): Promise<void> {
-    const assetsRoot = join(DIST_PUBLIC, 'assets');
-    if (!existsSync(assetsRoot)) {
-      EddyqWakeboardModule.logger.warn(
-        `wakeboard frontend assets not found at ${assetsRoot}; ` +
-          `run \`pnpm --filter @eddyq/wakeboard build:frontend\``,
-      );
-      return;
-    }
-
     const httpAdapter = this.adapterHost.httpAdapter;
     if (!httpAdapter) {
       EddyqWakeboardModule.logger.warn(
@@ -92,54 +95,76 @@ export class EddyqWakeboardModule implements NestModule, OnModuleInit {
       return;
     }
 
-    const mountPath = EddyqWakeboardModule._mountPath;
-    const assetsPrefix = `${mountPath}/assets/`;
     const adapterType = httpAdapter.getType();
-    const instance = httpAdapter.getInstance();
-
-    if (adapterType === 'fastify') {
-      let fastifyStatic: unknown;
-      try {
-        fastifyStatic = (await import('@fastify/static')).default;
-      } catch (err) {
-        throw new Error(
-          '@eddyq/wakeboard requires `@fastify/static` when running on the Fastify adapter. ' +
-            'Install it: `npm i @fastify/static`.',
-          { cause: err as Error },
-        );
-      }
-      await instance.register(fastifyStatic as never, {
-        root: assetsRoot,
-        prefix: assetsPrefix,
-        decorateReply: false,
-      });
-      EddyqWakeboardModule.logger.log(
-        `registered @fastify/static at ${assetsPrefix} → ${assetsRoot}`,
+    // Express assets were registered in `configure()`.
+    if (adapterType === 'express') return;
+    if (adapterType !== 'fastify') {
+      EddyqWakeboardModule.logger.warn(
+        `unknown HTTP adapter type "${adapterType}"; static assets not served`,
       );
       return;
     }
 
-    if (adapterType === 'express') {
-      let express: { static: (root: string) => unknown };
-      try {
-        express = (await import('express')).default as never;
-      } catch (err) {
-        throw new Error(
-          '@eddyq/wakeboard requires `express` when running on the Express adapter.',
-          { cause: err as Error },
-        );
-      }
-      // Drop trailing slash so `instance.use('/wakeboard/assets', …)` matches
-      // both `/wakeboard/assets/x.js` and (theoretically) `/wakeboard/assets`.
-      instance.use(`${mountPath}/assets`, express.static(assetsRoot));
-      EddyqWakeboardModule.logger.log(
-        `registered express.static at ${mountPath}/assets → ${assetsRoot}`,
-      );
-      return;
-    }
+    const assetsRoot = this.assetsRootOrWarn();
+    if (!assetsRoot) return;
 
-    EddyqWakeboardModule.logger.warn(
-      `unknown HTTP adapter type "${adapterType}"; static assets not served`,
+    let fastifyStatic: unknown;
+    try {
+      fastifyStatic = (await import('@fastify/static')).default;
+    } catch (err) {
+      throw new Error(
+        '@eddyq/wakeboard requires `@fastify/static` when running on the Fastify adapter. ' +
+          'Install it: `npm i @fastify/static`.',
+        { cause: err as Error },
+      );
+    }
+    // Fastify routes are matched by find-my-way, not registration order, so
+    // registering here (after the controller routes) is fine.
+    const assetsPrefix = `${EddyqWakeboardModule._mountPath}/assets/`;
+    await httpAdapter.getInstance().register(fastifyStatic as never, {
+      root: assetsRoot,
+      prefix: assetsPrefix,
+      decorateReply: false,
+    });
+    EddyqWakeboardModule.logger.log(
+      `registered @fastify/static at ${assetsPrefix} → ${assetsRoot}`,
     );
+  }
+
+  private async registerExpressAssets(): Promise<void> {
+    const assetsRoot = this.assetsRootOrWarn();
+    if (!assetsRoot) return;
+
+    let express: { static: (root: string) => unknown };
+    try {
+      express = (await import('express')).default as never;
+    } catch (err) {
+      throw new Error(
+        '@eddyq/wakeboard requires `express` when running on the Express adapter.',
+        { cause: err as Error },
+      );
+    }
+    const mountPath = EddyqWakeboardModule._mountPath;
+    // Registered ahead of Nest's own middleware, so apply auth explicitly.
+    // Drop trailing slash so `instance.use('/wakeboard/assets', …)` matches
+    // both `/wakeboard/assets/x.js` and (theoretically) `/wakeboard/assets`.
+    this.adapterHost.httpAdapter.getInstance().use(
+      `${mountPath}/assets`,
+      this.auth.use.bind(this.auth),
+      express.static(assetsRoot),
+    );
+    EddyqWakeboardModule.logger.log(
+      `registered express.static at ${mountPath}/assets → ${assetsRoot}`,
+    );
+  }
+
+  private assetsRootOrWarn(): string | undefined {
+    const assetsRoot = join(DIST_PUBLIC, 'assets');
+    if (existsSync(assetsRoot)) return assetsRoot;
+    EddyqWakeboardModule.logger.warn(
+      `wakeboard frontend assets not found at ${assetsRoot}; ` +
+        `run \`pnpm --filter @eddyq/wakeboard build:frontend\``,
+    );
+    return undefined;
   }
 }

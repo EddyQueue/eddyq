@@ -1,5 +1,5 @@
 import { Inject, Injectable, type NestMiddleware } from '@nestjs/common';
-import type { NextFunction, Request, Response } from 'express';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { WAKEBOARD_OPTIONS } from './wakeboard.constants.js';
 import type { EddyqWakeboardOptions } from './wakeboard.types.js';
 
@@ -17,17 +17,24 @@ export class WakeboardAuthMiddleware implements NestMiddleware {
       : '';
   }
 
-  use(req: Request, res: Response, next: NextFunction) {
+  // Fastify hands Nest middleware the raw Node objects, not Express's
+  // req/res, so stick to the `node:http` API that both adapters provide.
+  use(req: IncomingMessage, res: ServerResponse, next: () => void) {
     if (!this.configured) {
-      res.status(503).send('Set auth.password in EddyqWakeboardModule.forRoot()');
+      reply(res, 503, 'Set auth.password in EddyqWakeboardModule.forRoot()');
       return;
     }
-    const auth = (req.headers['authorization'] as string) ?? '';
-    if (auth !== this.expected) {
+    if (req.headers['authorization'] !== this.expected) {
       res.setHeader('WWW-Authenticate', 'Basic realm="eddyq-wakeboard"');
-      res.status(401).send('Unauthorized');
+      reply(res, 401, 'Unauthorized');
       return;
     }
     next();
   }
+}
+
+function reply(res: ServerResponse, status: number, body: string): void {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.end(body);
 }

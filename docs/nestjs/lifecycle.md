@@ -30,7 +30,7 @@ bootstrap()
 On `SIGINT` / `SIGTERM`:
 
 1. Nest's shutdown sequence fires.
-2. `EddyqModule` calls `eddyq.shutdown()` with `gracefulShutdownMs` (default 30_000).
+2. `EddyqModule` calls `eddyq.shutdown()` with `gracefulShutdownMs` (default 30_000), before any other module's `onModuleDestroy`. Resources your handlers use can close in any lifecycle hook.
 3. In-flight handlers receive `signal.abort()` and have the grace window to unwind.
 4. The DB pool closes.
 
@@ -53,20 +53,23 @@ EddyqModule.forRoot({
 
 ## Health checks
 
-Inject the raw client into a `HealthIndicator`:
+Inject the raw client next to Terminus's `HealthIndicatorService` (`@nestjs/terminus` 11+):
 
 ```ts
+import { HealthIndicatorService } from '@nestjs/terminus'
 import { InjectEddyq, type Eddyq } from '@eddyq/nestjs'
 
 @Injectable()
-export class EddyqHealth extends HealthIndicator {
-  constructor(@InjectEddyq() private readonly eddyq: Eddyq) {
-    super()
-  }
+export class EddyqHealth {
+  constructor(
+    @InjectEddyq() private readonly eddyq: Eddyq,
+    private readonly health: HealthIndicatorService,
+  ) {}
 
-  async check(key: string): Promise<HealthIndicatorResult> {
+  async check(key: string) {
+    const indicator = this.health.check(key)
     const stats = await this.eddyq.stats()
-    return this.getStatus(key, stats.healthy)
+    return stats.healthy ? indicator.up() : indicator.down()
   }
 }
 ```
