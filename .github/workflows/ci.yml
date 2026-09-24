@@ -64,3 +64,17 @@ jobs:
       - run: pnpm --filter @eddyq/nestjs test
         env:
           EDDYQ_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # @eddyq/nestjs peers on Nest ^10 || ^11 || ^12. Dev deps pin 12 (covered
+      # above); swap in each older major, rebuild, and re-run the smoke. Runs
+      # last because `pnpm add` rewrites the manifests.
+      - name: nestjs smoke on older Nest majors
+        env:
+          EDDYQ_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: |
+          for v in 10 11; do
+            echo "::group::NestJS $v"
+            pnpm --filter @eddyq/nestjs --filter @eddyq/wakeboard add -D "@nestjs/common@^$v" "@nestjs/core@^$v"
+            pnpm --filter @eddyq/nestjs --filter @eddyq/wakeboard build
+            pnpm --filter @eddyq/nestjs test
+            echo "::endgroup::"
+          done

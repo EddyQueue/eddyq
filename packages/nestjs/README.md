@@ -403,10 +403,10 @@ of admin scaffolding.**
 
 ## Requirements
 
-- Node ≥ 20
+- Node ≥ 20 (NestJS 12 itself needs ≥ 20.19 or ≥ 22.12)
 - PostgreSQL ≥ 14 (if using the Postgres backend)
 - Redis ≥ 7 (if using the Redis backend — Redis Functions require 7.0+)
-- `@nestjs/common` and `@nestjs/core` ^10 or ^11 (peer deps)
+- `@nestjs/common` and `@nestjs/core` ^10, ^11, or ^12 (peer deps)
 - `@eddyq/queue` same minor version (peer dep)
 
 ## License
