@@ -1,9 +1,5 @@
 # eddyq
 
-> A Rust job queue for the Node ecosystem — runs on Postgres, Redis, or both.
-
-**Status:** Beta. Running in production. APIs may change before 1.0 — pin exact versions.
-
 ## Why eddyq?
 
 - **Two backends, one API.** Postgres for transactional + durable; Redis (via Redis Functions, no Lua eval) for high-throughput ephemeral. Pick per-queue inside one app.
@@ -20,6 +16,22 @@
 | Transactional enqueue (`enqueueInTx`), durable batches, strong audit trail | **Postgres** | One DB, ACID, no extra moving parts |
 | Webhooks, fan-out, cache invalidation, anything ephemeral and hot | **Redis** | ~3–5× ingest, ~2–5× drain at scale; lower p50/p99 |
 | Mixed (e.g. payments on Postgres, webhooks on Redis) | **Both** — `EddyqApp` | Per-queue routing in one app, single handler registry |
+
+## eddyq vs BullMQ
+
+| | eddyq | BullMQ |
+|---|---|---|
+| Backends | Postgres, Redis, or both (per-queue) | Redis only |
+| Enqueue in your DB transaction | Yes (`enqueueInTx`, Postgres) | No |
+| Engine | Rust core, NAPI-RS bindings | TypeScript + Lua scripts |
+| Group concurrency / per-group rate limits | Built in, free | BullMQ Pro (paid) |
+| Fan-in callback | Batches (`onComplete`, Postgres) | Flows (parent/child, any depth) |
+| Cron + interval schedules | Yes, durable in the DB | Yes (job schedulers) |
+| NestJS module | `@eddyq/nestjs` | `@nestjs/bullmq` |
+| Dashboard | `@eddyq/wakeboard` | Bull Board, Taskforce.sh |
+| Maturity | Beta | Mature, widely deployed |
+
+If you're already on Redis, BullMQ works well, and you don't need transactional enqueue or group limits, stay on BullMQ. We haven't benchmarked the two head-to-head.
 
 ## Quick start (Postgres)
 
