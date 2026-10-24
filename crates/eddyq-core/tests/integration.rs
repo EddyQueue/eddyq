@@ -3968,6 +3968,78 @@ async fn batch_heartbeat_updates_all_in_flight(pool: PgPool) {
     assert_eq!(updated_count, 3);
 }
 
+/// A capped queue at its cap must not queue on its `eddyq_queues` row. With a
+/// deep backlog every fetcher keeps polling a full queue, and each poll used to
+/// wait on that row's `FOR UPDATE` only to claim nothing. Holding the row lock
+/// in another transaction proves the claim never asks for it.
+#[sqlx::test(migrations = "./migrations")]
+async fn full_capped_queue_claim_does_not_wait_on_queue_row(pool: PgPool) {
+    use eddyq_core::fetch::claim_batch;
+    use uuid::Uuid;
+
+    sqlx::query(
+        "INSERT INTO eddyq_queues (name, running_count, max_concurrency) VALUES ('capped', 2, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for n in 0..3i64 {
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state, queue) VALUES ('count', $1::jsonb, 'pending', 'capped')",
+        )
+        .bind(serde_json::json!({"n": n}))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM eddyq_queues WHERE name = 'capped' FOR UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let claimed = tokio::time::timeout(
+        Duration::from_secs(2),
+        claim_batch(
+            &pool,
+            Uuid::new_v4(),
+            10,
+            &["count".to_string()],
+            &["capped".to_string()],
+        ),
+    )
+    .await
+    .expect("claim on a full queue blocked on the queue row lock")
+    .unwrap();
+    assert!(claimed.is_empty(), "full queue must not admit: {claimed:?}");
+
+    holder.rollback().await.unwrap();
+
+    // Once a slot frees, the next claim takes exactly one job through the
+    // locked path and bumps the counter back to the cap.
+    sqlx::query("UPDATE eddyq_queues SET running_count = 1 WHERE name = 'capped'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claimed = claim_batch(
+        &pool,
+        Uuid::new_v4(),
+        10,
+        &["count".to_string()],
+        &["capped".to_string()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let running: i32 =
+        sqlx::query_scalar("SELECT running_count FROM eddyq_queues WHERE name = 'capped'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(running, 2);
+}
+
 // ─── Leader election tests ────────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "./migrations")]

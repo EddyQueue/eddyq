@@ -27,16 +27,26 @@ pub struct ClaimedJob {
     pub timeout: Option<std::time::Duration>,
 }
 
-/// Whether a queue's row can ever refuse a claim, and therefore whether its
-/// budget has to be read under `FOR UPDATE`.
+/// Whether a queue's budget has to be re-read under `FOR UPDATE` before this
+/// claim may take from it.
 ///
-/// `max_concurrency` defaults to i32::MAX, and a row is materialised by any
-/// queue-level setting at all — a timeout, or a pause since lifted. Such a row
-/// exists but cannot constrain anything: `running_count` is bounded by the
-/// number of jobs in flight and will never approach i32::MAX. Locking it
-/// serialises every fetcher of that queue for no purpose.
-fn queue_row_binds(max_concurrency: i32, paused: bool) -> bool {
-    paused || max_concurrency < i32::MAX
+/// The lock exists only to stop two fetchers both taking the last free slot,
+/// so it is needed only when the unlocked read shows a real cap with room
+/// left. Every other row can be answered from the unlocked read alone:
+///
+/// - The default row (`max_concurrency` = i32::MAX, materialised by any
+///   queue-level setting such as a timeout or a lifted pause) cannot
+///   constrain anything.
+/// - A paused or full queue yields zero slots, and claiming nothing cannot
+///   over-admit. If a slot frees between the read and the claim, the next
+///   poll takes it.
+///
+/// The full case is the one that matters under load. A capped queue at its
+/// cap with a deep backlog keeps every fetcher polling it, and each poll used
+/// to queue on this row's lock for the whole claim transaction only to learn
+/// there was nothing to take.
+fn queue_row_needs_lock(running_count: i32, max_concurrency: i32, paused: bool) -> bool {
+    !paused && max_concurrency < i32::MAX && running_count < max_concurrency
 }
 
 /// Claim up to `batch_size` pending jobs, respecting per-group concurrency
@@ -101,6 +111,10 @@ pub async fn claim_batch(
     // which can transiently over-admit on the single tick where an operator
     // introduces a cap. That is the same bound every queue with cross-process
     // limits lives with, and it is bounded by one fetch.
+    //
+    // A queue the unlocked read shows as full or paused is not locked either
+    // (see `queue_row_needs_lock`), and when that leaves no subscribed queue
+    // with room the claim ends here, before any job scan.
     let mut queue_budget: HashMap<String, i32> = HashMap::new();
     let mut queue_timeout: HashMap<String, Option<std::time::Duration>> = HashMap::new();
     {
@@ -118,7 +132,7 @@ pub async fn claim_batch(
 
         let binding: Vec<String> = rows
             .iter()
-            .filter(|(_, _, max, paused, _)| queue_row_binds(*max, *paused))
+            .filter(|(_, running, max, paused, _)| queue_row_needs_lock(*running, *max, *paused))
             .map(|(name, ..)| name.clone())
             .collect();
 
@@ -160,6 +174,10 @@ pub async fn claim_batch(
     let budget_for = |qname: &str, tbl: &HashMap<String, i32>| -> i32 {
         tbl.get(qname).copied().unwrap_or(i32::MAX)
     };
+    if queues.iter().all(|q| budget_for(q, &queue_budget) <= 0) {
+        tx.rollback().await?;
+        return Ok(vec![]);
+    }
 
     // Phase 1 — ungrouped (fastlane). Claim per queue so the per-queue cap
     // is enforced alongside the batch_size cap.
@@ -1316,20 +1334,30 @@ mod queue_lock_tests {
     /// row with the default cap, so "has a row" is not the same question as
     /// "has a limit".
     #[test]
-    fn a_default_row_does_not_bind() {
-        assert!(!queue_row_binds(i32::MAX, false));
+    fn a_default_row_does_not_need_the_lock() {
+        assert!(!queue_row_needs_lock(0, i32::MAX, false));
     }
 
     #[test]
-    fn a_real_cap_binds() {
-        assert!(queue_row_binds(15, false));
-        assert!(queue_row_binds(0, false));
+    fn a_cap_with_room_needs_the_lock() {
+        assert!(queue_row_needs_lock(0, 15, false));
+        assert!(queue_row_needs_lock(14, 15, false));
     }
 
-    /// Paused is a cap of zero however high `max_concurrency` reads, so it has
-    /// to be serialised like any other refusal.
+    /// A full queue gives zero slots from the unlocked read, and claiming
+    /// nothing cannot over-admit, so it must not queue on the row.
     #[test]
-    fn a_paused_queue_binds_even_at_the_default_cap() {
-        assert!(queue_row_binds(i32::MAX, true));
+    fn a_full_queue_does_not_need_the_lock() {
+        assert!(!queue_row_needs_lock(15, 15, false));
+        assert!(!queue_row_needs_lock(16, 15, false));
+        assert!(!queue_row_needs_lock(0, 0, false));
+    }
+
+    /// Paused is a cap of zero however high `max_concurrency` reads, and is
+    /// answered from the unlocked read the same way.
+    #[test]
+    fn a_paused_queue_does_not_need_the_lock() {
+        assert!(!queue_row_needs_lock(0, i32::MAX, true));
+        assert!(!queue_row_needs_lock(0, 15, true));
     }
 }
