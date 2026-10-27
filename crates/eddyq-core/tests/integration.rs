@@ -4040,6 +4040,115 @@ async fn full_capped_queue_claim_does_not_wait_on_queue_row(pool: PgPool) {
     assert_eq!(running, 2);
 }
 
+/// A capped queue with room whose row a peer holds is skipped for this poll,
+/// not waited on: the claim returns at once with the other queues' work, and
+/// the capped queue is served on the next poll once the row is free.
+#[sqlx::test(migrations = "./migrations")]
+async fn capped_queue_row_held_by_peer_is_skipped_not_waited_on(pool: PgPool) {
+    use eddyq_core::fetch::claim_batch;
+    use uuid::Uuid;
+
+    sqlx::query(
+        "INSERT INTO eddyq_queues (name, running_count, max_concurrency) VALUES ('capped', 1, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for queue in ["capped", "open"] {
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state, queue) VALUES ('count', '{}'::jsonb, 'pending', $1)",
+        )
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let kinds = ["count".to_string()];
+    let queues = ["capped".to_string(), "open".to_string()];
+
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM eddyq_queues WHERE name = 'capped' FOR UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let claimed = tokio::time::timeout(
+        Duration::from_secs(2),
+        claim_batch(&pool, Uuid::new_v4(), 10, &kinds, &queues),
+    )
+    .await
+    .expect("claim blocked on a queue row held by a peer")
+    .unwrap();
+    let got: Vec<&str> = claimed.iter().map(|j| j.queue.as_str()).collect();
+    assert_eq!(
+        got,
+        vec!["open"],
+        "held capped queue must be skipped: {claimed:?}"
+    );
+
+    holder.rollback().await.unwrap();
+
+    let claimed = claim_batch(&pool, Uuid::new_v4(), 10, &kinds, &queues)
+        .await
+        .unwrap();
+    let got: Vec<&str> = claimed.iter().map(|j| j.queue.as_str()).collect();
+    assert_eq!(got, vec!["capped"]);
+    let running: i32 =
+        sqlx::query_scalar("SELECT running_count FROM eddyq_queues WHERE name = 'capped'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(running, 2);
+}
+
+/// A group spans queues. When its oldest pending jobs sit on a full queue,
+/// its jobs on an open queue must still be claimed; they used to be crowded
+/// out of the candidate list by the full queue's jobs and starve.
+#[sqlx::test(migrations = "./migrations")]
+async fn group_spanning_full_and_open_queue_claims_from_open(pool: PgPool) {
+    use eddyq_core::fetch::claim_batch;
+    use uuid::Uuid;
+
+    sqlx::query(
+        "INSERT INTO eddyq_queues (name, running_count, max_concurrency) VALUES ('full', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for _ in 0..5 {
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state, queue, group_key, scheduled_at)
+             VALUES ('count', '{}'::jsonb, 'pending', 'full', 'g', NOW() - INTERVAL '1 hour')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO eddyq_jobs (kind, payload, state, queue, group_key, scheduled_at)
+         VALUES ('count', '{}'::jsonb, 'pending', 'open', 'g', NOW() - INTERVAL '1 minute')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let claimed = claim_batch(
+        &pool,
+        Uuid::new_v4(),
+        1,
+        &["count".to_string()],
+        &["full".to_string(), "open".to_string()],
+    )
+    .await
+    .unwrap();
+    let got: Vec<&str> = claimed.iter().map(|j| j.queue.as_str()).collect();
+    assert_eq!(
+        got,
+        vec!["open"],
+        "open-queue job starved behind full queue: {claimed:?}"
+    );
+}
+
 // ─── Leader election tests ────────────────────────────────────────────────────
 
 #[sqlx::test(migrations = "./migrations")]
