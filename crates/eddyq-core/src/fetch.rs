@@ -115,6 +115,13 @@ pub async fn claim_batch(
     // A queue the unlocked read shows as full or paused is not locked either
     // (see `queue_row_needs_lock`), and when that leaves no subscribed queue
     // with room the claim ends here, before any job scan.
+    //
+    // The rows that do need the lock are taken with SKIP LOCKED, the same way
+    // phase 2 takes group rows. A queue whose row a peer holds gets no budget
+    // on this poll: the peer is mid-claim on exactly the slots we would have
+    // fought over, so waiting for its commit only to find them taken is the
+    // convoy this avoids. A row held by a completion's decrement is skipped
+    // the same way and served on the next poll.
     let mut queue_budget: HashMap<String, i32> = HashMap::new();
     let mut queue_timeout: HashMap<String, Option<std::time::Duration>> = HashMap::new();
     {
@@ -159,12 +166,16 @@ pub async fn claim_batch(
                   FROM eddyq_queues
                  WHERE name = ANY($1)
               ORDER BY name
-                   FOR UPDATE
+                   FOR UPDATE SKIP LOCKED
                 "#,
             )
             .bind(&binding)
             .fetch_all(&mut *tx)
             .await?;
+            // Held by a peer: no budget this poll (see above).
+            for name in &binding {
+                queue_budget.insert(name.clone(), 0);
+            }
             for (name, running, max, paused) in locked {
                 let slots = if paused { 0 } else { (max - running).max(0) };
                 queue_budget.insert(name, slots);
@@ -228,6 +239,18 @@ pub async fn claim_batch(
 
     let remaining = batch_size.saturating_sub(accepted.len());
 
+    // Groups are looked up, locked and scanned only on queues that still have
+    // budget. A group spans queues (eddyq_groups is keyed by group_key alone),
+    // and phase 3 takes a group's oldest jobs first: scanning a full queue too
+    // let those jobs fill the candidate list, be dropped for want of queue
+    // budget, and starve the same group's jobs on an open queue. It also
+    // locked group rows that a full queue could never claim from.
+    let open_queues: Vec<String> = queues
+        .iter()
+        .filter(|q| budget_for(q, &queue_budget) > 0)
+        .cloned()
+        .collect();
+
     // Phase 2 — find which groups have pending work right now, lock their
     // rows, read their caps/tokens.
     //
@@ -237,7 +260,7 @@ pub async fn claim_batch(
     // O(groups). Each recursive step seeks the next group_key past the
     // current one via eddyq_jobs_group, so a deep backlog in one group costs
     // one index seek, not one scan per row.
-    let active_group_keys: Vec<String> = if remaining == 0 {
+    let active_group_keys: Vec<String> = if remaining == 0 || open_queues.is_empty() {
         vec![]
     } else {
         let rows: Vec<(String,)> = sqlx::query_as(
@@ -269,7 +292,7 @@ pub async fn claim_batch(
             "#,
         )
         .bind(&kinds_vec)
-        .bind(queues)
+        .bind(&open_queues)
         .fetch_all(&mut *tx)
         .await?;
         rows.into_iter().map(|(k,)| k).collect()
@@ -415,7 +438,7 @@ pub async fn claim_batch(
         .bind(key)
         .bind(take_n)
         .bind(&kinds_vec)
-        .bind(queues)
+        .bind(&open_queues)
         .fetch_all(&mut *tx)
         .await?;
         // Filter by remaining per-queue budget as we accept.
