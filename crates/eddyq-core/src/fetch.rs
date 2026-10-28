@@ -49,6 +49,75 @@ fn queue_row_needs_lock(running_count: i32, max_concurrency: i32, paused: bool) 
     !paused && max_concurrency < i32::MAX && running_count < max_concurrency
 }
 
+/// Phase 2 walk when every subscribed queue has budget: seek the next
+/// group_key through eddyq_jobs_group. Nearly every pending grouped row is in
+/// a subscribed queue, so the first row past each key almost always matches
+/// and the walk costs about one seek per group.
+const GROUP_WALK: &str = r#"
+    WITH RECURSIVE walk AS (
+        (SELECT j.group_key AS key
+           FROM eddyq_jobs j
+          WHERE j.state = 'pending'
+            AND j.scheduled_at <= NOW()
+            AND j.group_key IS NOT NULL
+            AND j.kind = ANY($1)
+            AND j.queue = ANY($2)
+       ORDER BY j.group_key
+          LIMIT 1)
+      UNION ALL
+        SELECT (SELECT j.group_key
+                  FROM eddyq_jobs j
+                 WHERE j.state = 'pending'
+                   AND j.scheduled_at <= NOW()
+                   AND j.group_key > w.key
+                   AND j.kind = ANY($1)
+                   AND j.queue = ANY($2)
+              ORDER BY j.group_key
+                 LIMIT 1)
+          FROM walk w
+         WHERE w.key IS NOT NULL
+    )
+    SELECT key FROM walk WHERE key IS NOT NULL
+"#;
+
+/// Phase 2 walk when phase 0 excluded full or paused queues. GROUP_WALK would
+/// still seek through eddyq_jobs_group, which has no queue column: every
+/// pending row of a group whose work sits only in an excluded queue is read
+/// from the heap and rejected (in production, thousands of rows per poll to
+/// find one claimable group). This walks (queue, group_key) pairs through
+/// eddyq_jobs_group_queue instead, with the open queues as an index condition,
+/// so excluded queues are never visited. A group with work in several open
+/// queues appears once per queue, hence DISTINCT.
+const GROUP_WALK_BY_QUEUE: &str = r#"
+    WITH RECURSIVE walk(queue, key) AS (
+        (SELECT j.queue, j.group_key
+           FROM eddyq_jobs j
+          WHERE j.state = 'pending'
+            AND j.group_key IS NOT NULL
+            AND j.queue = ANY($2)
+            AND j.scheduled_at <= NOW()
+            AND j.kind = ANY($1)
+       ORDER BY j.queue, j.group_key
+          LIMIT 1)
+      UNION ALL
+        SELECT n.queue, n.group_key
+          FROM walk w
+          CROSS JOIN LATERAL (
+              SELECT j.queue, j.group_key
+                FROM eddyq_jobs j
+               WHERE j.state = 'pending'
+                 AND j.group_key IS NOT NULL
+                 AND j.queue = ANY($2)
+                 AND (j.queue, j.group_key) > (w.queue, w.key)
+                 AND j.scheduled_at <= NOW()
+                 AND j.kind = ANY($1)
+            ORDER BY j.queue, j.group_key
+               LIMIT 1
+          ) n
+    )
+    SELECT DISTINCT key FROM walk
+"#;
+
 /// Claim up to `batch_size` pending jobs, respecting per-group concurrency
 /// caps and per-group token-bucket rate limits.
 ///
@@ -257,44 +326,23 @@ pub async fn claim_batch(
     // The distinct-key walk is a recursive "loose index scan": Postgres has
     // no native skip-scan, so a plain SELECT DISTINCT walks every pending
     // grouped index entry on every fetch — O(pending jobs) instead of
-    // O(groups). Each recursive step seeks the next group_key past the
-    // current one via eddyq_jobs_group, so a deep backlog in one group costs
-    // one index seek, not one scan per row.
+    // O(groups). Each recursive step seeks past the current key, so a deep
+    // backlog in one group costs one index seek, not one scan per row. Which
+    // walk depends on whether phase 0 excluded any subscribed queue; see
+    // GROUP_WALK and GROUP_WALK_BY_QUEUE.
     let active_group_keys: Vec<String> = if remaining == 0 || open_queues.is_empty() {
         vec![]
     } else {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            r#"
-            WITH RECURSIVE walk AS (
-                (SELECT j.group_key AS key
-                   FROM eddyq_jobs j
-                  WHERE j.state = 'pending'
-                    AND j.scheduled_at <= NOW()
-                    AND j.group_key IS NOT NULL
-                    AND j.kind = ANY($1)
-                    AND j.queue = ANY($2)
-               ORDER BY j.group_key
-                  LIMIT 1)
-              UNION ALL
-                SELECT (SELECT j.group_key
-                          FROM eddyq_jobs j
-                         WHERE j.state = 'pending'
-                           AND j.scheduled_at <= NOW()
-                           AND j.group_key > w.key
-                           AND j.kind = ANY($1)
-                           AND j.queue = ANY($2)
-                      ORDER BY j.group_key
-                         LIMIT 1)
-                  FROM walk w
-                 WHERE w.key IS NOT NULL
-            )
-            SELECT key FROM walk WHERE key IS NOT NULL
-            "#,
-        )
-        .bind(&kinds_vec)
-        .bind(&open_queues)
-        .fetch_all(&mut *tx)
-        .await?;
+        let walk = if open_queues.len() < queues.len() {
+            GROUP_WALK_BY_QUEUE
+        } else {
+            GROUP_WALK
+        };
+        let rows: Vec<(String,)> = sqlx::query_as(walk)
+            .bind(&kinds_vec)
+            .bind(&open_queues)
+            .fetch_all(&mut *tx)
+            .await?;
         rows.into_iter().map(|(k,)| k).collect()
     };
 
@@ -1382,5 +1430,146 @@ mod queue_lock_tests {
     fn a_paused_queue_does_not_need_the_lock() {
         assert!(!queue_row_needs_lock(0, i32::MAX, true));
         assert!(!queue_row_needs_lock(0, 15, true));
+    }
+}
+
+#[cfg(test)]
+mod group_walk_plan_tests {
+    use super::{GROUP_WALK, GROUP_WALK_BY_QUEUE};
+    use sqlx::PgPool;
+
+    /// The shape that regressed: deep grouped backlogs on a full queue, one
+    /// claimable group on an open one.
+    async fn seed(pool: &PgPool) {
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state, queue, group_key, scheduled_at)
+             SELECT 'k', '{}'::jsonb, 'pending', 'full', 'g' || (n % 20), NOW() - INTERVAL '1 hour'
+               FROM generate_series(1, 2000) n",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state, queue, group_key, scheduled_at)
+             VALUES ('k', '{}'::jsonb, 'pending', 'open', 'zz', NOW() - INTERVAL '1 minute'),
+                    ('k', '{}'::jsonb, 'pending', 'open2', 'zz', NOW() - INTERVAL '1 minute'),
+                    ('k', '{}'::jsonb, 'pending', 'open', 'later', NOW() + INTERVAL '1 hour')",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE eddyq_jobs")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn keys(pool: &PgPool, walk: &str, queues: &[&str]) -> Vec<String> {
+        let queues: Vec<String> = queues.iter().map(|q| (*q).to_owned()).collect();
+        let mut rows: Vec<(String,)> = sqlx::query_as(walk)
+            .bind(vec!["k".to_owned()])
+            .bind(&queues)
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows.sort();
+        rows.into_iter().map(|(k,)| k).collect()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn walk_by_queue_finds_open_groups_once_and_skips_excluded_queues(pool: PgPool) {
+        seed(&pool).await;
+        // Future-dated and excluded-queue keys are not returned; a key with
+        // work in two open queues is returned once.
+        assert_eq!(
+            keys(&pool, GROUP_WALK_BY_QUEUE, &["open", "open2"]).await,
+            vec!["zz"]
+        );
+        // Same answer as the walk it replaces, over the same queues.
+        assert_eq!(
+            keys(&pool, GROUP_WALK, &["open", "open2"]).await,
+            vec!["zz"]
+        );
+        let all: Vec<String> = keys(&pool, GROUP_WALK, &["full", "open", "open2"]).await;
+        assert_eq!(all.len(), 21);
+        assert_eq!(
+            keys(&pool, GROUP_WALK_BY_QUEUE, &["full", "open", "open2"]).await,
+            all
+        );
+    }
+
+    /// The eddyq_jobs scan nodes of `walk`'s plan over the open queues, each
+    /// as its header line plus detail lines, with the whole plan for messages.
+    async fn walk_scans(pool: &PgPool, walk: &str) -> (Vec<String>, String) {
+        let plan: Vec<(String,)> = sqlx::query_as(&format!("EXPLAIN (ANALYZE, COSTS OFF) {walk}"))
+            .bind(vec!["k".to_owned()])
+            .bind(vec!["open".to_owned(), "open2".to_owned()])
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        let lines: Vec<String> = plan.into_iter().map(|(l,)| l).collect();
+        let mut scans: Vec<String> = Vec::new();
+        let mut in_scan = false;
+        for line in &lines {
+            // Plan nodes start with "->"; detail lines (Index Cond, Filter,
+            // Rows Removed) follow their node.
+            if line.contains("->") {
+                in_scan = line.contains(" on eddyq_jobs");
+                if in_scan {
+                    scans.push(line.clone());
+                }
+            } else if in_scan {
+                let last = scans.last_mut().unwrap();
+                last.push('\n');
+                last.push_str(line);
+            }
+        }
+        (scans, lines.join("\n"))
+    }
+
+    fn rejects_rows(scan: &str) -> bool {
+        scan.lines()
+            .any(|l| l.contains("Rows Removed by Filter") && !l.trim_end().ends_with(": 0"))
+    }
+
+    /// Guards the regression itself, with the planner left to choose as it
+    /// does in production: with a full queue excluded, the walk must seek
+    /// through eddyq_jobs_group_queue with the open queues as an index
+    /// condition, and never read and reject the excluded queue's rows. The
+    /// table carries finalized history in every queue, as production does:
+    /// that is what makes `queue = ANY(open)` look unselective and sends the
+    /// old walk down eddyq_jobs_group. The old walk is checked on the same
+    /// data to prove the seed still reproduces the problem.
+    #[sqlx::test(migrations = "./migrations")]
+    async fn walk_by_queue_never_reads_excluded_queue_rows(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO eddyq_jobs (kind, payload, state, queue, finalized_at)
+             SELECT 'k', '{}'::jsonb, 'completed', (ARRAY['full', 'open', 'open2'])[1 + n % 3], NOW()
+               FROM generate_series(1, 60000) n",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        seed(&pool).await;
+
+        let (old, old_plan) = walk_scans(&pool, GROUP_WALK).await;
+        assert!(
+            old.iter().any(|s| rejects_rows(s)),
+            "seed no longer reproduces the regression:\n{old_plan}"
+        );
+
+        let (scans, plan) = walk_scans(&pool, GROUP_WALK_BY_QUEUE).await;
+        assert!(!scans.is_empty(), "{plan}");
+        for scan in &scans {
+            assert!(
+                scan.contains("eddyq_jobs_group_queue"),
+                "scan not on the queue index:\n{plan}"
+            );
+            assert!(
+                scan.contains("queue = ANY"),
+                "open queues not an index condition:\n{plan}"
+            );
+            assert!(!rejects_rows(scan), "scan read and rejected rows:\n{plan}");
+        }
     }
 }

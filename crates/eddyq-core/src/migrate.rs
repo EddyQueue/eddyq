@@ -111,6 +111,12 @@ pub const MIGRATIONS: &[Migration] = &[
         up_sql: include_str!("../migrations/20261028000001_stats_cache.up.sql"),
         down_sql: include_str!("../migrations/20261028000001_stats_cache.down.sql"),
     },
+    Migration {
+        version: 20_261_028_000_002,
+        name: "group_queue_index",
+        up_sql: include_str!("../migrations/20261028000002_group_queue_index.up.sql"),
+        down_sql: include_str!("../migrations/20261028000002_group_queue_index.down.sql"),
+    },
 ];
 
 /// Fresh-install DDL for the tracking table: composite PK `(line, version)`
