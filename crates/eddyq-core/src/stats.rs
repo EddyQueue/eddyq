@@ -5,7 +5,7 @@
 //! specific job. Writes and the runtime live in other modules.
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
 
 use crate::{
     error::Result,
@@ -27,19 +27,34 @@ pub struct JobStats {
     pub by_queue_state: Vec<QueueStateCount>,
 }
 
-/// Count jobs grouped by (queue, state). One round trip, suitable as the
-/// landing query for a board.
+/// How stale the terminal (completed / failed / cancelled) counts in
+/// `get_stats` may be. Live counts are always exact.
+pub const TERMINAL_STATS_TTL_SECS: i64 = 60;
+
+/// Count jobs grouped by (queue, state), ordered by (queue, state).
+///
+/// Live states (pending, running) are counted exactly on every call from the
+/// partial indexes the runtime already maintains, so they cost about a
+/// millisecond however large the table is. Terminal states are retained
+/// history and dominate the table, so their counts come from
+/// `eddyq_stats_cache` and may be up to [`TERMINAL_STATS_TTL_SECS`] old: one
+/// caller across the cluster recomputes them per TTL, and every other caller
+/// reads the cache. Polling this from many processes or dashboard tabs no
+/// longer multiplies a full-table scan.
 pub async fn get_stats(pool: &PgPool) -> Result<JobStats> {
-    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+    let mut rows: Vec<(String, String, i64)> = sqlx::query_as(
         r#"
-        SELECT queue, state, COUNT(*)::bigint
-          FROM eddyq_jobs
-         GROUP BY queue, state
-         ORDER BY queue, state
+        SELECT queue, 'pending'::text, COUNT(*)::bigint
+          FROM eddyq_jobs WHERE state = 'pending' GROUP BY queue
+        UNION ALL
+        SELECT queue, 'running'::text, COUNT(*)::bigint
+          FROM eddyq_jobs WHERE state = 'running' GROUP BY queue
         "#,
     )
     .fetch_all(pool)
     .await?;
+    rows.extend(terminal_counts(pool).await?);
+    rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
     let by_queue_state = rows
         .into_iter()
@@ -54,6 +69,84 @@ pub async fn get_stats(pool: &PgPool) -> Result<JobStats> {
 
     Ok(JobStats { by_queue_state })
 }
+
+/// Terminal-state counts from `eddyq_stats_cache`, refreshing it first when
+/// it is older than the TTL and this caller wins the refresh lock. A caller
+/// that loses the lock returns the previous snapshot rather than waiting,
+/// except on the very first call, when there is no snapshot to return.
+async fn terminal_counts(pool: &PgPool) -> Result<Vec<(String, String, i64)>> {
+    let mut tx = pool.begin().await?;
+    // None: no snapshot yet. Some(false): older than the TTL. Judged by the
+    // database clock, the one that stamped computed_at.
+    let fresh = snapshot_fresh(&mut tx).await?;
+    if fresh != Some(true) {
+        let locked: bool = if fresh.is_none() {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(STATS_LOCK_KEY)
+                .execute(&mut *tx)
+                .await?;
+            true
+        } else {
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+                .bind(STATS_LOCK_KEY)
+                .fetch_one(&mut *tx)
+                .await?
+        };
+        // Another caller may have refreshed between the read and the lock;
+        // read committed sees its commit, so check again before scanning.
+        if locked && snapshot_fresh(&mut tx).await? != Some(true) {
+            sqlx::query("DELETE FROM eddyq_stats_cache")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO eddyq_stats_cache (queue, state, count)
+                SELECT queue, state, COUNT(*)::bigint
+                  FROM eddyq_jobs
+                 WHERE state IN ('completed', 'failed', 'cancelled')
+                 GROUP BY queue, state
+                "#,
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO eddyq_stats_meta (id, computed_at) VALUES (1, now()) \
+                 ON CONFLICT (id) DO UPDATE SET computed_at = EXCLUDED.computed_at",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    let rows = sqlx::query_as("SELECT queue, state, count FROM eddyq_stats_cache")
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+async fn snapshot_fresh(tx: &mut Transaction<'_, Postgres>) -> Result<Option<bool>> {
+    Ok(sqlx::query_scalar(
+        "SELECT computed_at > clock_timestamp() - make_interval(secs => $1) \
+           FROM eddyq_stats_meta WHERE id = 1",
+    )
+    .bind(TERMINAL_STATS_TTL_SECS as f64)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+/// Advisory-lock key serializing terminal-count refreshes: FNV-1a 64-bit of
+/// `"eddyq::stats"`, the same scheme `migrate` uses for its own key.
+pub const STATS_LOCK_KEY: i64 = {
+    let bytes = b"eddyq::stats";
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        i += 1;
+    }
+    hash as i64
+};
 
 fn parse_state(s: &str) -> Option<JobState> {
     match s {
