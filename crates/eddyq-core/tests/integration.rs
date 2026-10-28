@@ -4790,3 +4790,95 @@ async fn error_entry_fields_are_truncated(pool: PgPool) {
         format!("...[truncated {} bytes]", 50_000 - kept)
     );
 }
+
+async fn insert_jobs(pool: &PgPool, queue: &str, state: &str, n: i64) {
+    sqlx::query(
+        "INSERT INTO eddyq_jobs (queue, kind, payload, state, heartbeat_at, finalized_at) \
+         SELECT $1, 'count', '{}'::jsonb, $2, \
+                CASE WHEN $2 = 'running' THEN now() END, \
+                CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN now() END \
+           FROM generate_series(1, $3)",
+    )
+    .bind(queue)
+    .bind(state)
+    .bind(n)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn stat_counts(stats: &eddyq_core::stats::JobStats) -> Vec<(String, &'static str, i64)> {
+    stats
+        .by_queue_state
+        .iter()
+        .map(|r| (r.queue.clone(), r.state.as_str(), r.count))
+        .collect()
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_stats_live_counts_exact_terminal_counts_cached(pool: PgPool) {
+    insert_jobs(&pool, "a", "pending", 3).await;
+    insert_jobs(&pool, "a", "running", 2).await;
+    insert_jobs(&pool, "a", "completed", 5).await;
+    insert_jobs(&pool, "b", "failed", 1).await;
+    insert_jobs(&pool, "b", "cancelled", 4).await;
+
+    let first = eddyq_core::stats::get_stats(&pool).await.unwrap();
+    assert_eq!(
+        stat_counts(&first),
+        vec![
+            ("a".to_owned(), "completed", 5),
+            ("a".to_owned(), "pending", 3),
+            ("a".to_owned(), "running", 2),
+            ("b".to_owned(), "cancelled", 4),
+            ("b".to_owned(), "failed", 1),
+        ]
+    );
+
+    // Within the TTL: live counts move, terminal counts are the snapshot.
+    insert_jobs(&pool, "a", "pending", 1).await;
+    insert_jobs(&pool, "a", "completed", 10).await;
+    let cached = eddyq_core::stats::get_stats(&pool).await.unwrap();
+    assert!(stat_counts(&cached).contains(&("a".to_owned(), "pending", 4)));
+    assert!(stat_counts(&cached).contains(&("a".to_owned(), "completed", 5)));
+
+    // Past the TTL the next caller recomputes them.
+    sqlx::query("UPDATE eddyq_stats_meta SET computed_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let refreshed = eddyq_core::stats::get_stats(&pool).await.unwrap();
+    assert!(stat_counts(&refreshed).contains(&("a".to_owned(), "completed", 15)));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn get_stats_stale_snapshot_served_while_another_caller_refreshes(pool: PgPool) {
+    insert_jobs(&pool, "a", "completed", 2).await;
+    eddyq_core::stats::get_stats(&pool).await.unwrap();
+    insert_jobs(&pool, "a", "completed", 3).await;
+    sqlx::query("UPDATE eddyq_stats_meta SET computed_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Hold the refresh lock as a concurrent refresher would.
+    let mut refresher = pool.begin().await.unwrap();
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(eddyq_core::stats::STATS_LOCK_KEY)
+        .fetch_one(&mut *refresher)
+        .await
+        .unwrap();
+    assert!(locked);
+
+    // The lock is taken, so this caller does not scan or wait: it returns the
+    // previous snapshot.
+    let stale = tokio::time::timeout(Duration::from_secs(5), eddyq_core::stats::get_stats(&pool))
+        .await
+        .expect("get_stats waited on the refresh lock")
+        .unwrap();
+    assert!(stat_counts(&stale).contains(&("a".to_owned(), "completed", 2)));
+    refresher.rollback().await.unwrap();
+
+    let fresh = eddyq_core::stats::get_stats(&pool).await.unwrap();
+    assert!(stat_counts(&fresh).contains(&("a".to_owned(), "completed", 5)));
+}
