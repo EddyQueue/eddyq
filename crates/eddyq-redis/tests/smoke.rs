@@ -2076,6 +2076,7 @@ async fn enqueue_tracked(
 }
 
 /// Every key and index entry a completed job owns, and whether it exists.
+/// Panics if the job still holds its unique key, which completion releases.
 async fn completed_footprint(
     conn: &mut redis::aio::MultiplexedConnection,
     line: &str,
@@ -2118,10 +2119,12 @@ async fn completed_footprint(
         .query_async(conn)
         .await
         .unwrap();
+    // A completed job releases its unique key at completion, kept or pruned,
+    // so the key is not part of what retention keeps or deletes.
+    assert_eq!(unique, 0, "completed job {} still holds its unique key", id);
     vec![
         ("job hash", hash == 1),
         ("error log", errors == 1),
-        ("unique key", unique == 1),
         ("queue set", queue_set == 1),
         ("kind set", kind_set == 1),
         ("tag set", tag_set == 1),
@@ -2540,6 +2543,476 @@ async fn error_log_is_capped_and_truncated_redis() {
         assert!(stack.len() <= MAX_ERROR_STACK_BYTES);
         assert!(stack.contains("...[truncated "));
     }
+
+    flush_line(&url, &line).await;
+}
+
+// =========================================================================
+// Unique keys: released at finalize (Postgres parity)
+// =========================================================================
+
+async fn wait_for(counter: &Arc<AtomicUsize>, n: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while counter.load(Ordering::SeqCst) < n {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("jobs should run within 5s");
+}
+
+fn uniq(key: &str) -> eddyq_core::EnqueueOptions {
+    eddyq_core::EnqueueOptions {
+        unique_key: Some(key.into()),
+        ..Default::default()
+    }
+}
+
+/// The same key can be enqueued again as soon as the first job completes,
+/// and cleaning up the finished job later does not free the new job's key.
+#[tokio::test]
+async fn unique_key_released_on_complete_and_not_freed_by_cleanup() {
+    use eddyq_core::{Backend, CleanState, EnqueueResult};
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("uniqrel");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+    queue.start().unwrap();
+    let r1 = queue
+        .enqueue_with(&Count { n: 1 }, uniq("variant:1"))
+        .await
+        .unwrap();
+    assert!(matches!(r1, EnqueueResult::Inserted(_)));
+    wait_for(&counter, 1).await;
+    queue.shutdown().await.unwrap();
+
+    // A second worker-less queue on the same line: jobs stay pending.
+    let idle = build_queue(&url, &line, Arc::new(AtomicUsize::new(0))).await;
+    let r2 = idle
+        .enqueue_with(&Count { n: 2 }, uniq("variant:1"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(r2, EnqueueResult::Inserted(_)),
+        "key must be free once the first job completed: got {:?}",
+        r2
+    );
+    let r3 = idle
+        .enqueue_with(&Count { n: 3 }, uniq("variant:1"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(r3, EnqueueResult::Skipped),
+        "pending job still owns the key"
+    );
+
+    // Retention deletes the completed first job. Its teardown must leave the
+    // pending job's reservation alone.
+    let deleted = idle
+        .backend()
+        .as_ref()
+        .clean(Duration::ZERO, 500, CleanState::Completed)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    let r4 = idle
+        .enqueue_with(&Count { n: 4 }, uniq("variant:1"))
+        .await
+        .unwrap();
+    assert!(
+        matches!(r4, EnqueueResult::Skipped),
+        "cleanup of the old job freed the new job's key: got {:?}",
+        r4
+    );
+
+    flush_line(&url, &line).await;
+}
+
+#[tokio::test]
+async fn unique_key_released_on_cancel() {
+    use eddyq_core::EnqueueResult;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("uniqcxl");
+    flush_line(&url, &line).await;
+
+    let queue = build_queue(&url, &line, Arc::new(AtomicUsize::new(0))).await;
+    let EnqueueResult::Inserted(id) = queue
+        .enqueue_with(&Count { n: 1 }, uniq("k"))
+        .await
+        .unwrap()
+    else {
+        panic!("first enqueue should insert");
+    };
+    assert!(queue.cancel(id).await.unwrap());
+    let r = queue
+        .enqueue_with(&Count { n: 2 }, uniq("k"))
+        .await
+        .unwrap();
+    assert!(matches!(r, EnqueueResult::Inserted(_)), "got {:?}", r);
+
+    flush_line(&url, &line).await;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Boom;
+
+impl Job for Boom {
+    const KIND: &'static str = "boom";
+}
+
+#[derive(Clone)]
+struct BoomWorker {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Worker<Boom> for BoomWorker {
+    async fn perform(&self, _job: Boom, _ctx: JobContext) -> JobResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other("boom").into())
+    }
+}
+
+/// A job that exhausts its attempts releases its key; a retry does not.
+#[tokio::test]
+async fn unique_key_released_on_final_failure_only() {
+    use eddyq_core::EnqueueResult;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("uniqfail");
+    flush_line(&url, &line).await;
+
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.clone(),
+        line: line.clone(),
+    })
+    .await
+    .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let queue = QueueBuilder::with_backend(backend)
+        .register::<Boom, _>(BoomWorker {
+            calls: calls.clone(),
+        })
+        .config(fast_config())
+        .line(line.clone())
+        .build();
+
+    let opts = || eddyq_core::EnqueueOptions {
+        unique_key: Some("f".into()),
+        max_attempts: Some(1),
+        ..Default::default()
+    };
+    let r1 = queue.enqueue_with(&Boom, opts()).await.unwrap();
+    assert!(matches!(r1, EnqueueResult::Inserted(_)));
+    queue.start().unwrap();
+    wait_for(&calls, 1).await;
+    // Give the fail call a moment to land after the handler returns.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    queue.shutdown().await.unwrap();
+
+    let r2 = queue.enqueue_with(&Boom, opts()).await.unwrap();
+    assert!(
+        matches!(r2, EnqueueResult::Inserted(_)),
+        "key must be free after final failure: got {:?}",
+        r2
+    );
+
+    flush_line(&url, &line).await;
+}
+
+/// Keys written by eddyq <= 0.1.13 hold '1' rather than the owner's id. The
+/// owning job must still release one when it finishes.
+#[tokio::test]
+async fn unique_key_legacy_value_released() {
+    use eddyq_core::EnqueueResult;
+    use redis::AsyncCommands;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("uniqlegacy");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+    let r1 = queue
+        .enqueue_with(&Count { n: 1 }, uniq("old"))
+        .await
+        .unwrap();
+    assert!(matches!(r1, EnqueueResult::Inserted(_)));
+
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let key = format!("{{{}}}:unique:old", line);
+    let _: () = conn.set(&key, "1").await.unwrap();
+
+    queue.start().unwrap();
+    wait_for(&counter, 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    queue.shutdown().await.unwrap();
+
+    let exists: bool = conn.exists(&key).await.unwrap();
+    assert!(
+        !exists,
+        "legacy reservation should be released at completion"
+    );
+
+    flush_line(&url, &line).await;
+}
+
+// =========================================================================
+// Cleanup throughput: one tick drains more than one batch
+// =========================================================================
+
+/// One leader tick must keep sweeping until the backlog is gone, not stop
+/// after one 500-job batch per state. At one batch per 5-minute tick the
+/// sweep tops out at 144k a day, below what a busy queue completes.
+#[tokio::test]
+async fn cleanup_drains_more_than_one_batch_per_tick() {
+    use eddyq_core::Backend;
+    use eddyq_core::fetch::Retention;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("cleanbig");
+    flush_line(&url, &line).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let queue = build_queue(&url, &line, counter.clone()).await;
+    let jobs: Vec<Count> = (0..1_300).map(|n| Count { n }).collect();
+    for chunk in jobs.chunks(500) {
+        queue.enqueue_many(chunk).await.unwrap();
+    }
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while counter.load(Ordering::SeqCst) < 1_300 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("1300 jobs should run within 30s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    queue.shutdown().await.unwrap();
+
+    let (completed, _, _, _) = queue
+        .backend()
+        .as_ref()
+        .cleanup(Retention {
+            completed_secs: Some(0),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed, 1_300, "one tick should sweep the whole backlog");
+
+    // And the count cap path: keep the newest 100 of a fresh 700.
+    let jobs: Vec<Count> = (0..700).map(|n| Count { n }).collect();
+    counter.store(0, Ordering::SeqCst);
+    let queue = build_queue(&url, &line, counter.clone()).await;
+    for chunk in jobs.chunks(500) {
+        queue.enqueue_many(chunk).await.unwrap();
+    }
+    queue.start().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while counter.load(Ordering::SeqCst) < 700 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("700 jobs should run within 30s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    queue.shutdown().await.unwrap();
+
+    let (completed, _, _, _) = queue
+        .backend()
+        .as_ref()
+        .cleanup(Retention {
+            completed_count: Some(100),
+            ..Retention::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(completed, 600, "count cap keeps exactly the newest 100");
+
+    flush_line(&url, &line).await;
+}
+
+// =========================================================================
+// Claim: full groups at the head of the wait set must not starve the rest
+// =========================================================================
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Lane {
+    g: String,
+}
+
+impl Job for Lane {
+    const KIND: &'static str = "lane";
+    fn group_key(&self) -> Option<String> {
+        Some(self.g.clone())
+    }
+}
+
+#[derive(Clone)]
+struct NoopLane;
+
+#[async_trait]
+impl Worker<Lane> for NoopLane {
+    async fn perform(&self, _job: Lane, _ctx: JobContext) -> JobResult {
+        Ok(())
+    }
+}
+
+async fn lane_queue(url: &str, line: &str) -> Queue<RedisBackend> {
+    let backend = RedisBackend::connect(RedisConfig {
+        url: url.to_owned(),
+        line: line.to_owned(),
+    })
+    .await
+    .unwrap();
+    QueueBuilder::with_backend(backend)
+        .register::<Lane, _>(NoopLane)
+        .register::<Count, _>(CountWorker {
+            counter: Arc::new(AtomicUsize::new(0)),
+        })
+        .config(fast_config())
+        .line(line.to_owned())
+        .build()
+}
+
+/// One store's catalog (300 jobs, group capped at 1) is enqueued ahead of
+/// another store's 3 jobs. A claim must reach past the full group to the
+/// free one; reading only the head page returned the single slot the full
+/// group had and nothing else.
+#[tokio::test]
+async fn claim_reaches_past_full_groups_at_the_head() {
+    use eddyq_core::Backend;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("hol");
+    flush_line(&url, &line).await;
+
+    let queue = lane_queue(&url, &line).await;
+    queue.set_group_concurrency("full", 1).await.unwrap();
+    let busy: Vec<Lane> = (0..300).map(|_| Lane { g: "full".into() }).collect();
+    queue.enqueue_many(&busy).await.unwrap();
+    for _ in 0..3 {
+        queue.enqueue(&Lane { g: "free".into() }).await.unwrap();
+    }
+
+    let claimed = queue
+        .backend()
+        .as_ref()
+        .claim_batch(
+            uuid::Uuid::new_v4(),
+            10,
+            &["lane".to_string()],
+            &[eddyq_core::DEFAULT_QUEUE.to_string()],
+        )
+        .await
+        .unwrap();
+    let by_group = |g: &str| {
+        claimed
+            .iter()
+            .filter(|j| j.group_key.as_deref() == Some(g))
+            .count()
+    };
+    assert_eq!(by_group("full"), 1, "the capped group gets its one slot");
+    assert_eq!(by_group("free"), 3, "the free group behind it is reached");
+
+    flush_line(&url, &line).await;
+}
+
+/// A queue-wide cap stops the claim at the cap even when groups have room.
+#[tokio::test]
+async fn claim_stops_at_queue_cap() {
+    use eddyq_core::Backend;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("qcap");
+    flush_line(&url, &line).await;
+
+    let queue = lane_queue(&url, &line).await;
+    queue
+        .set_queue_concurrency(eddyq_core::DEFAULT_QUEUE, 2)
+        .await
+        .unwrap();
+    for g in ["a", "b", "c", "d"] {
+        queue.enqueue(&Lane { g: g.into() }).await.unwrap();
+    }
+    let claimed = queue
+        .backend()
+        .as_ref()
+        .claim_batch(
+            uuid::Uuid::new_v4(),
+            10,
+            &["lane".to_string()],
+            &[eddyq_core::DEFAULT_QUEUE.to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+
+    flush_line(&url, &line).await;
+}
+
+/// The queue's default timeout travels with the claim, as on Postgres.
+#[tokio::test]
+async fn claim_carries_queue_timeout() {
+    use eddyq_core::Backend;
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL not set");
+        return;
+    };
+    let line = fresh_line("qtimeout");
+    flush_line(&url, &line).await;
+
+    let queue = lane_queue(&url, &line).await;
+    let claim = || async {
+        queue
+            .backend()
+            .as_ref()
+            .claim_batch(
+                uuid::Uuid::new_v4(),
+                10,
+                &["count".to_string()],
+                &[eddyq_core::DEFAULT_QUEUE.to_string()],
+            )
+            .await
+            .unwrap()
+    };
+
+    queue.enqueue(&Count { n: 1 }).await.unwrap();
+    let untimed = claim().await;
+    assert_eq!(untimed.len(), 1);
+    assert_eq!(untimed[0].timeout, None, "no timeout configured");
+
+    queue
+        .set_queue_timeout(
+            eddyq_core::DEFAULT_QUEUE,
+            Some(Duration::from_millis(1_500)),
+        )
+        .await
+        .unwrap();
+    queue.enqueue(&Count { n: 2 }).await.unwrap();
+    let timed = claim().await;
+    assert_eq!(timed.len(), 1);
+    assert_eq!(timed[0].timeout, Some(Duration::from_millis(1_500)));
 
     flush_line(&url, &line).await;
 }

@@ -282,16 +282,21 @@ local function fn_enqueue(keys, args)
   local max_stalled_count   = tonumber(args[13]) or 1
   local now_ms              = tonumber(args[14])
 
-  -- Unique-key dedup: SET NX. If the key already maps to a job id, this
-  -- enqueue is a no-op.
+  -- Unique-key dedup. The key holds the owning job's id for as long as that
+  -- job is pending, scheduled or running, and is released when it finalizes
+  -- (`release_unique`) -- the same window as Postgres's partial unique index.
+  -- Functions run atomically, so the EXISTS check and the SET below cannot
+  -- interleave with another enqueue.
   if unique_key ~= '' then
-    local got = redis.call('SET', uniquekey(prefix, unique_key), '1', 'NX')
-    if not got then
+    if redis.call('EXISTS', uniquekey(prefix, unique_key)) == 1 then
       return { 'skipped' }
     end
   end
 
   local id = redis.call('INCR', prefix .. ':idgen')
+  if unique_key ~= '' then
+    redis.call('SET', uniquekey(prefix, unique_key), tostring(id))
+  end
   local effective_scheduled = scheduled_at_ms
   if effective_scheduled == 0 then effective_scheduled = now_ms end
   local due_now = effective_scheduled <= now_ms
@@ -413,6 +418,11 @@ end
 --
 -- Returns: flat array of JSON strings, one per claimed job.
 -- ====================================================================
+-- Most wait-set entries one claim examines per queue. Bounds the Lua call
+-- when the head of the set is all blocked groups; at the default batch of 10
+-- that is 25 pages, a few milliseconds of HMGETs.
+local CLAIM_SCAN_LIMIT = 1000
+
 local function fn_claim(keys, args)
   local prefix = keys[1]
   local batch_size = tonumber(args[1])
@@ -437,98 +447,130 @@ local function fn_claim(keys, args)
   for _, queue in ipairs(queues) do
     if taken >= batch_size then break end
 
-    -- Take a generous slice up front so we have room to skip kind-mismatches
-    -- without re-reading. ZRANGE returns lowest-score first = highest priority.
-    local slice = redis.call('ZRANGE', waitkey(prefix, queue), 0, batch_size * 4 - 1)
-    for _, id in ipairs(slice) do
-      if taken >= batch_size then break end
+    -- Queue-wide gate, read once per queue rather than per candidate. A full
+    -- or paused queue is skipped outright, and the check runs before any
+    -- group's rate-limit token is spent, so a claim the queue cap rejects no
+    -- longer burns a token.
+    local nq_meta = read_nq_meta(prefix, queue)
+    local queue_open = true
+    local queue_room = nil -- nil = no queue-wide cap
+    if nq_has_limits(nq_meta) then
+      if nq_meta.paused == 1 then
+        queue_open = false
+      elseif nq_meta.max_concurrency >= 0 then
+        queue_room = nq_meta.max_concurrency - redis.call('ZCARD', nqrunkey(prefix, queue))
+        if queue_room <= 0 then queue_open = false end
+      end
+    end
+    -- The queue's default timeout travels with the claim, as on Postgres.
+    local timeout_ms = nil
+    if nq_meta and nq_meta.default_timeout_ms and nq_meta.default_timeout_ms > 0 then
+      timeout_ms = nq_meta.default_timeout_ms
+    end
 
-      -- Read minimum needed fields. Skip if kind not in subscribed list.
-      local fields = redis.call('HMGET', jobkey(prefix, id),
-        'kind', 'payload', 'priority', 'max_attempts', 'attempt',
-        'queue', 'group_key', 'state', 'stalled_count', 'max_stalled_count')
-      local kind = fields[1]
-      local gkey = fields[7]
-      if kind and kinds_set[kind] and fields[8] == 'pending' then
-        -- Gate on group: pause / concurrency cap / rate-limit token bucket.
-        -- All three checks happen atomically inside this Lua call, so the
-        -- ZCARD running can't race with another claimer in this slot.
-        local allowed = true
-        local meta = read_group_meta(prefix, gkey)
-        if group_has_limits(meta) then
-          if meta.paused == 1 then
-            allowed = false
-          end
-          if allowed and meta.max_concurrency >= 0 then
-            local running = redis.call('ZCARD', grouprunkey(prefix, gkey))
-            if running >= meta.max_concurrency then
-              allowed = false
-            end
-          end
-          if allowed and meta.rate_count >= 0 then
-            local tokens = refill_tokens(prefix, gkey, meta, now_ms)
-            if tokens < 1.0 then
-              persist_tokens(prefix, gkey, meta)
-              allowed = false
-            else
-              meta.tokens = tokens - 1
-              persist_tokens(prefix, gkey, meta)
-            end
-          end
-        end
+    -- Groups found paused, full or out of tokens during this call. Their
+    -- other jobs are skipped without re-checking.
+    local blocked = {}
+    -- Page past the head of the wait set when the jobs there belong to
+    -- groups that cannot run. Reading only the first page let a few full
+    -- groups at the head (one store's catalog, say) starve every other group
+    -- behind them. CLAIM_SCAN_LIMIT bounds the work per call.
+    local page = batch_size * 4
+    local offset = 0
+    local scanned = 0
+    while queue_open and taken < batch_size and scanned < CLAIM_SCAN_LIMIT do
+      local slice = redis.call('ZRANGE', waitkey(prefix, queue), offset, offset + page - 1)
+      if #slice == 0 then break end
+      local claimed_here = 0
 
-        -- Cross-process named-queue gating: a parallel mechanism to groups,
-        -- bounded per-queue. Skipped when nothing's configured.
-        if allowed then
-          local nq_meta = read_nq_meta(prefix, queue)
-          if nq_has_limits(nq_meta) then
-            if nq_meta.paused == 1 then
+      for _, id in ipairs(slice) do
+        if taken >= batch_size or not queue_open then break end
+        scanned = scanned + 1
+
+        -- Read minimum needed fields. Skip if kind not in subscribed list.
+        local fields = redis.call('HMGET', jobkey(prefix, id),
+          'kind', 'payload', 'priority', 'max_attempts', 'attempt',
+          'queue', 'group_key', 'state', 'stalled_count', 'max_stalled_count')
+        local kind = fields[1]
+        local gkey = fields[7]
+        local grouped = gkey and gkey ~= ''
+        if kind and kinds_set[kind] and fields[8] == 'pending'
+           and not (grouped and blocked[gkey]) then
+          -- Gate on group: pause / concurrency cap / rate-limit token bucket.
+          -- All three checks happen atomically inside this Lua call, so the
+          -- ZCARD running can't race with another claimer in this slot.
+          local allowed = true
+          local meta = read_group_meta(prefix, gkey)
+          if group_has_limits(meta) then
+            if meta.paused == 1 then
               allowed = false
             end
-            if allowed and nq_meta.max_concurrency >= 0 then
-              local running = redis.call('ZCARD', nqrunkey(prefix, queue))
-              if running >= nq_meta.max_concurrency then
+            if allowed and meta.max_concurrency >= 0 then
+              local running = redis.call('ZCARD', grouprunkey(prefix, gkey))
+              if running >= meta.max_concurrency then
                 allowed = false
               end
             end
-          end
-        end
-
-        if allowed then
-          -- Atomically transition: ZREM from wait, ZADD to active, bump attempt,
-          -- set lease metadata.
-          local removed = redis.call('ZREM', waitkey(prefix, queue), id)
-          if removed == 1 then
-            local attempt = (tonumber(fields[5]) or 0) + 1
-            redis.call('ZADD', activekey(prefix), now_ms, id)
-            redis.call('HSET', jobkey(prefix, id),
-              'state',     'running',
-              'attempt',   attempt,
-              'locked_at', now_ms,
-              'locked_by', worker_id)
-            if gkey and gkey ~= '' then
-              redis.call('ZADD', grouprunkey(prefix, gkey), now_ms, id)
+            if allowed and meta.rate_count >= 0 then
+              local tokens = refill_tokens(prefix, gkey, meta, now_ms)
+              if tokens < 1.0 then
+                persist_tokens(prefix, gkey, meta)
+                allowed = false
+              else
+                meta.tokens = tokens - 1
+                persist_tokens(prefix, gkey, meta)
+              end
             end
-            redis.call('ZADD', nqrunkey(prefix, queue), now_ms, id)
+            if not allowed and grouped then blocked[gkey] = true end
+          end
 
-            -- Build the per-job JSON the Rust ClaimedJob constructor expects.
-            out[#out + 1] = cjson.encode({
-              id                = tonumber(id),
-              kind              = kind,
-              payload           = fields[2],          -- JSON string; Rust re-parses
-              priority          = tonumber(fields[3]) or 0,
-              max_attempts      = tonumber(fields[4]) or 3,
-              attempt           = attempt,
-              stalled_count     = tonumber(fields[9]) or 0,
-              max_stalled_count = tonumber(fields[10]) or 1,
-              queue             = fields[6],
-              group_key         = (gkey ~= '' and gkey) or nil,
-              worker_id         = worker_id,
-            })
-            taken = taken + 1
+          if allowed then
+            -- Atomically transition: ZREM from wait, ZADD to active, bump attempt,
+            -- set lease metadata.
+            local removed = redis.call('ZREM', waitkey(prefix, queue), id)
+            if removed == 1 then
+              claimed_here = claimed_here + 1
+              local attempt = (tonumber(fields[5]) or 0) + 1
+              redis.call('ZADD', activekey(prefix), now_ms, id)
+              redis.call('HSET', jobkey(prefix, id),
+                'state',     'running',
+                'attempt',   attempt,
+                'locked_at', now_ms,
+                'locked_by', worker_id)
+              if grouped then
+                redis.call('ZADD', grouprunkey(prefix, gkey), now_ms, id)
+              end
+              redis.call('ZADD', nqrunkey(prefix, queue), now_ms, id)
+              if queue_room then
+                queue_room = queue_room - 1
+                if queue_room <= 0 then queue_open = false end
+              end
+
+              -- Build the per-job JSON the Rust ClaimedJob constructor expects.
+              out[#out + 1] = cjson.encode({
+                id                = tonumber(id),
+                kind              = kind,
+                payload           = fields[2],          -- JSON string; Rust re-parses
+                priority          = tonumber(fields[3]) or 0,
+                max_attempts      = tonumber(fields[4]) or 3,
+                attempt           = attempt,
+                stalled_count     = tonumber(fields[9]) or 0,
+                max_stalled_count = tonumber(fields[10]) or 1,
+                queue             = fields[6],
+                group_key         = (grouped and gkey) or nil,
+                worker_id         = worker_id,
+                timeout_ms        = timeout_ms,
+              })
+              taken = taken + 1
+            end
           end
         end
       end
+
+      if #slice < page then break end
+      -- Claimed entries left the set, so the next unread entry sits that
+      -- many places earlier.
+      offset = offset + #slice - claimed_here
     end
   end
 
@@ -558,6 +600,32 @@ local function fn_heartbeat(keys, args)
   return count
 end
 
+-- Drop a unique-key reservation only if `id` still owns it. Once a job's key
+-- is released at finalize, a new job may reserve the same key; a later
+-- teardown of the old job must not free the new job's reservation. Keys
+-- written before 0.1.14 hold '1' instead of an id; only one job can hold a
+-- given key at a time, so a '1' always belongs to the job tearing it down.
+local function drop_unique_if_owner(prefix, uniq, id)
+  if uniq == nil or uniq == false or uniq == '' then return end
+  local k = uniquekey(prefix, uniq)
+  local owner = redis.call('GET', k)
+  if owner == tostring(id) or owner == '1' then
+    redis.call('DEL', k)
+  end
+end
+
+-- Release a job's unique key as it leaves pending/scheduled/running, so the
+-- same key can be enqueued again at once -- Postgres semantics. The HASH
+-- keeps its `unique_key` field for listings; the owner check is what stops
+-- the job's later `delete_job` from freeing a successor's reservation.
+-- Before 0.1.14 the key was held until retention deleted the finished job
+-- (24h by default), so an update arriving within a day of the last one was
+-- silently dropped.
+local function release_unique(prefix, id)
+  local uniq = redis.call('HGET', jobkey(prefix, id), 'unique_key')
+  drop_unique_if_owner(prefix, uniq, id)
+end
+
 -- Tear down a job's metadata after a `drop` retention or a prune. Removes
 -- the HASH, error log, queue/kind/tag set memberships, and unique-key
 -- reservation. Does not touch the state ZSETs; callers ZREM those.
@@ -579,7 +647,7 @@ local function delete_job(prefix, id)
       end
     end
   end
-  if uniq and uniq ~= '' then redis.call('DEL', uniquekey(prefix, uniq)) end
+  drop_unique_if_owner(prefix, uniq, id)
   redis.call('DEL', errkey(prefix, id))
   redis.call('DEL', jobkey(prefix, id))
 end
@@ -725,6 +793,7 @@ local function fn_complete(keys, args)
     'state',        'completed',
     'completed_at', now_ms,
     'result',       (result == '' and '' or result))
+  release_unique(prefix, id)
 
   local rule = redis.call('HGET', jobkey(prefix, id), 'remove_on_complete')
   local nqck = (jqueue and jqueue ~= '') and nqcompletedkey(prefix, jqueue) or nil
@@ -796,6 +865,7 @@ local function fn_fail(keys, args)
   -- Permanent failure / DLQ
   redis.call('HSET', jobkey(prefix, id),
     'state', 'failed', 'failed_at', now_ms)
+  release_unique(prefix, id)
   local nqfk = (queue and queue ~= '') and nqfailedkey(prefix, queue) or nil
   local should_drop = apply_retention(prefix, id, failedkey(prefix), nqfk, rule, now_ms)
   if should_drop then
@@ -851,6 +921,7 @@ local function fn_sweep_stale(keys, args)
         redis.call('ZADD', nqfailedkey(prefix, queue), stale_before_ms, id)
       end
       push_error(prefix, id, '{"name":"StaleSweep","message":"worker lost contact \xe2\x80\x94 job recovered"}')
+      release_unique(prefix, id)
     else
       -- Stall recovery. Decrement attempt — the prior claim never produced
       -- a verdict, so it shouldn't burn the handler-throw budget. The next
@@ -943,6 +1014,7 @@ local function fn_reclaim_in_flight(keys, args)
           redis.call('ZADD', nqfailedkey(prefix, queue), now_ms, id)
         end
         push_error(prefix, id, '{"name":"ForceReclaim","message":"worker shutting down \xe2\x80\x94 stall budget exhausted"}')
+        release_unique(prefix, id)
       else
         redis.call('HSET', jobkey(prefix, id),
           'state', 'pending',
@@ -988,6 +1060,7 @@ local function fn_cancel(keys, args)
   end
   redis.call('HSET', jobkey(prefix, id),
     'state', 'cancelled', 'cancelled_at', now_ms)
+  release_unique(prefix, id)
   redis.call('ZADD', cancelledkey(prefix), now_ms, id)
   if queue and queue ~= '' then
     redis.call('ZADD', nqcancelledkey(prefix, queue), now_ms, id)
@@ -1740,11 +1813,18 @@ local function fn_cleanup(keys, args)
         end
       end
     end
-    -- Count-cap: ZRANGE 0 to -(count+1) selects everything except the
-    -- newest `count`. Out-of-range stop → empty result (Redis-safe).
+    -- Count-cap: the oldest entries beyond the newest `count`, read at most
+    -- one batch at a time. An unbounded `ZRANGE 0 -(count+1)` materialized
+    -- every surplus id on each call -- 100k+ on a busy queue -- only to use
+    -- the first `batch_limit`.
     if count >= 0 and #victims < batch_limit then
-      local stop = -(count + 1)
-      local ids = redis.call('ZRANGE', zsetkey, 0, stop)
+      local excess = redis.call('ZCARD', zsetkey) - count
+      -- Both passes read oldest-first, so the age victims already taken are
+      -- the head of this range; reading `batch_limit` entries still leaves
+      -- room to fill the batch after skipping them.
+      local want = math.min(excess, batch_limit)
+      local ids = {}
+      if want > 0 then ids = redis.call('ZRANGE', zsetkey, 0, want - 1) end
       for _, id in ipairs(ids) do
         if not seen[id] then
           seen[id] = true

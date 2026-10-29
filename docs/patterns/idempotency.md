@@ -32,6 +32,7 @@ The dedupe constraint is `UNIQUE (kind, unique_key) WHERE state IN ('pending', '
 
 - **Per-kind.** `uniqueKey: 'event-123'` for `send.email` does **not** conflict with the same key for `process.payment`. Namespace your key (`'webhook:event-123'`) if you want cross-kind dedupe.
 - **Active jobs only.** Once a job reaches `completed`/`failed`/`cancelled`, the key is freed. A new enqueue with the same key inserts a fresh row.
+- **On Redis** the active-only window is the same (since 0.1.14; before it, the key was held until retention deleted the finished job, 24h by default). The scope is not per-kind: Redis keys are global across kinds, so namespace keys by kind if two kinds could share one.
 
 This is "don't enqueue twice while one is in the pipeline," **not** "this event has happened before, ever." For historical dedupe, store keys in your own table.
 

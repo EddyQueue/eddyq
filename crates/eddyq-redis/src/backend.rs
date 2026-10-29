@@ -922,6 +922,10 @@ struct ClaimedJobJson {
     #[serde(default)]
     group_key: Option<String>,
     worker_id: String,
+    /// The queue's `default_timeout_ms` at claim time; absent when the queue
+    /// has none.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 fn default_max_stalled_count_json() -> i32 {
@@ -944,9 +948,13 @@ fn parse_claimed_job(s: &str) -> Result<ClaimedJob, crate::Error> {
         group_key: raw.group_key,
         queue: raw.queue,
         worker_id,
-        // Per-queue timeouts are wired in PR3 once named-queue admin lands
-        // on Redis. Until then no Redis-claimed job has a timeout.
-        timeout: None,
+        // Postgres semantics: the queue's default timeout at claim time.
+        // Before 0.1.14 the Lua claim never returned it and every Redis job
+        // ran unbounded, so a hung handler held its slot indefinitely.
+        timeout: raw
+            .timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis),
     })
 }
 
@@ -1246,12 +1254,18 @@ impl Backend for RedisBackend {
     }
 
     async fn cleanup(&self, retention: Retention) -> eddyq_core::Result<(u64, u64, u64, u64)> {
-        // Bounded per call so a backlog can't block the Redis event loop —
-        // the leader cleanup_loop ticks again on the next interval and
-        // drains over many calls. Per-job retention already ran inline at
-        // complete/fail time; this is only for jobs whose owner set no
-        // per-job rule, or explicitly set `false`.
+        // Each FCALL is bounded so a backlog can't block the Redis event
+        // loop, but one call per tick is not enough: at 500 per state per
+        // 5-minute tick the sweep tops out at 144k jobs a day, below what a
+        // single busy queue finishes, and the finalized set then grows until
+        // Redis is out of memory. So the tick keeps calling until every state
+        // comes back short of the limit, up to MAX_ROUNDS calls -- 20k per
+        // state per tick, ~5.7M a day at the default interval -- with the
+        // event loop free between calls. Per-job retention already ran
+        // inline at complete/fail time; this is only for jobs whose owner set
+        // no per-job rule, or explicitly set `false`.
         const PER_STATE_LIMIT: u32 = 500;
+        const MAX_ROUNDS: u32 = 40;
         if retention.completed_secs.is_none()
             && retention.failed_secs.is_none()
             && retention.cancelled_secs.is_none()
@@ -1285,43 +1299,55 @@ impl Backend for RedisBackend {
         let cx = count_to_arg(retention.cancelled_count);
         let limit = PER_STATE_LIMIT.to_string();
 
-        let value: redis::Value = with_retry(&mut conn, |mut conn| {
-            let prefix = prefix.clone();
-            let now_ms = now_ms.clone();
-            let c = c.clone();
-            let f = f.clone();
-            let x = x.clone();
-            let cc = cc.clone();
-            let cf = cf.clone();
-            let cx = cx.clone();
-            let limit = limit.clone();
-            async move {
-                redis::cmd("FCALL")
-                    .arg(FN_CLEANUP)
-                    .arg(1)
-                    .arg(&prefix)
-                    .arg(&now_ms)
-                    .arg(&c)
-                    .arg(&f)
-                    .arg(&x)
-                    .arg(&cc)
-                    .arg(&cf)
-                    .arg(&cx)
-                    .arg(&limit)
-                    .query_async(&mut conn)
-                    .await
-            }
-        })
-        .await?;
+        let mut totals = (0u64, 0u64, 0u64, 0u64);
+        for _ in 0..MAX_ROUNDS {
+            let value: redis::Value = with_retry(&mut conn, |mut conn| {
+                let prefix = prefix.clone();
+                let now_ms = now_ms.clone();
+                let c = c.clone();
+                let f = f.clone();
+                let x = x.clone();
+                let cc = cc.clone();
+                let cf = cf.clone();
+                let cx = cx.clone();
+                let limit = limit.clone();
+                async move {
+                    redis::cmd("FCALL")
+                        .arg(FN_CLEANUP)
+                        .arg(1)
+                        .arg(&prefix)
+                        .arg(&now_ms)
+                        .arg(&c)
+                        .arg(&f)
+                        .arg(&x)
+                        .arg(&cc)
+                        .arg(&cf)
+                        .arg(&cx)
+                        .arg(&limit)
+                        .query_async(&mut conn)
+                        .await
+                }
+            })
+            .await?;
 
-        // Lua returns { n_completed, n_failed, n_cancelled, 0 } as bulk strings.
-        // Reuse value_to_u64 element-wise; tolerate short replies defensively.
-        let arr = match value {
-            redis::Value::Array(a) => a,
-            _ => return Ok((0, 0, 0, 0)),
-        };
-        let get = |i: usize| arr.get(i).cloned().map(value_to_u64).unwrap_or(0);
-        Ok((get(0), get(1), get(2), get(3)))
+            // Lua returns { n_completed, n_failed, n_cancelled, 0 } as bulk strings.
+            // Reuse value_to_u64 element-wise; tolerate short replies defensively.
+            let arr = match value {
+                redis::Value::Array(a) => a,
+                _ => break,
+            };
+            let get = |i: usize| arr.get(i).cloned().map(value_to_u64).unwrap_or(0);
+            let (c, f, x) = (get(0), get(1), get(2));
+            totals.0 += c;
+            totals.1 += f;
+            totals.2 += x;
+            totals.3 += get(3);
+            let limit = u64::from(PER_STATE_LIMIT);
+            if c < limit && f < limit && x < limit {
+                break;
+            }
+        }
+        Ok(totals)
     }
 
     async fn clean(
