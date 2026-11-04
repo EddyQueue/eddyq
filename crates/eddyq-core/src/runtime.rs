@@ -8,7 +8,10 @@ use std::{
 };
 
 use rand::Rng;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -63,6 +66,14 @@ fn escalate_idle(current: Duration, ceiling: Duration) -> Duration {
 /// by `Queue::shutdown_with(ShutdownMode::Force)` so we can proactively
 /// reclaim jobs this pod has claimed but won't get to finish.
 pub(crate) type InFlightJobs = Arc<std::sync::Mutex<HashSet<i64>>>;
+
+/// What the fetcher and the workers share about this process's worker slots.
+#[derive(Clone)]
+struct WorkerSlots {
+    /// One permit per worker not running a job. The fetcher claims only this many.
+    idle: Arc<Semaphore>,
+    in_flight: InFlightJobs,
+}
 
 pub(crate) struct RuntimeHandles {
     pub fetcher: JoinHandle<()>,
@@ -130,6 +141,10 @@ pub(crate) fn start<B: Backend>(
 
     // Shared in-flight job set for batch heartbeats.
     let in_flight: InFlightJobs = Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let slots = WorkerSlots {
+        idle: Arc::new(Semaphore::new(config.worker_concurrency)),
+        in_flight: in_flight.clone(),
+    };
 
     // Leader election state.
     let is_leader = Arc::new(AtomicBool::new(false));
@@ -143,6 +158,7 @@ pub(crate) fn start<B: Backend>(
         queues,
         shutdown.clone(),
         wakeup.clone(),
+        slots.clone(),
     ));
 
     let workers = (0..config.worker_concurrency)
@@ -154,7 +170,7 @@ pub(crate) fn start<B: Backend>(
                 rx.clone(),
                 config.clone(),
                 shutdown.clone(),
-                in_flight.clone(),
+                slots.clone(),
             ))
         })
         .collect();
@@ -219,6 +235,7 @@ pub(crate) fn start<B: Backend>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fetch_loop<B: Backend>(
     backend: Arc<B>,
     tx: mpsc::Sender<ClaimedJob>,
@@ -227,6 +244,7 @@ async fn fetch_loop<B: Backend>(
     queues: Vec<String>,
     shutdown: CancellationToken,
     wakeup: Arc<tokio::sync::Notify>,
+    slots: WorkerSlots,
 ) {
     let worker_id = Uuid::new_v4();
     let kinds = registry.kinds();
@@ -257,15 +275,21 @@ async fn fetch_loop<B: Backend>(
             break;
         }
 
-        let capacity = tx.capacity();
-        if capacity == 0 {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(config.fetch_cooldown) => continue,
-            }
+        // Claim only what an idle worker can start now. A row claimed ahead of a
+        // free worker holds its concurrency budget and waits behind a job that may
+        // run for minutes, while an idle worker elsewhere cannot have it. Rescuing
+        // it from the buffer is worse: the claimer still runs it when a worker frees
+        // up, so the job executes twice.
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            permit = slots.idle.acquire() => match permit {
+                Ok(permit) => drop(permit),
+                Err(_) => break,
+            },
         }
-
+        // Only this loop takes permits, so this many stay available through the claim.
+        let capacity = slots.idle.available_permits();
         let batch_size = config.fetch_batch_size.min(capacity);
         let claimed = match backend
             .claim_batch(worker_id, batch_size, &kinds, &queues)
@@ -284,6 +308,17 @@ async fn fetch_loop<B: Backend>(
 
         let got = claimed.len();
         for job in claimed {
+            slots
+                .idle
+                .try_acquire()
+                .expect("claimed no more jobs than idle workers")
+                .forget();
+            // Heartbeating from the claim leaves no gap before a worker takes it.
+            slots
+                .in_flight
+                .lock()
+                .expect("in_flight lock poisoned")
+                .insert(job.id);
             if tx.send(job).await.is_err() {
                 debug!("worker channel closed, fetcher exiting");
                 return;
@@ -292,9 +327,8 @@ async fn fetch_loop<B: Backend>(
 
         // A full batch signals a deep backlog — re-fetch immediately instead
         // of sleeping, otherwise throughput caps at batch_size / cooldown
-        // (~100 jobs/s at defaults). The bounded channel above already
-        // applies backpressure, and the capacity==0 check at the top of the
-        // loop falls back to the cooldown once workers are saturated.
+        // (~100 jobs/s at defaults). Waiting for an idle worker at the top of
+        // the loop applies backpressure once workers are saturated.
         if got == batch_size && got > 0 {
             continue;
         }
@@ -339,8 +373,12 @@ async fn worker_loop<B: Backend>(
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<ClaimedJob>>>,
     config: QueueConfig,
     shutdown: CancellationToken,
-    in_flight: InFlightJobs,
+    slots: WorkerSlots,
 ) {
+    let WorkerSlots {
+        idle: idle_workers,
+        in_flight,
+    } = slots;
     let worker_id = Uuid::new_v4();
     info!(worker = n, %worker_id, "eddyq worker started");
 
@@ -355,12 +393,8 @@ async fn worker_loop<B: Backend>(
         };
 
         let Some(mut job) = job else { break };
-
-        // Register this job as in-flight for the shared heartbeat loop.
-        {
-            let mut set = in_flight.lock().expect("in_flight lock poisoned");
-            set.insert(job.id);
-        }
+        // Back on every path out of this iteration, so a slot cannot leak.
+        let _idle_again = IdleOnDrop(&idle_workers);
 
         let ctx = JobContext {
             id: job.id,
@@ -480,6 +514,15 @@ async fn worker_loop<B: Backend>(
     }
 
     info!(worker = n, "eddyq worker stopped");
+}
+
+/// Marks a worker idle again when its job is finished, whichever way it finished.
+struct IdleOnDrop<'a>(&'a Semaphore);
+
+impl Drop for IdleOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
 }
 
 /// Single shared heartbeat loop — one round trip every `heartbeat_interval`

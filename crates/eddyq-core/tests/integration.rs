@@ -4882,3 +4882,77 @@ async fn get_stats_stale_snapshot_served_while_another_caller_refreshes(pool: Pg
     let fresh = eddyq_core::stats::get_stats(&pool).await.unwrap();
     assert!(stat_counts(&fresh).contains(&("a".to_owned(), "completed", 5)));
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IdleClaimJob {
+    n: i32,
+}
+
+impl Job for IdleClaimJob {
+    const KIND: &'static str = "idle_claim_job";
+}
+
+#[derive(Clone)]
+struct IdleClaimWorker {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Worker<IdleClaimJob> for IdleClaimWorker {
+    async fn perform(&self, _job: IdleClaimJob, _ctx: JobContext) -> JobResult {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        Ok(())
+    }
+}
+
+/// A job waiting behind a slower one must not look dead. A claimed row with no worker
+/// gets no heartbeat, so the sweep used to recover it while the claimer still held it,
+/// and both then ran it. Each job here waits longer than `stale_after`.
+#[sqlx::test(migrations = "./migrations")]
+async fn jobs_behind_a_busy_worker_are_not_claimed_or_recovered(pool: PgPool) {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let queue = Queue::builder(pool.clone())
+        .register::<IdleClaimJob, _>(IdleClaimWorker { runs: runs.clone() })
+        .config(QueueConfig {
+            worker_concurrency: 1,
+            stale_after: Duration::from_secs(1),
+            sweep_interval: Duration::from_millis(100),
+            ..fast_config()
+        })
+        .build();
+
+    for n in 0..3 {
+        queue.enqueue(&IdleClaimJob { n }).await.unwrap();
+    }
+    queue.start().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let (pending, running, _) = count_states(&pool).await;
+    assert_eq!(
+        (pending, running),
+        (2, 1),
+        "one worker claims one job, leaving the rest for any other process"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (pending, running, _) = count_states(&pool).await;
+            if pending == 0 && running == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("all three should finish");
+    queue.shutdown().await.unwrap();
+
+    assert_eq!(runs.load(Ordering::SeqCst), 3, "each job runs exactly once");
+    let stalled: i64 =
+        sqlx::query_scalar("SELECT COALESCE(SUM(stalled_count), 0)::bigint FROM eddyq_jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stalled, 0, "no job was recovered as stalled");
+}
